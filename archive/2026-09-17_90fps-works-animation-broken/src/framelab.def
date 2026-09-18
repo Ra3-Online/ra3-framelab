@@ -1,0 +1,18 @@
+LIBRARY Ra3FrameLab
+EXPORTS
+    FrameLabEnable
+    FrameLabDryRun
+    FrameLabDisable
+    FrameLabStatus
+    FrameLabVersion
+    FrameLabDumpDiagnostics
+    FrameLabSelfTestRollback
+    FrameLabSetGroups
+    FrameLabMeasureOnly
+    FrameLabFrameCount
+    FrameLabLogicFrame
+    FrameLabWaitFrame
+    FrameLabFpsWindow
+    FrameLabEngineFps
+    FrameLabDesyncDump
+    FrameLabDesyncRestore

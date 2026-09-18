@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  ra3fps_gui.manifest -- 2026-09-17 / portable-GUI session (Claude)
+
+  Why each line is here:
+
+  * requestedExecutionLevel asInvoker
+      The tool injects into a game started by the SAME user, so a plain OpenProcess is
+      enough. Deliberately NOT requireAdministrator: asking for UAC on a test tool is
+      hostile, and it would also make the tool unable to touch a non-elevated game on
+      some configurations. If the game WAS started elevated, injection fails and the tool
+      says "try running as administrator" in its log instead of failing silently.
+
+  * Microsoft.Windows.Common-Controls 6.0
+      Without it the combo box and buttons render in the Windows 95 style. Purely cosmetic,
+      but this is a tool a person has to look at.
+
+  * dpiAware true
+      On a 125%/150% display the window would otherwise be bitmap-stretched and blurry.
+      "true" (system DPI aware) rather than per-monitor: simpler, and enough here.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="Ra3FrameLab.Ra3FpsTest" version="1.0.0.0"
+                    processorArchitecture="x86"/>
+  <description>Red Alert 3 frame-rate test tool (runtime memory patch, nothing on disk is modified)</description>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls"
+                        version="6.0.0.0" processorArchitecture="*"
+                        publicKeyToken="6595b64144ccf1df" language="*"/>
+    </dependentAssembly>
+  </dependency>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
+    </windowsSettings>
+  </application>
+</assembly>

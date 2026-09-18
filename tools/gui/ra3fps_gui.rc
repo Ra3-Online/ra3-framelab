@@ -1,0 +1,55 @@
+// ra3fps_gui.rc -- resources for Ra3FpsTest.exe
+//
+// 2026-09-17 / portable-GUI session (Claude)
+//
+// ASCII ONLY. rc.exe reads this file in the ANSI codepage; a non-ASCII comment can make it
+// drop the next line (the same accident that once shipped a decorated export name in
+// src/framelab.def). Comments are English on purpose.
+//
+// The DLL path below is relative to THIS file's folder, and the build runs rc.exe with its
+// working directory set to tools\gui. Nothing absolute is baked in: the shipped exe contains
+// the DLL bytes, not a path. That matters because the whole point of this tool is to be
+// carried to another machine.
+
+#include "gui_res.h"
+
+// The patcher DLL, embedded so the shipped tool is one file with no side files to lose.
+// It is extracted to %TEMP% at run time (see ExtractDll in ra3fps_gui.cpp) -- we never write
+// into the game folder, which is one of this project's standing rules.
+IDR_FRAMELAB_DLL  RCDATA  "..\\..\\build\\Ra3FrameLab.dll"
+
+// 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID. See ra3fps_gui.manifest for why each setting is there.
+1 RT_MANIFEST "ra3fps_gui.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION     1,0,0,0
+ PRODUCTVERSION  1,0,0,0
+ FILEFLAGSMASK   0x3fL
+ FILEFLAGS       0x0L
+ // Numeric literals instead of VOS_NT_WINDOWS32 / VFT_APP / VFT2_UNKNOWN: those names live in
+ // winver.h, and rc.exe resolves them through INCLUDE. Spelling them out removes a way for the
+ // build to depend on the environment it happens to run in.
+ FILEOS          0x00040004L   // VOS_NT_WINDOWS32
+ FILETYPE        0x00000001L   // VFT_APP
+ FILESUBTYPE     0x00000000L   // VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        // 0804 = Simplified Chinese, 04b0 = Unicode. The strings are ASCII anyway.
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName",      "Ra3 FrameLab"
+            VALUE "FileDescription",  "Red Alert 3 frame-rate test tool (runtime memory patch)"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "InternalName",     "Ra3FpsTest"
+            VALUE "OriginalFilename", "Ra3FpsTest.exe"
+            VALUE "ProductName",      "Ra3 FrameLab Test Tool"
+            VALUE "ProductVersion",   "1.0.0.0"
+            VALUE "Comments",         "Patches the running game in memory only. No game file is modified or replaced."
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END
