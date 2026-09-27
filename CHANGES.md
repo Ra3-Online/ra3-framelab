@@ -1433,3 +1433,133 @@ v19 = 10 * v13 / (unsigned int)dword_CAF9D0;   // 质量档位
    **零匹配**(只有定义处)—— 要枚举 `(*(vtbl+128))(...)` 形式的虚调用点才能知道
    「W3DView 的等 N 帧倒计时」到底服务于哪个游戏功能。
 5. **`sub_ABC2B0`**(比较桶)与 `sub_51A110/sub_51A170`(实参桶)的语义未明。
+
+
+---
+
+## §AA(2026-09-21 第十二批):车身悬挂路径 —— 探针 + 30 Hz 节拍门(默认关)
+
+背景与证据链见 `RE-车身悬挂-2026-09-21.md`;总览见 `HANDOFF.md §20`。改动前的源码已归档到
+`archive/2026-09-21_before-chassis-gate/`。
+
+| 文件 | 改动 |
+|---|---|
+| `src/chassis_gate.h` | **新建**:节拍门的纯逻辑(虚拟帧号、1024 格定长表、放行 / 回放 / 表满直通),DLL 与自检共用 |
+| `src/framelab.cpp` | `kSigChassisCall` + `FL_G_CHASSISPROBE 0x80000` / `FL_G_CHASSIS30 0x100000`(都不在 `FL_G_ALL` 里);`FL_G_EVERYTHING` → `0x1FFFFF`;`fl_wrap_chassis`;install / uninstall / SetGroups 日志;三个导出;黑匣子姿态轴(`Rec.chsCalls / chsAdv / chs[4][3]`)+ 报告缓冲 384 KB;`dump_state` 多一行车身状态;**修掉 `FrameLabMemScan` 的 C2065(声明顺序)** |
+| `src/framelab.def` | +3 导出(纯 ASCII 注释) |
+| `tools/flctl.cpp` | `chassisrate` / `chassisslots`;`groups` 改用 `strtoul(…, 0)` |
+| `tests/test_loader.cpp` | +9 条断言(23 → 32) |
+| `tools/re/ring_analyze.py` | 行正则可选组 + 第 9 节姿态轴;`STATE_RE` 订正 |
+
+对照掩码:`0x0A8FFF` = 默认 + 探针;`0x1A8FFF` = 默认 + 探针 + 节拍门;`measureex 0xACFFF` = 原版基线 + 探针。
+**实机未验证;转正前必须三臂实测 + 确定性回放 + desync 对账。**
+
+
+### §AA.2 同日下午:实机四臂 + 插值模式 + GUI 覆盖口
+
+| 文件 | 改动 |
+|---|---|
+| `src/chassis_gate.h` | 三种模式(探针 / 回放 / **插值**);`prev[]` / `shown[]`;相位 `((f×30) mod fps + 30) ÷ fps`,φ=1 直接拷贝保证逐位 |
+| `src/framelab.cpp` | `FL_G_CHASSISLERP 0x200000`;`g_chsMode`;`FL_G_EVERYTHING` → `0x3FFFFF`;自检 +2 位(`0x3FF`);`chassisrate` 改为挑**载具**且读数与可见时长无关;全表先列载具;黑匣子记 `shown`、且只记「这一帧真被画到」的车 |
+| `tests/test_loader.cpp` | +2 条(32 → **34**) |
+| `tools/chassis_probe.ps1` | **新建**:车身路径的实机探针(路径可配,纯 ASCII) |
+| `tools/re/ring_analyze.py` | 第 9 节加「按逻辑时间」的频率 / 角速度(两臂游戏速度不同时只比这一行) |
+| `tools/gui/ra3fps_gui.cpp` | 可选环境变量 `RA3FL_GROUPS` 覆盖掩码(默认不变,日志标注) |
+
+实机读数(目标 60,本机):原版 **2000** / 没修 **3993** / 回放 **2007** / 插值 **2003**(长跑 **2002**),全程 0 份崩溃报告。
+环境限制与「全屏 60.00 不是真渲染」见 `HANDOFF.md §20.8`。
+
+
+### §AA.3 同日傍晚:修复开关进 GUI + 生效状态回报
+
+起因:用户 15:03 的 GUI 验收掩码是出厂默认 `0x2CFFF`(修复关),见 `HANDOFF.md §20.11`。
+
+| 文件 | 改动 |
+|---|---|
+| `tools/gui/ra3fps_gui.cpp` / `gui_res.h` | 复选框 `IDC_CHASSIS_FIX`「修复载具上下颠簸」,**默认勾上**(+`0x380000`);`EffectiveGroups()` = 环境变量 > 复选框;启用后读 `FrameLabChassisStatus` 并报一行 |
+| `src/framelab.cpp` / `.def` | 新导出 `FrameLabChassisStatus()`(38 个导出) |
+| `build/analysis-20260921/` | 录像切片图 `kymo_30/90.png`、`pose_spectrum.py` 等分析脚本(不入 git,`build/` 被忽略) |
+
+DLL / flctl 的默认集合不变(三个车身位仍默认关)。
+
+
+### §AA.4 同日傍晚(续):第四个派生量 `FL_G_DER_SPF = 0x400000`(默认关)+ 显示帧号读点全量普查
+
+| 文件 | 改动 |
+|---|---|
+| `src/framelab.cpp` | `kSigSecPerFrameInit` + `FL_G_DER_SPF`;`Sites.spfTarget`;`resolve_and_verify` 里 R2b 定位与核对(失败只 WARN);`install` 里改写 `0x00CDBD34` 的存量值为 `1/目标帧率`;`FL_G_EVERYTHING` → `0x7FFFFF`;SetGroups 日志多一行 |
+| `RE-按显示帧递推普查-2026-09-21.md` | **新建**:103 处读点 / 87 个函数的分类结果、`0xCDBD34` 的证据、卷屏等未修候选的排序 |
+
+默认集合不变;`0x400000` 未经实机验证。
+
+
+### §AA.5 同日傍晚(再续):卷屏速度归一(可自选,默认关)
+
+| 文件 | 改动 |
+|---|---|
+| `src/framelab.cpp` | `FL_G_SCROLL 0x800000` + `kSigScrollStep1 / 2`;`g_scroll100`;`resolve_and_verify` 里两处一起登记的 S 段;`install` 里就位常量 + 状态;导出 `FrameLabScrollStatus`;`FL_G_EVERYTHING` → `0xFFFFFF` |
+| `src/framelab.def` | +1 导出(39) |
+| `tools/gui/ra3fps_gui.cpp` / `gui_res.h` | 复选框 `IDC_SCROLL_FIX`「卷屏保持原版速度」(默认不勾);启用后读状态并报一行 |
+
+不含右键拖拽卷屏(调用节拍未定)。实机未验证。
+
+
+### §AB(2026-09-22):弹道流 30 Hz 节拍门 + 状态图标乒乓(都默认关)
+
+| 文件 | 改动 |
+|---|---|
+| `src/framelab.cpp` | `FL_G_TRACER 0x1000000` + `kSigTracerUpdate`(scan_all 按操作数过滤)+ `fl_wrap_tracer`;`FL_G_ICONANIM 0x2000000` + `kSigIconPingPong`(一处 4 字节重定向);`kEngineTracerMgrVa`;`FL_G_EVERYTHING` → `0x3FFFFFF`;SetGroups 各报一行;导出 `FrameLabTracerStatus` |
+| `src/framelab.def` | +1 导出(40) |
+| `RE-按显示帧递推普查-2026-09-21.md` | §6:用户快照逐条分析、弹道流机制与补丁点、客户端逐帧更新 hub 的管理器名单、两条已排除项 |
+
+干扫 25 条全过;两个新位默认关,实机未验证。
+
+
+### §AB.2(2026-09-22):GUI 打包复选框 + 熔炉光定位
+
+| 文件 | 改动 |
+|---|---|
+| `tools/gui/ra3fps_gui.cpp` / `gui_res.h` | 复选框 `IDC_FX_FIX`「修复过快的视觉效果」(默认不勾,`kFxFixBits = 0x3400000`);启用后报弹道流节拍门状态;窗口布局下移 24 px、客户区 472 → 496 |
+| `RE-按显示帧递推普查-2026-09-21.md` | §6.8 RadiusDecal = 熔炉光头号候选;§6.9~6.11 三条排除(粒子量纲 / 动态点光 / 开火动画) |
+
+三个新位仍默认关;实机未验证。
+
+
+### §AB.3(2026-09-22):联机不同步的定性 + GUI 联机提醒
+
+| 文件 | 改动 |
+|---|---|
+| `tools/gui/ra3fps_gui.cpp` | 目标帧率 > 30 且安装成功时,日志多打四行联机提醒(实测 30 原版 ＋ 90 补丁 = 不同步;只和同样装补丁、同目标帧率的玩家联机;即便如此也从未测过;单机 / 战役 / 遭遇战 / 自录自看不受影响) |
+| `HANDOFF.md` | 新增 §22:现场澄清(是真人对战不是回放)、与 §18 证据链的对应、嫌疑名单、已排除的客户端 RNG、对照实验 |
+
+**本节没有改任何补丁点**,只是定性与提醒。构建:`Ra3FpsTest.exe` 367104 字节,`deps OK`。
+
+⚠ 记一条口径:一开始把提醒写成「这是锁步模型的必然结果,不是某处写错」—— **这是错的**。
+原版本身允许两台机器渲染帧率不同却同步,所以「渲染变快」不该导致不同步;实测不同步 ⇒
+补丁改的某个量被模拟侧读到了,**只是还没查出是哪一个**。已按「未知就说未知」的口径改写。
+
+
+### §AC(2026-09-23):粒子系统管理器 30 Hz 节拍门(默认关)
+
+| 文件 | 改动 |
+|---|---|
+| `src/framelab.cpp` | `FL_G_PSYS 0x4000000` + `kSigPsysUpdate`(唯一命中 `0x005F43A7`)+ `fl_wrap_psys`(只改 `sub_5F43A0` 里 `call sub_6D1D30` 的 rel32,运行期核对原目标);`FL_G_EVERYTHING` → `0x7FFFFFF`;分组汇总日志一行;卸载时清登记;导出 `FrameLabPsysStatus` |
+| `src/framelab.def` | +1 导出(41) |
+| `tools/gui/ra3fps_gui.cpp` / `gui_res.h` | 「修复过快的视觉效果」打包 `0x3400000` → `0x7400000`;启用后报粒子系统节拍门状态 |
+| `tests/test_loader.cpp` | +2 条:状态导出取得到;未安装时返回 0(不是 -2) |
+| `HANDOFF.md` §23 / `RE-按显示帧递推普查-2026-09-21.md` §6.12 | 真因、调用链、补丁点;订正 §6.8(RadiusDecal 被实测否定) |
+
+用户实测结论:弹道流节拍门**有效**(帝国武士不再像机关枪);熔炉光仍快 ⇒ 本节。新位实机未验证。
+
+
+### §AD(2026-09-26):战役过场运镜计时(默认关)
+
+| 文件 | 改动 |
+|---|---|
+| `src/framelab.cpp` | `FL_G_CAMERA 0x8000000`:16 条特征 `kSigCam00..15`(全部 `scan()` 唯一命中、全进干扫)、`kCamOpOff` / `kCamKind`;11 处换算改指 `g_camMs`、3 处推进改指 `g_msPerFrame`、2 处镜头动画除数改指 `g_fpsRender`;16 处全中才装;`FL_G_EVERYTHING` → `0xFFFFFFF`;导出 `FrameLabCameraStatus` |
+| `src/framelab.def` | +1 导出(42) |
+| `tools/gui/ra3fps_gui.cpp` / `gui_res.h` | 打包复选框改名「修复过快的特效与过场运镜(实验)」,`0x7400000` → `0xF400000`;启用后报运镜计时状态 |
+| `tests/test_loader.cpp` | +2 条(38 / 0) |
+| `HANDOFF.md` §24 / RE §6.13 / `交接-给90帧机器.md` §12 | 真因、普查、修法;熔炉光的排除清单与测量方案 |
+
+熔炉光:粒子路径已全部封住,剩余约 3 倍的来源静态未找到,待测量。

@@ -110,16 +110,6 @@ EXPORTS
     ; 2026-09-21: user-selectable scroll-speed normalisation (group 0x800000, default off).
     ; FrameLabScrollStatus(): -2 = patch points not found, 0 = off, 1 = engaged.
     FrameLabScrollStatus
-    ; 2026-09-22: tracer-stream 30 Hz cadence gate (group 0x1000000, default off).
-    ; FrameLabTracerStatus(): -2 = patch point missing, 0 = off, 1000000+ratio = engaged
-    ;   (ratio = forwarded/called x1000; ~333 at 90 fps, ~500 at 60 fps).
-    FrameLabTracerStatus
-    ; 2026-09-23: particle-system manager 30 Hz cadence gate (group 0x4000000, default off).
-    ; FrameLabPsysStatus(): -2 = patch point missing, 0 = off, 1000000+ratio = engaged.
-    FrameLabPsysStatus
-    ; 2026-09-26: scripted-camera timing fix (group 0x8000000, default off).
-    ; FrameLabCameraStatus(): -2 = not all 16 sites patched, 0 = off / not needed, 1000+ms = engaged.
-    FrameLabCameraStatus
     FrameLabChassisRate
     FrameLabChassisSlots
     FrameLabSelfTestChassis

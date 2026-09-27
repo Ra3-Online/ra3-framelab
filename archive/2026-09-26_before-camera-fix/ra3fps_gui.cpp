@@ -141,8 +141,7 @@ static volatile LONG g_scrollFix = 0;
 //   **默认不勾**:三位都还没在游戏里跑过,车身那一项刚验收通过,不要把变量混在一起。
 // 2026-09-23:打包里再加 0x4000000 粒子系统节拍门 —— 用户实测「光仍然闪得快」,而同包的弹道流已修好
 //   ⇒ 0x400000(RadiusDecal)不是那盏光;真凶是粒子系统管理器每显示帧推进一步(见 framelab.cpp FL_G_PSYS)。
-// 2026-09-26:再加 0x8000000 过场运镜计时 —— 用户实测战役过场「镜头一下就过去、到了地方等飞机」,约快 3 倍。
-static const unsigned kFxFixBits = 0xF400000u;
+static const unsigned kFxFixBits = 0x7400000u;
 static volatile LONG g_fxFix = 0;
 static bool g_groupsOverridden = false;
 static unsigned EnvGroups();
@@ -945,22 +944,6 @@ static bool JobPatch(DWORD& outPid, HANDLE& outProc, JobCtx& ctx) {
                     LogLine(L"[WARN] 读不到载具颠簸修复的状态（DLL 太旧？）。");
                 }
             }
-            // 2026-09-26:过场运镜计时同样报「到底开没开成」。
-            if ((EffectiveGroups() & 0x8000000u) != 0) {
-                void* camStatus = RemoteExport(pid, localBase, "FrameLabCameraStatus");
-                DWORD cs2 = 0;
-                if (camStatus && RemoteCall(proc, camStatus, NULL, &cs2, 60000)) {
-                    const int v = (int)cs2;
-                    if (v >= 1000)
-                        LogF(L"[OK]   过场运镜计时已生效（换算按每帧 %d 毫秒；90 帧应为 11、60 帧应为 17）。", v - 1000);
-                    else if (v == -2)
-                        LogLine(L"[!!]   过场运镜计时【没装上】（16 处特征没全部命中？）—— 战役过场镜头仍会跑太快。");
-                    else
-                        LogLine(L"[..]   过场运镜计时未生效（目标帧率不高于原版？）。");
-                } else {
-                    LogLine(L"[WARN] 读不到过场运镜计时的状态（DLL 太旧？）。");
-                }
-            }
             // 2026-09-23:粒子系统节拍门(电厂 / 矿场的光)同样报「到底开没开成」+ 放行比例。
             if ((EffectiveGroups() & 0x4000000u) != 0) {
                 void* psStatus = RemoteExport(pid, localBase, "FrameLabPsysStatus");
@@ -1255,7 +1238,7 @@ static bool RunJob(JobCtx ctx) {
              : L"随帧率变快（现状：60 帧约 2 倍、90 帧约 3 倍）");
     if (!g_groupsOverridden)
         LogF(L"过快视觉效果修复 = %s", g_fxFix
-             ? L"开（弹道流密度 + 粒子发射 + 光效 / 淡出 / 图标 + 战役过场运镜钉回原版；分组多出 0xF400000）"
+             ? L"开（弹道流密度 + 粒子发射 + 光效 / 淡出 / 图标节奏钉回原版；分组多出 0x7400000）"
              : L"关（现状：弹道流、贴花淡出、拖尾滚动等在 60/90 帧下快 2/3 倍）");
 
     // Warn about a mismatch between the requested rate and the panel BEFORE launching, so the
@@ -1489,7 +1472,7 @@ static void CreateUi(HWND h) {
                                 312, 29, 290, 20, h, (HMENU)IDC_SCROLL_FIX, g_hInst, NULL);
     SendMessageW(g_hScroll, BM_SETCHECK, g_scrollFix ? BST_CHECKED : BST_UNCHECKED, 0);
     // 2026-09-22:过快视觉效果的打包开关,默认不勾。
-    g_hFx = CreateWindowExW(0, L"BUTTON", L"修复过快的特效与过场运镜（实验）",
+    g_hFx = CreateWindowExW(0, L"BUTTON", L"修复过快的视觉效果（弹道 / 光效，实验）",
                             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                             312, 50, 290, 20, h, (HMENU)IDC_FX_FIX, g_hInst, NULL);
     SendMessageW(g_hFx, BM_SETCHECK, g_fxFix ? BST_CHECKED : BST_UNCHECKED, 0);

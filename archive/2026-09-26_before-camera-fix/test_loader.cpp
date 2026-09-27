@@ -163,14 +163,6 @@ int main(int argc, char** argv) {
         check(rcPs == 0, "粒子系统节拍门:没安装时状态 = 0(关),不是 -2", rcPs);
     }
 
-    // 2026-09-26:过场运镜计时。没安装时必须是 0(关),不能是 -2。
-    FnStatus camStatus = (FnStatus)GetProcAddress(h, "FrameLabCameraStatus");
-    check(camStatus != NULL, "过场运镜计时的状态导出取得到");
-    if (camStatus) {
-        const int rcCam = camStatus();
-        check(rcCam == 0, "过场运镜计时:没安装时状态 = 0(关),不是 -2", rcCam);
-    }
-
     const int rcDisable = disable();
     check(rcDisable == 1, "没装过时关闭返回「未安装」(1)", rcDisable);
 

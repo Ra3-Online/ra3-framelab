@@ -39,7 +39,6 @@
 #include <cstring>
 
 #include "schedule.h"
-#include "chassis_gate.h"   // 2026-09-21:车身外观 30 Hz 节拍门的纯逻辑(与离线自检共用)
 
 // ───────────────────────────── 版本与状态码 ─────────────────────────────
 #define FL_VERSION "0.2.0"
@@ -434,10 +433,7 @@ static const short kSigMsPerFrameSetter[] = {
 // 实测供参考(历史,不当理由用):关掉后渲染 89.75 / 逻辑 14.97,与全开无差别 ——
 // **那条读数看不见建筑解包动画**,所以它对这个问题没有鉴别力。
 #define FL_G_ANIMGATE  0x1000        // P7 逐帧绘制更新的**次数门**(修动画过快;见下面 kSigFrameUpdate)
-#define FL_G_EVERYTHING 0xFFFFFFF      // 含派生量 + P8 + 动画标尺 + 混合斜坡量尺 + 时钟修正 + P6b + 原版帧率下的时钟修正
-                                      // + 车身外观探针/节拍门/插值(2026-09-21,0x80000 / 0x100000 / 0x200000)+ 第四个派生量(0x400000),仅供对照实验
-                                      // + 卷屏 / 弹道流 / 图标(0x800000 / 0x1000000 / 0x2000000)+ 粒子系统节拍门(0x4000000,2026-09-23)
-                                      // + 过场运镜计时(0x8000000,2026-09-26)
+#define FL_G_EVERYTHING 0x7FFFF       // 含派生量 + P8 + 动画标尺 + 混合斜坡量尺 + 时钟修正 + P6b + 原版帧率下的时钟修正,仅供对照实验
 // ⛔ 2026-09-17 P7「动画次数门」已从默认集合**移除**,理由见 kSigFrameUpdate 上方的订正。
 //    实测:开了它,录像回放**当场不同步** —— 它删的是模拟步骤,不是动画。
 // ★ 2026-09-17 动画定位会话:默认集合加入 FL_G_CLOCK(0x8000)。
@@ -635,288 +631,6 @@ static const short kSigMsPerFrameSetter[] = {
 //   这个位 = **强制**在原版帧率下也修正(只为做对照实验,默认关)。
 //   判据可测:开它 ⇒ 时钟增量出现 33,33,34;不开 ⇒ 恒 33。用 ring_analyze.py 第 5 节看。
 #define FL_G_CLOCK_AT_RETAIL 0x40000
-
-// ── ★★★ 2026-09-21(悬挂路径会话):车身外观(悬挂 / 俯仰 / 侧倾)—— 探针 + 30 Hz 节拍门 ──────
-// 背景:用户实机(170 Hz 屏,真 90 帧)录像:蓝色海啸坦克行驶时**上下颠簸剧烈**,原版 30 帧正常。
-//   此前两把量具(动画帧号、世界坐标)都测不出差异 —— 因为它们在结构上就看不见这条路径:
-//     sub_53F080 (Drawable::draw)
-//       → sub_535DD0 (applyPhysicsXform:平移视觉 Z,再依次转 俯仰 / −侧倾 / 偏航)
-//         → sub_532CA0 (calcPhysicsXform:按**显示帧号**去重 loco+0xBC,再按 locomotor 外观分派)
-//           → 外观 1/7 sub_526BD0(轮式带悬挂)| 2/3/4 sub_51E800 | 8 sub_5262D0
-//   与 EA 公开的 Generals `Drawable.cpp`(calcPhysicsXformWheels 等)近乎逐行对应。这一族函数是
-//   **每显示帧递推一次、不含 dt** 的迭代(逐条见 RE-车身悬挂-2026-09-21.md):
-//     · 俯仰/侧倾弹簧阻尼      rate += −k·(角 − 地面角) − c·rate;  角 += rate·u
-//     · 随机颠簸 sub_5269C0    速度 > 10% 最大速度、且角速度已衰减到阈值以下才再踢一次
-//     · 加速点头/侧倾的第二套弹簧、sub_51A220 摆动相位累加、sub_51A2D0 偏航衰减、
-//       四个轮位偏移 ×0.5 平滑、轮角 ×0.1 平滑
-//   原版每秒递推 30 次;渲染到 60/90 帧后每秒 60/90 次 ⇒ 整套车身运动的**时间轴被压缩 2/3 倍**。
-//   它只改渲染矩阵、不动逻辑坐标;随机数走**客户端**种子(sub_600AB0 → 0x00CB01F0),
-//   不碰逻辑随机数;也不读任何帧率常量 —— 所以帧率读者普查(0xCAF9D4 / 0xCDBC5x / 0xCE176C)查不到它。
-//
-// 补丁点:sub_535DD0 里**唯一**那条 `call sub_532CA0`。现场字节(原始二进制读的):
-//     00535E7B  F3 0F 11 44 24 14    movss [esp+0x14], xmm0      ; 四个输出清零(后两个)
-//     00535E81  F3 0F 11 44 24 18    movss [esp+0x18], xmm0
-//     00535E87  E8 14 CE FF FF       call  sub_532CA0            ; ★ 只改这条 call 的 rel32(+13)
-//     00535E8C  84 C0                test  al, al
-//     00535E8E  0F 84 B4 00 00 00    je    不施加任何姿态        ; ★ 返回 0 ⇒ 这一帧车身没有姿态
-//   原目标 = hit + 17 + rel32,必须等于 0x00532CA0(绝对 VA,别再加基址 —— 见 kEngineBlendStepVa 的坑)。
-//   与动画标尺 / 混合斜坡量尺同一种手法:5 字节原地改写、长度不变、进撤销表、可整体回滚。
-//
-// 两个位,**都默认关**(不在 FL_G_ALL 里;GUI 的 0x2CFFF 也不含):
-//   FL_G_CHASSISPROBE 0x80000   只读探针:包装先记账再**原样**转发,行为逐位不变。
-//                               给 `flctl chassisrate / chassisslots` 和黑匣子「姿态轴」用。
-//                               与动画标尺一样,只量不改(measureex)模式下也可装 —— 原版基线要用同一把尺子。
-//   FL_G_CHASSIS30    0x100000  修复候选:节拍门。只在「30 Hz 虚拟帧号」变化的显示帧放行原函数,
-//                               其余显示帧回放缓存的四个输出(见 src/chassis_gate.h)。
-//                               目标帧率 == 原版帧率时等于直通;只量不改模式下**不生效**。
-//   任一位开着就会装包装函数;对照实验用:
-//       0x28FFF | 0x080000 = 0x0A8FFF   默认集合 + 探针(量「修之前」)
-//       0x28FFF | 0x180000 = 0x1A8FFF   默认集合 + 探针 + 节拍门(量「修之后」)
-// 判据(与 clockrate / blendrate 同类的不变量):**同一辆车每逻辑帧的递推步数恒为 2**
-//   (原版 30 帧:2;没修的 60/90 帧:4/6;修好后任何帧率:2)。读数 = `flctl chassisrate` ×1000。
-// ⚠ 状态:2026-09-21 只做了离线构建与自检,**实机一次都没跑过**;默认关,转正前必须实测 A/B。
-#define FL_G_CHASSISPROBE 0x80000
-#define FL_G_CHASSIS30    0x100000
-// ── 2026-09-21(同日追加):节拍门的**插值**变体,为 90 帧准备 ──────────────────────────────
-//   FL_G_CHASSIS30 单开 = 「回放」:车身姿态每秒只变 30 次(60 帧停 2 帧、90 帧停 3 帧),而车的平移每帧都在动
-//   ⇒ 车身相对自己的平移有 30 Hz 台阶,帧率越高越显眼。再开这一位 = 递推仍严格 30 Hz,
-//   但**显示**时在相邻两个 30 Hz 位姿之间按相位线性插值(90 帧 φ = 1/3, 2/3, 1)⇒ 每个显示帧姿态都在变、
-//   动力学与原版逐步相同,代价是显示晚至多 33 毫秒。细节与边界见 src/chassis_gate.h。
-//   单开这一位没有意义(它只是节拍门的一个模式),install() 会把它当成「节拍门 + 插值」。
-//       0x28FFF | 0x180000 = 0x1A8FFF   探针 + 节拍门(回放)
-//       0x28FFF | 0x380000 = 0x3A8FFF   探针 + 节拍门(插值)  ← 90 帧的首选候选
-#define FL_G_CHASSISLERP  0x200000
-
-// ── ★★★ 2026-09-21(显示帧递推普查):帧率派生量其实有**四个**,第七批只管了三个 ────────────────
-//   第四个 = 0x00CDBD34 = 1.0 ÷ flt_CDBC50 = **每显示帧的秒数**(原版 1/30)。初始化器紧跟在
-//   0x00CDBC50 的后面(原始字节已核):
-//       00BB3150  F3 0F 10 05 00 62 BE 00   movss xmm0,[0x00BE6200]   ; 1.0
-//       00BB3158  F3 0F 5E 05 50 BC CD 00   divss xmm0,[0x00CDBC50]   ; ÷ 帧率        ← 用它核对没认错地方
-//       00BB3160  F3 0F 11 05 34 BD CD 00   movss [0x00CDBD34],xmm0   ; ★要改写的存量值
-//       00BB3168  C3
-//   全镜像 1 个写者(就是它,只在启动时跑一次 —— 我们是中途注入,改指令没用,只能改**存量值**)+ 8 个读者,
-//   逐个读过,全部是「一个显示帧 = 多少秒」:sub_52C4B0(精灵旋转/脉动,t = 帧号 × 它)、
-//   sub_5EA080 / sub_5EA110(贴花淡出,每帧 alpha −= (1÷时长) × 它)、sub_6BDE60(拖尾粒子贴图滚动)、
-//   sub_9080B0 → sub_8E3130(子物体计时,每帧 t += 它)、sub_8E2070 / sub_8E42E0(动画时间比较里的「一帧以内」阈值)。
-//   渲染到 60/90 帧而它仍是 1/30 ⇒ 这些效果快 2/3 倍。单位一致性的论证与 FL_G_DERIVED2 完全相同。
-//   为什么**默认关**(不进 FL_G_ALL,GUI 的默认集合也不含):2026-09-21 才发现,实机一次都没跑过;
-//   而且此刻正在验收车身颠簸修复,变量不要混。对照掩码:0x28FFF | 0x400000 = 0x428FFF。
-//   完整普查见 RE-按显示帧递推普查-2026-09-21.md。
-#define FL_G_DER_SPF      0x400000
-
-// ── ★ 2026-09-21(用户点名「卷屏做成可自选的」):卷屏速度按帧率归一,**默认关、可自选** ─────────────
-//   键盘 / 屏幕边缘卷屏(sub_AC0070,状态对象 vtable off_C80FA8 的 +8 槽;加速段走 sub_ABC9C0)的位移是
-//       位移 = 方向 × 卷屏系数(flt_CB0338 / flt_CB033C) × **100.0** × (显示帧号 − 上次帧号) × 选项里的卷屏速度
-//   帧号差**没有**换算成时间(只有「加速段多长」用了 flt_CDBC50 × 0.25)⇒ 每个显示帧走固定的一步
-//   ⇒ 卷屏速度正比于渲染帧率:60 / 90 帧下快 2 / 3 倍。这是手感问题而不是对错问题,所以做成开关:
-//       关(默认) = 现状:卷屏随帧率变快;      开 = 每秒走的距离与原版 30 帧相同。
-//   做法(仍是「只重定向读者」):那个 100.0 是 .rdata 里的共享常量(0x00C7FF44,全镜像 4 个读者),
-//   只把**这两条按帧推进的**读指令的操作数改指我们自己的 g_scroll100 = 100 × 原版帧率 ÷ 目标帧率:
-//       00AC0273  F3 0F 10 1D 44 FF C7 00   movss xmm3,[0x00C7FF44]   ; sub_AC0070 稳态段
-//       00ABCA04  F3 0F 10 1D 44 FF C7 00   movss xmm3,[0x00C7FF44]   ; sub_ABC9C0 加速段
-//   另外两个读者 sub_ABC640 / sub_ABC690 是**事件驱动**的一次性位移(没有帧号差),不动。
-//   为什么不去缩放卷屏系数本身:flt_CB0338 / flt_CB033C 各有 3 个写入点(设置 / 选项菜单),运行中会变,
-//   我们的副本会过期;而 100.0 是常量。两处必须**一起**改(只改一处,加速段与稳态段速度会接不上)。
-//   ⚠ 不含右键拖拽卷屏(sub_ABFF40):它是「每调用一次走 系数 ×(鼠标 − 锚点)」,没有帧号差;
-//     它的调用节拍(每帧 / 每次鼠标消息)静态没定下来,先不碰,见 RE-按显示帧递推普查-2026-09-21.md。
-//   状态:2026-09-21 静态定位 + 离线构建;**实机一次都没跑过**。
-#define FL_G_SCROLL       0x800000
-
-// ── ★★★ 2026-09-22(用户 90 帧实机报告 #2):弹道流(TheTracerManager)30 Hz 节拍门,**默认关** ──────
-//   用户原话:帝国武士(JapanAntiInfantryInfantry)开火「原速一轮射击开不了几发子弹,60/90 帧下像机关枪,
-//   射速极高」,**但总伤害量没变** ⇒ 模拟侧是对的,快的是纯视觉。
-//   真因与车身悬挂是**同一个形状**:`dword_CDB79C`(由 sub_98D690(..., "TheTracerManager") 确证)的
-//   update(vtable +20 = sub_5F4960)开头就按显示帧号去重:
-//       v2 = (*(vtbl+116))(dword_CDB750);                    // 显示帧号
-//       if (v2 != this[42]) { this[42] = v2; sub_5F48C0(this, v2); ... }   // 一次调用 = 推进一步
-//   ⇒ 原版每秒推进 30 步,90 帧下每秒 90 步。而生成密度(sub_5F1D30,转储 419149 起)是
-//   「每次推进生成 rand(模板+36, 模板+40) 条」(带小数进位器 this[34]),伸展进度 this[38] 同样每次推进一步
-//   ⇒ **每秒生成的弹道流条数是原版的 2 / 3 倍** —— 正是「看起来子弹多得像机关枪」。
-//   弹道流是纯客户端视觉(不碰模拟),与「总伤害没变」完全一致。
-//
-//   补丁点 = 客户端逐帧更新总入口 sub_542DF0 里那次调用,11 字节窗口(现场字节已核):
-//       00542E49  8B 0D 9C B7 CD 00   mov  ecx,[0x00CDB79C]   ; TheTracerManager ← 让签名唯一的就是它
-//       00542E4F  85 C9               test ecx, ecx           ; ★ 窗口从这里开始
-//       00542E51  74 07               je   0x542E5A
-//       00542E53  8B 01               mov  eax,[ecx]
-//       00542E55  8B 50 14            mov  edx,[eax+0x14]
-//       00542E58  FF D2               call edx
-//   ⚠ 紧邻的上一处(dword_CDB794)后 11 个字节**完全相同**,所以特征必须带上 `mov ecx,[0xCDB79C]`。
-//   换成 `call fl_wrap_tracer`(5 字节)+ 6 个 NOP;包装函数拿 ecx = 管理器,只在「30 Hz 虚拟帧号变化」
-//   时才转发 vtbl[0x14]。**不需要插值**:原版本来就是 30 Hz 步进,这样与原版逐步相同。
-#define FL_G_TRACER       0x1000000
-static const short kSigTracerUpdate[] = {
-    0x8B,0x0D,W,W,W,W,                    // mov  ecx,[TheTracerManager]   ← 操作数在 +2,必须是 0x00CDB79C
-    0x85,0xC9,                            // test ecx, ecx                 ← 窗口起点在 +6
-    0x74,0x07,                            // je   +7
-    0x8B,0x01,                            // mov  eax,[ecx]
-    0x8B,0x50,0x14,                       // mov  edx,[eax+0x14]
-    0xFF,0xD2                             // call edx
-};
-
-// ── ★ 2026-09-22:单位头顶状态图标的乒乓动画,**默认关** ────────────────────────────────────────
-//   sub_51A4D0:`帧 = 显示帧号 × dword_CAD5F4(=15) ÷ dword_CAF9D4(=30) % (2N)`,再折回来做乒乓。
-//   分子 15 = 逻辑帧率、除数 30 = **原版**客户端帧率,而补丁故意不写 0xCAF9D4(它仍是 30)
-//   ⇒ 90 帧下这组图标动画快 3 倍。调用点在 sub_527900 / sub_528860,取的是 dword_CDB7A0 那组共享图标。
-//   修法是一处 4 字节:把那条 `div [0x00CAF9D4]` 的操作数改指 g_fpsRender ⇒ `帧号 × 15 ÷ 目标帧率`
-//   = 逻辑帧数,与原版逐帧相同。**不是**用户说的熔炉光,只是顺手修掉的同类。
-#define FL_G_ICONANIM     0x2000000
-
-// ── ★★★ 2026-09-23(用户 90 帧实机报告 #3):粒子系统管理器 30 Hz 节拍门,**默认关** ──────────────
-//   用户原话:苏联电厂灯口、矿场熔炉的光「一闪一闪,闪得特别快(原速闪得较慢)」。
-//   ⛔ 先订正上一轮的头号候选:RE 文档 §6.8 押的是 RadiusDecal(flt_CDBD34)—— **错了**。
-//     用户这次开着「修复过快的视觉效果」(含 0x400000,而同包的弹道流确实修好了),光照样快。
-//     真正画那团光的是**粒子系统**:sovietpowerplant.xml / sovietrefinery.xml 里都挂着
-//     <ParticleSysBone BoneName="FX_STEAM01" FXParticleSystemTemplate="SovietPowerGlow"/>,
-//     帝国矿场挂的是 JapanPowerGlow(Remix 源码 Data/ 下的 XML 逐条读过)。
-//   真因(伪代码逐行读过):
-//     TheFXParticleSystemManager = dword_CE3F04(sub_98D690(..., "TheFXParticleSystemManager") 确证),
-//     它的 update(vtbl+20 = sub_5F43A0,W3D 派生类)由 sub_5D9A50 调用 —— 那是**画一帧**("FullFrame")的函数,
-//     所以每个**显示帧**跑一次,不含 dt。sub_5F43A0 先 call sub_6D1D30(基类:逐个系统 sub_6D18F0),
-//     再清空并重建 47 个按着色器分组的绘制桶。而 sub_6D18F0 里全是「每调用减一」的帧计数器:
-//       this+60   起始延迟(A8)          每次 --                         ⇒ 延迟缩到 1/2、1/3
-//       this+260  爆发间隔(sub_6BF1F0)   每次 --,到 0 发射 rand(模板+168)×this+80 颗,再装填 rand(模板+156)
-//                                                                          ⇒ **每秒发射次数是原版的 2 / 3 倍**
-//       this+268  系统寿命(sub_6B7530)   每次 --                         ⇒ 系统提前消失
-//     粒子**个体**的寿命走时钟(P4 已钉,见 RE §6.9),所以不是「粒子活得短」,而是「新粒子冒得勤」——
-//     一团由随机大小 / 亮度的加色粒子叠出来的光,每冒一颗亮度就跳一下 ⇒ 肉眼就是「闪得快 3 倍」。
-//   补丁点 = sub_5F43A0 开头那条 call sub_6D1D30(只改 rel32,5 字节;现场字节已核,全镜像唯一):
-//       005F43A7  8B F9               mov  edi, ecx
-//       005F43A9  89 7C 24 14         mov  [esp+0x14], edi
-//       005F43AD  E8 7E D9 0D 00      call sub_6D1D30        ; ★ ecx = 管理器(上面没动过 ecx)
-//       005F43B2  C7 87 84 00 00 00 00 00 00 00   mov dword [edi+0x84], 0
-//       005F43BC  81 C7 E4 00 00 00   add  edi, 0xE4
-//       005F43C2  BD 2F 00 00 00      mov  ebp, 47          ; 47 个绘制桶
-//   ★ 为什么只门住这一条 call、**不**门住整个 sub_5F43A0:后半段每帧清空并重建绘制桶(存的是系统指针)。
-//     整个跳过 ⇒ 桶里留着上一帧的指针,期间若有系统被别的路径销毁就是悬空指针。只门基类 update
-//     ⇒ 桶照旧每帧重建,只有「推进一步」按 30 Hz 虚拟帧放行 ⇒ 三个计数器与原版逐步相同。
-//   代价(已知、可接受):跟随骨骼的系统,其发射点 / 变换也按 30 Hz 刷新 —— 这正是原版 30 帧下的节拍;
-//     GPU 粒子的运动在着色器里按时钟算(age = Time × 30 − CreationFrame),仍然每个显示帧都在动。
-//     死掉的系统最多晚 2 个显示帧才从表里摘掉(它们已经没有粒子,画出来是空的)。
-#define FL_G_PSYS         0x4000000
-static const short kSigPsysUpdate[] = {                  // sub_5F43A0 开头,命中 0x005F43A7
-    0x8B,0xF9,                            // mov  edi, ecx
-    0x89,0x7C,0x24,0x14,                  // mov  [esp+0x14], edi
-    0xE8,W,W,W,W,                         // call sub_6D1D30               ← call 在 +6,rel32 在 +7
-    0xC7,0x87,0x84,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,   // mov dword [edi+0x84], 0
-    0x81,0xC7,0xE4,0x00,0x00,0x00,        // add  edi, 0xE4
-    0xBD,0x2F,0x00,0x00,0x00              // mov  ebp, 47
-};
-
-// ── ★★★ 2026-09-26(用户 90 帧实机报告 #4):战役过场「运镜一下就过去了」—— 脚本镜头计时,**默认关** ─────
-//   用户原话:90 帧下过场镜头跑得飞快,提前到了地方等了一会飞机才过来(正常应镜头跟着飞机),约快 3 倍;
-//   但有些过场(如苏联第一关开场)又是正常的。录像抽帧核对:镜头 ~3 秒扫完、4~8 秒原地等、8.3 秒飞机才到。
-//   真因(伪代码逐行读过;与 Generals W3DView::update 的写法 1:1):
-//     视角更新 sub_5EB7D0 → sub_5EB5E0(每个**显示帧**一次)推进所有脚本镜头动作,全部按「每次调用走一帧」:
-//       旋转 sub_5B9920 / 俯仰 sub_5B99A0 / 缩放 sub_5B9A40 / 视角 sub_5B9AC0 / 移动 sub_5E5910 / 模式 3 sub_5C3980:
-//           `++当前帧; 进度 = 当前帧 ÷ 总帧数`,而总帧数在发起时算:`总帧数 = 毫秒 ÷ dword_CE176C`(9 处 idiv)
-//       沿路径移动 sub_5C4070 / 模式 1 sub_5C3A20 / 模式 2:每次调用推进 `dword_CE176C` 毫秒(3 处读)
-//       模式 4 镜头动画(sub_5B98B0 发起,sub_913AE0 推进):`帧 += 显示帧差 × 30.0 ÷ dword_CAF9D4`(2 处读)
-//     dword_CE176C = 原版「每客户端帧毫秒」33,dword_CAF9D4 = 原版名义帧率 30;补丁故意**不写**这两个共享全局
-//     (FL_G_CLOCK 只改指了时钟那两处读者)⇒ 90 帧下每秒走 90 步 ⇒ 所有脚本运镜快 3 倍。
-//     跟随单位的镜头(镜头绑在移动的单位上)按单位的逻辑位置走,本来就对 —— 这大概就是「有些过场正常」。
-//   普查:全镜像读 0x00CE176C 的指令一共 18 条 = 2 个写者(已隔离)+ 2 条时钟(FL_G_CLOCK 已改指)+ **14 条全在镜头代码里**。
-//   修法 = 只改指操作数(16 处,每处 4 字节;不写共享全局,铁律同 R1):
-//     9 条 idiv + 2 条 imul(毫秒↔帧数换算)→ g_camMs = round(1000 ÷ 目标帧率)(固定值;90 → 11,60 → 17)
-//         ⚠ 不能用 g_msPerFrame:那是时钟累加器逐帧摆动的值(90 帧下 11/12),拿它当除数会让单次运镜时长抖 ±9%。
-//     3 条「每次调用推进毫秒」→ g_msPerFrame(与游戏时钟同一个精确平均值)
-//     2 条读 dword_CAF9D4 → g_fpsRender(= 目标帧率)⇒ 镜头动画每显示帧走 30 ÷ 目标帧率 帧 —— 正是公式本意。
-//   目标帧率 ≤ 原版时不装(那时两套值与原版逐位相同)。16 处全部命中才装,否则一处都不改(只 WARN)。
-//   ⚠ 若战役脚本在逻辑侧等待「镜头动作完成」,这一修正会把等待时长恢复成原版 —— 这正是要的;
-//     但它确实影响逻辑时序,联机合作战役里双方配置不同必然更早不同步(本来就不同步,见 HANDOFF §22)。
-#define FL_G_CAMERA       0x8000000
-#define FL_CAM_SITES      16
-static const short kSigCam00[] = {   // 005B9615  sub_5B95F0  idiv [CE176C]  镜头移动(+1048)帧数 = 毫秒 ÷ 每帧毫秒  (操作数在 +2)
-    0xF7,0x3D,0x6C,0x17,0xCE,0x00,0x83,0xF8,0x01,0x89,0x86,0xE8,0x03,0x00,0x00,0x7D,0x0A,0xC7,0x86,0xE8,0x03,0x00,0x00,0x01,0x00,0x00,0x00,0xF3
-};
-static const short kSigCam01[] = {   // 005B96C6  sub_5B96B0  idiv [CE176C]  镜头移动帧数(第 1 处)  (操作数在 +2)
-    0xF7,0x3D,0x6C,0x17,0xCE,0x00,0x83,0xF8,0x01,0x89,0x86,0xF8
-};
-static const short kSigCam02[] = {   // 005B96F2  sub_5B96B0  idiv [CE176C]  镜头移动帧数(第 2 处)  (操作数在 +2)
-    0xF7,0x3D,0x6C,0x17,0xCE,0x00,0x83,0xF8,0x01,0x89,0x86,0xE8,0x03,0x00,0x00,0x7D,0x0A,0xC7,0x86,0xE8,0x03,0x00,0x00,0x01,0x00,0x00,0x00,0x8B,0x44,0x24,0x08
-};
-static const short kSigCam03[] = {   // 005B97AA  sub_5B9780  imul [CE176C]  剩余帧 → 剩余毫秒  (操作数在 +3)
-    0x0F,0xAF,0x05,0x6C,0x17,0xCE,0x00,0xF3,0x0F,0x2A
-};
-static const short kSigCam04[] = {   // 005C3189  sub_5C3160  idiv [CE176C]  镜头移动帧数  (操作数在 +2)
-    0xF7,0x3D,0x6C,0x17,0xCE,0x00,0x83,0xF8,0x01,0x89,0x86,0xE8,0x03,0x00,0x00,0x7D,0x0A,0xC7,0x86,0xE8,0x03,0x00,0x00,0x01,0x00,0x00,0x00,0x8B,0x44,0x24,0x14
-};
-static const short kSigCam05[] = {   // 005C333C  sub_5C3320  idiv [CE176C]  旋转帧数(+1092)  (操作数在 +2)
-    0xF7,0x3D,0x6C,0x17,0xCE,0x00,0x83,0xF8,0x01,0x7D,0x05,0xB8,0x01,0x00,0x00,0x00,0xD9
-};
-static const short kSigCam06[] = {   // 005C33CC  sub_5C33B0  idiv [CE176C]  俯仰帧数(+1128)  (操作数在 +2)
-    0xF7,0x3D,0x6C,0x17,0xCE,0x00,0x83,0xF8,0x01,0x7D,0x05,0xB8,0x01,0x00,0x00,0x00,0xF3
-};
-static const short kSigCam07[] = {   // 005C3495  sub_5C3480  idiv [CE176C]  缩放帧数(+1052)  (操作数在 +2)
-    0xF7,0x3D,0x6C,0x17,0xCE,0x00,0x83,0xF8,0x01,0x89,0x86,0x1C
-};
-static const short kSigCam08[] = {   // 005C3525  sub_5C3510  idiv [CE176C]  高度/视角帧数(+1172)  (操作数在 +2)
-    0xF7,0x3D,0x6C,0x17,0xCE,0x00,0x83,0xF8,0x01,0x89,0x86,0x94
-};
-static const short kSigCam09[] = {   // 005C3607  sub_5C35A0  imul [CE176C]  剩余帧 → 剩余毫秒  (操作数在 +3)
-    0x0F,0xAF,0x05,0x6C,0x17,0xCE,0x00,0xD8,0x4C,0x24
-};
-static const short kSigCam10[] = {   // 005ED163  sub_5ECF00  idiv [CE176C]  变换插值帧数(模式 3,+984)  (操作数在 +2)
-    0xF7,0x3D,0x6C,0x17,0xCE,0x00,0x83,0xF8,0x01,0x89,0x86,0xD8
-};
-static const short kSigCam11[] = {   // 005EB661  sub_5EB5E0  mov eax,[CE176C]  沿路径移动:每次调用推进的毫秒  (操作数在 +1)
-    0xA1,0x6C,0x17,0xCE,0x00,0x6A,0x01,0x50,0x8B,0xCE
-};
-static const short kSigCam12[] = {   // 005EB6A6  sub_5EB5E0  mov ecx,[CE176C]  模式 1:每次调用推进的毫秒  (操作数在 +2)
-    0x8B,0x0D,0x6C,0x17,0xCE,0x00,0x51,0x8B,0xCE,0xE8
-};
-static const short kSigCam13[] = {   // 005EB769  sub_5EB5E0  mov eax,[CE176C]  模式 2:每次调用推进的毫秒  (操作数在 +1)
-    0xA1,0x6C,0x17,0xCE,0x00,0x6A,0x00,0x50,0x8B,0xCE
-};
-static const short kSigCam14[] = {   // 005EB6F5  sub_5EB5E0  mov eax,[CAF9D4]  模式 4 镜头动画:符号检查  (操作数在 +1)
-    0xA1,0xD4,0xF9,0xCA,0x00,0xDB,0x05,0xD4,0xF9,0xCA,0x00,0x85,0xC0,0x7D,0x06,0xD8,0x05,0x74,0x8F,0xBE,0x00,0xD8,0x3D,0xFC
-};
-static const short kSigCam15[] = {   // 005EB6FA  sub_5EB5E0  fild [CAF9D4]     模式 4 镜头动画:显示帧差 × 30 ÷ 它  (操作数在 +2)
-    0xDB,0x05,0xD4,0xF9,0xCA,0x00,0x85,0xC0,0x7D,0x06,0xD8,0x05,0x74,0x8F,0xBE,0x00,0xD8,0x3D,0xFC
-};
-// 每条特征里「要改指的操作数」的偏移,以及改指到哪:c = g_camMs(换算用固定值)/ k = g_msPerFrame(每次推进)/ f = g_fpsRender
-static const unsigned char kCamOpOff[FL_CAM_SITES] = {2,2,2,3,2,2,2,2,2,3,2, 1,2,1, 1,2};
-static const char          kCamKind[FL_CAM_SITES + 1] = "ccccccccccckkkff";
-static const short kSigIconPingPong[] = {
-    0x8B,0xD0,                            // mov  edx, eax                 (显示帧号)
-    0xA1,W,W,W,W,                         // mov  eax,[dword_CAD5F4]
-    0x0F,0xAF,0xC2,                       // imul eax, edx
-    0x33,0xD2,                            // xor  edx, edx
-    0xF7,0x35,W,W,W,W,                    // div  dword [0x00CAF9D4]       ← 操作数在 +16
-    0x8D,0x0C,0x36                        // lea  ecx,[esi+esi]
-};
-static const short kSigScrollStep1[] = {                 // sub_AC0070 稳态段,命中 0x00AC0263
-    0x89,0x4C,0x24,0x10,                  // mov  [esp+0x10], ecx         帧号差
-    0xDB,0x44,0x24,0x10,                  // fild dword [esp+0x10]
-    0x7D,0x06,                            // jge  +6
-    0xD8,0x05,W,W,W,W,                    // fadd [2^32]                  无符号修正
-    0xF3,0x0F,0x10,0x1D,W,W,W,W,          // movss xmm3,[100.0]           ← 操作数在 +20
-    0xD9,0x5C,0x24,0x10,                  // fstp dword [esp+0x10]
-    0xF3,0x0F,0x59,0xC3,                  // mulss xmm0, xmm3
-    0xF3,0x0F,0x59,0xCB                   // mulss xmm1, xmm3
-};
-static const short kSigScrollStep2[] = {                 // sub_ABC9C0 加速段,命中 0x00ABC9FC
-    0x7D,0x06,                            // jge  +6
-    0xD8,0x05,W,W,W,W,                    // fadd [2^32]
-    0xF3,0x0F,0x10,0x1D,W,W,W,W,          // movss xmm3,[100.0]           ← 操作数在 +12
-    0xD9,0x5C,0x24,0x08,                  // fstp dword [esp+8]
-    0x8B,0x44,0x24,0x04,                  // mov  eax,[esp+4]
-    0xF3,0x0F,0x59,0xC3,                  // mulss xmm0, xmm3
-    0xF3,0x0F,0x59,0xCB                   // mulss xmm1, xmm3
-};
-static const short kSigSecPerFrameInit[] = {
-    0xF3,0x0F,0x10,0x05,W,W,W,W,          // movss xmm0, [1.0]
-    0xF3,0x0F,0x5E,0x05,W,W,W,W,          // divss xmm0, [客户端帧率浮点]   ← 操作数在 +12,必须是 0x00CDBC50
-    0xF3,0x0F,0x11,0x05,W,W,W,W,          // movss [每显示帧秒数], xmm0    ← 操作数在 +20 = 要改写的全局
-    0xC3                                  // ret
-};
-static const short kSigChassisCall[] = {
-    0xF3,0x0F,0x11,0x44,0x24,0x14,        // movss [esp+0x14], xmm0
-    0xF3,0x0F,0x11,0x44,0x24,0x18,        // movss [esp+0x18], xmm0
-    0xE8,W,W,W,W,                         // call sub_532CA0          ← rel32 在 +13
-    0x84,0xC0,                            // test al, al
-    0x0F,0x84,W,W,W,W                     // je   (返回 0 ⇒ 不施加姿态)
-};
 // 覆盖范围从 xorps 开始,是因为调用我们的钩子会破坏 xmm1/xmm2(32 位 MSVC 里 xmm 全是易失的),
 // 而后面的钳位要用它们 —— 所以把这两个常量的装载也一起接管,调用后重新装载。
 static const short kSigPerFrame[] = {
@@ -1154,45 +868,6 @@ static volatile long  g_stepCalls  = 0;      // 区间内被调用了多少次(�
 static double         g_stepDtSum  = 0.0;    // 区间内收到的 dt 之和,单位**秒**
 static volatile long  g_stepDtCnt  = 0;      // dt 的样本数(与 g_stepCalls 一致,分开只为可读性)
 static volatile long  g_stepMaxDt  = 0;      // 见过的最大 dt × 1000000(用来发现异常大的步长)
-
-// ── ★★★ 2026-09-21(悬挂路径会话):车身外观探针 / 30 Hz 节拍门的状态(钩子点见 kSigChassisCall)──
-// calcPhysicsXform(sub_532CA0)的绝对 VA —— 用来核对「那条 call 真的调去了它」。
-// ⚠ 绝对 VA,不是 RVA;**不要再加 g_base**(同 kEngineBlendStepVa 的坑)。
-static const uintptr_t kEngineChassisXformVa = 0x00532CA0;
-// 2026-09-22:TheTracerManager 的全局(sub_98D690(..., "TheTracerManager") 确证)。只用来核对特征没认错。
-static const uintptr_t kEngineTracerMgrVa = 0x00CDB79C;
-// 2026-09-21:卷屏归一(见 FL_G_SCROLL)。被改指过来的两条 movss 直接读这个常量。
-static float g_scroll100   = 100.0f;      // = 100 × 原版帧率 ÷ 目标帧率,install() 里算
-// 2026-09-23:粒子系统管理器节拍门(见 FL_G_PSYS)。基类 update 的绝对 VA,用来核对「那条 call 真的调去了它」。
-static const uintptr_t kEnginePsysUpdateVa = 0x006D1D30;
-static unsigned char* g_psSite   = NULL;    // 被改的那条 call 的地址(应为 0x005F43AD);NULL = 没装
-static void*          g_psOrigFn = NULL;    // 它原来的目标 sub_6D1D30(不在卸载时清,理由同 g_chsOrigFn)
-static unsigned       g_psVFrame = 0xFFFFFFFFu;  // 上一次放行时的 30 Hz 虚拟帧号
-static bool           g_psOn     = false;   // 节拍门是否真的生效
-static volatile long  g_psCalls  = 0;       // 包装被进入的次数
-static volatile long  g_psFwd    = 0;       // 真的转发给引擎的次数(放行 ÷ 调用 应 ≈ 30 ÷ 目标帧率)
-// 2026-09-26:过场运镜计时(见 FL_G_CAMERA)。被改指过来的 11 条换算指令直接读 g_camMs。
-static int            g_camMs    = 33;      // round(1000 ÷ 目标帧率),install() 里算
-static int            g_camSites = 0;       // 实际改指成功的处数(应为 16)
-static bool           g_camOn    = false;   // 16 处全部改指成功
-static int   g_scrollSites = 0;           // resolve 时定位并核对通过的补丁点个数(应为 2;不是 2 就一处都不登记)
-static bool  g_scrollOn    = false;       // 两处是否真的改指了(给 FrameLabScrollStatus 用)
-// 2026-09-22:弹道流节拍门(见 FL_G_TRACER)。只需要一个「上次转发时的 30 Hz 虚拟帧号」,不需要表 ——
-//   全进程只有一个 TheTracerManager。
-static unsigned char* g_trcSite   = NULL;    // 被改的那 11 字节的起点(应为 0x00542E4F);NULL = 没装
-static unsigned       g_trcVFrame = 0xFFFFFFFFu;  // 上一次放行时的虚拟帧号
-static bool           g_trcOn     = false;   // 节拍门是否真的生效
-static volatile long  g_trcCalls  = 0;       // 包装被进入的次数
-static volatile long  g_trcFwd    = 0;       // 真的转发给引擎的次数(放行 ÷ 调用 应 ≈ 30 ÷ 目标帧率)
-static unsigned char* g_chsSite   = NULL;    // 被改的那条 call 的地址(应为 0x00535E87);NULL = 没装
-static void*          g_chsOrigFn = NULL;    // 它原来的目标 sub_532CA0
-static int            g_chsMode   = FL_CHS_MODE_PROBE;   // 0 探针 / 1 节拍门·回放 / 2 节拍门·插值(只量不改或目标帧率 <= 原版时恒为 0)
-static FlChassisEnt   g_chsTab[FL_CHS_SLOTS];            // 每辆车一格:缓存的输出 + 记账(见 chassis_gate.h)
-static volatile long  g_chsCalls  = 0;       // 包装函数被进入的总次数
-static volatile long  g_chsAdv    = 0;       // 原函数被放行且返回非 0 的总次数(= 递推总步数)
-static volatile long  g_chsHold   = 0;       // 回放缓存的总次数
-static volatile long  g_chsZero   = 0;       // 原函数返回 0 的总次数(无 locomotor / 外观不处理 / 同帧去重)
-static volatile long  g_chsNoSlot = 0;       // 表满退回直通的总次数(正常应为 0)
 
 static bool remember(void* address, int size) {
     if (g_undoCount >= kUndoMax) { FL_ERR("撤销表已满(%d 处)—— 拒绝继续改,否则回滚会残缺", kUndoMax); return false; }
@@ -1514,106 +1189,6 @@ extern "C" void __fastcall fl_wrap_blendstep(void* self, void* unused, float dt)
     orig(self, dt);                                // 原样转发
 }
 
-// ── ★★★ 2026-09-21(悬挂路径会话):车身外观包装(探针 + 30 Hz 节拍门)────────────────────
-// sub_532CA0 的形状:`char __thiscall sub_532CA0(Drawable* this, float* out4)` ——
-//   this 在 ECX,out(四个 float:俯仰/侧倾/偏航/视觉 Z)是唯一的栈参,被调方 `ret 4`,结果在 AL。
-// 我们的钩子声明成 `__fastcall(self, 占位, out)`:self→ECX、占位→EDX(原函数不用)、out→栈,
-//   被调方同样清 4 字节 —— 与上面 fl_wrap_blendstep 是同一招,栈布局与原调用逐位一致。
-// ★ 这是被**正常编译的 call** 调进来的(只改了 rel32),不是手工机器码桩,所以没有「手工栈平衡」
-//   的约束;但它在渲染热路径上(每辆可见载具每显示帧一次),所以照样:不用 SEH、不调 read_ok
-//   (VirtualQuery 是系统调用)、不分配内存。表是定长静态数组,满了就退回直通。
-// 行为保证:
-//   · 只开探针(FL_G_CHASSISPROBE):每次都原样转发 ⇒ 对引擎逐位无差别,只多记账。
-//   · 开节拍门(FL_G_CHASSIS30):见 src/chassis_gate.h —— 只在 30 Hz 虚拟帧变化时放行,其余帧回放缓存。
-typedef char (__thiscall *FnChassisXform)(void* self, float* out);
-typedef int  (__thiscall *FnClientFrame)(void* client);
-
-// 适配器:把引擎的 __thiscall 原函数包成 chassis_gate.h 要的形状(ctx 不用)。
-static char chassis_call_engine(void* ctx, void* self, float* out) {
-    (void)ctx;
-    return ((FnChassisXform)g_chsOrigFn)(self, out);
-}
-
-extern "C" char __fastcall fl_wrap_chassis(void* self, void* unused, float* out) {
-    (void)unused;                                  // edx 是调用方的残留值
-    ++g_chsCalls;
-    // 显示帧号:和原函数用**同一个来源**(TheGameClient 的 vtbl+0x74,字节偏移)。原函数自己
-    //   紧接着也会对同一个指针做同样的解引用,所以这里与原代码同样安全。全局还是空的
-    //   (极早期)就直接直通。
-    void* client = *(void**)kDisplayClockVa;
-    if (!client) return chassis_call_engine(NULL, self, out);
-    const unsigned frame = (unsigned)((FnClientFrame)(*(void***)client)[0x74 / 4])(client);
-
-    FlChassisEnt* ent = NULL;
-    int did = FL_CHS_DID_ZERO;
-    const char r = fl_chs_gate(g_chsTab, self, out, frame, g_targetFps, g_retailFps,
-                               g_chsMode, (unsigned)(2 * (g_targetFps > 0 ? g_targetFps : 60)),
-                               chassis_call_engine, NULL, &ent, &did);
-    if (did == FL_CHS_DID_ADVANCE)      ++g_chsAdv;
-    else if (did == FL_CHS_DID_HOLD)    ++g_chsHold;
-    else                                ++g_chsZero;
-    if (!ent) ++g_chsNoSlot;
-    // 外观枚举只读一次,而且只在「原函数刚刚放行且返回非 0」之后读:那一刻引擎自己刚沿着
-    //   同一条指针链走过一遍(Drawable+0x138 → Object+0x374 → AI+0x21C → locomotor → 模板+100),
-    //   链上每一环都刚被它自己用过。它告诉我们这辆车走的是哪个分支:
-    //   1/7 → sub_526BD0(轮式带悬挂)  2/3/4 → sub_51E800  8 → sub_5262D0。
-    if (ent && ent->appearance < 0 && did == FL_CHS_DID_ADVANCE) {
-        unsigned char* obj  = *(unsigned char**)((unsigned char*)self + 0x138);
-        unsigned char* ai   = obj  ? *(unsigned char**)(obj + 0x374) : NULL;
-        unsigned char* loco = ai   ? *(unsigned char**)(ai + 0x21C)  : NULL;
-        unsigned char* lt   = loco ? *(unsigned char**)(loco + 4)    : NULL;
-        unsigned char* tmpl = lt   ? *(unsigned char**)(lt + 4)      : NULL;
-        if (tmpl) ent->appearance = *(int*)(tmpl + 100);
-    }
-    return r;
-}
-
-// ── ★★★ 2026-09-22:弹道流 30 Hz 节拍门的包装(见 FL_G_TRACER)────────────────────────────────
-// 被改的 11 字节里,ecx 在进入时**已经**装着 TheTracerManager(上一条 `mov ecx,[0xCDB79C]` 没被动),
-// 所以这里用 __fastcall 接住它;原代码的 null 判断由我们自己做(那条 test/je 被我们覆盖掉了)。
-// 只读我们自己的两个全局 + 一次虚拟帧号计算,不分配、不用 SEH;转发就是原来那条 `call [vtbl+0x14]`。
-// 节拍门关着(只读计数)时每次都转发 ⇒ 行为逐位不变。
-typedef void (__thiscall *FnTracerUpdate)(void* self);
-extern "C" void __fastcall fl_wrap_tracer(void* mgr, void* unused) {
-    (void)unused;
-    if (!mgr) return;                                  // 原代码的 test ecx,ecx / je
-    ++g_trcCalls;
-    if (g_trcOn) {
-        void* client = *(void**)kDisplayClockVa;
-        if (client) {
-            typedef int (__thiscall *FnClientFrame2)(void*);
-            const unsigned frame = (unsigned)((FnClientFrame2)(*(void***)client)[0x74 / 4])(client);
-            const unsigned vf = fl_chs_vframe(frame, g_targetFps, g_retailFps);
-            if (vf == g_trcVFrame) return;             // 这个 30 Hz 虚拟帧已经推进过了
-            g_trcVFrame = vf;
-        }
-    }
-    ++g_trcFwd;
-    ((FnTracerUpdate)(*(void***)mgr)[0x14 / 4])(mgr);
-}
-
-// ── ★★★ 2026-09-23:粒子系统管理器 30 Hz 节拍门的包装(见 FL_G_PSYS)────────────────────────────
-// 进来时 ecx = W3D 粒子管理器(原 call 前没动过 ecx),__fastcall 接住;原目标 sub_6D1D30 是 __thiscall、
-// 无栈参数 ⇒ 我们也无栈参数,调用约定对得上。与弹道流包装同一个形状:只读自己的全局 + 一次虚拟帧号计算,
-// 不分配、不用 SEH。节拍门不生效时每次都转发 ⇒ 行为逐位不变。
-typedef void (__thiscall *FnPsysUpdate)(void* self);
-extern "C" void __fastcall fl_wrap_psys(void* mgr, void* unused) {
-    (void)unused;
-    ++g_psCalls;
-    if (g_psOn) {
-        void* client = *(void**)kDisplayClockVa;
-        if (client) {
-            typedef int (__thiscall *FnClientFrame3)(void*);
-            const unsigned frame = (unsigned)((FnClientFrame3)(*(void***)client)[0x74 / 4])(client);
-            const unsigned vf = fl_chs_vframe(frame, g_targetFps, g_retailFps);
-            if (vf == g_psVFrame) return;              // 这个 30 Hz 虚拟帧已经推进过了
-            g_psVFrame = vf;
-        }
-    }
-    ++g_psFwd;
-    ((FnPsysUpdate)g_psOrigFn)(mgr);
-}
-
 // ───────────────────────────── 安装 / 卸载 ─────────────────────────────
 static void log_environment() {
     char path[MAX_PATH] = {0};
@@ -1684,9 +1259,6 @@ struct Sites {
     // 我们注入时它们早算完了,得按同样公式按新帧率写回去;顺便把算它们的那条 fild 也改指向。
     struct { float* target; float value; void** fildOperand; int group; } derived[8];
     int derivedCount;
-
-    // 2026-09-21:第四个派生量 0x00CDBD34(每显示帧秒数)的存量值。NULL = 没定位到 / 核对没过(只 WARN,不拒装)。
-    float* spfTarget;
 };
 
 static bool add_redirect(Sites& s, void** operand, const char* name, int group, void* newTarget = NULL) {
@@ -1789,7 +1361,6 @@ static int resolve_and_verify(int targetFps, Sites& s) {
     // 2026-09-16 会话 68ee9b9d
     s.redirectCount = 0;
     s.derivedCount = 0;
-    s.spfTarget = NULL;
     {
         unsigned char* hits[16];
 
@@ -1937,62 +1508,6 @@ static int resolve_and_verify(int targetFps, Sites& s) {
         for (int i = 0; i < s.derivedCount; ++i)
             if (!add_redirect(s, s.derived[i].fildOperand, "R2 派生量 fild", s.derived[i].group)) return FL_ERR_SIG_AMBIGUOUS;
 
-        // ── R2b 第四个派生量:每显示帧秒数 0x00CDBD34(2026-09-21,默认关,见 FL_G_DER_SPF 定义处)──────
-        //   这种「movss / divss / movss / ret」形状的静态初始化器在主程序里不止一个,所以用 scan_all
-        //   按**除数操作数 == 0x00CDBC50** 过滤,过滤后必须恰好 1 处;再核对被除数常量 = 1.0、
-        //   存量值 ≈ 1 ÷ 原版帧率。任何一条对不上 ⇒ 只 WARN、跳过(它是可选项,不该拖垮整个补丁)。
-        {
-            Pattern pSpf = {"每显示帧秒数 init", kSigSecPerFrameInit,
-                            (int)(sizeof kSigSecPerFrameInit / sizeof kSigSecPerFrameInit[0]), 0};
-            const int nSpf = scan_all(pSpf, 12, (void*)kEngineFpsFloatVa, hits, 16);
-            if (nSpf != 1) {
-                FL_WARN("R2b 每显示帧秒数:按「除数 = %08X」过滤后命中 %d 处(应恰好 1 处)—— 跳过。",
-                        (unsigned)kEngineFpsFloatVa, nSpf);
-            } else {
-                float* one = *(float**)(hits[0] + 4);
-                float* spf = *(float**)(hits[0] + 20);
-                const float want = 1.0f / (float)g_retailFps;
-                if (!mem::read_ok(one, 4) || !mem::read_ok(spf, 4)) {
-                    FL_WARN("R2b 每显示帧秒数:操作数地址不可读(%08X / %08X)—— 跳过。",
-                            (unsigned)(uintptr_t)one, (unsigned)(uintptr_t)spf);
-                } else if (*one < 0.999f || *one > 1.001f || *spf < want * 0.99f || *spf > want * 1.01f) {
-                    FL_WARN("R2b 每显示帧秒数:现场值不对(被除数 %.6f 应为 1.0;存量值 @%08X = %.6f 应为 %.6f)"
-                            "—— 认错了地方或已被改过,跳过。",
-                            *one, (unsigned)(uintptr_t)spf, *spf, want);
-                } else {
-                    s.spfTarget = spf;
-                    FL_INFO("  R2b 每显示帧秒数 @ %08X = %.6f(init @ %08X);FL_G_DER_SPF 开着才会改写成 1/%d",
-                            (unsigned)(uintptr_t)spf, *spf, (unsigned)(uintptr_t)hits[0], targetFps);
-                }
-            }
-        }
-
-        // ── S 卷屏步长常量(可自选,默认关;见 FL_G_SCROLL 定义处)。两处必须一起登记:只改一处,
-        //    加速段与稳态段的速度会接不上。任何一处没命中 / 常量不是 100.0 ⇒ 两处都不登记,只 WARN。
-        g_scrollSites = 0;
-        {
-            Pattern pScroll1 = {"卷屏步长①(键盘/边缘·稳态段)", kSigScrollStep1,
-                                (int)(sizeof kSigScrollStep1 / sizeof kSigScrollStep1[0]), 0x00AC0263};
-            Pattern pScroll2 = {"卷屏步长②(键盘/边缘·加速段)", kSigScrollStep2,
-                                (int)(sizeof kSigScrollStep2 / sizeof kSigScrollStep2[0]), 0x00ABC9FC};
-            unsigned char* sc1 = scan(pScroll1);
-            unsigned char* sc2 = scan(pScroll2);
-            const bool found = sc1 && sc2 && sc1 != (unsigned char*)-1 && sc2 != (unsigned char*)-1;
-            float* c1 = found ? *(float**)(sc1 + 20) : NULL;
-            float* c2 = found ? *(float**)(sc2 + 12) : NULL;
-            if (!found || !mem::read_ok(c1, 4) || !mem::read_ok(c2, 4)
-                || *c1 < 99.99f || *c1 > 100.01f || *c2 < 99.99f || *c2 > 100.01f) {
-                FL_WARN("S 卷屏步长:两处特征没有同时命中,或常量不是 100.0 —— 两处都不登记(卷屏保持现状)。");
-            } else if (!add_redirect(s, (void**)(sc1 + 20), "S 卷屏步长①(稳态段)", FL_G_SCROLL, (void*)&g_scroll100)
-                    || !add_redirect(s, (void**)(sc2 + 12), "S 卷屏步长②(加速段)", FL_G_SCROLL, (void*)&g_scroll100)) {
-                return FL_ERR_SIG_AMBIGUOUS;
-            } else {
-                g_scrollSites = 2;
-                FL_INFO("  S 卷屏步长:两处就位(%08X / %08X,共享常量 %08X = %.1f);FL_G_SCROLL 开着才会改指",
-                        (unsigned)(uintptr_t)sc1, (unsigned)(uintptr_t)sc2, (unsigned)(uintptr_t)c1, *c1);
-            }
-        }
-
         // ── ★ 时钟推进量(2026-09-17 动画定位会话)—— 这是「动画快 3 倍」的真因,默认开。
         // 完整证据链见 FL_G_CLOCK 上方的注释。这里只**定位 + 登记**重定向,真正写内存由 install() 统一做。
         // 干扫(dryrun)也走这里,所以「能不能装」的判据与实际要改的东西永远一致。
@@ -2130,7 +1645,6 @@ static int resolve_perframe_only(Sites& s) {
     }
     s.redirectCount = 0;
     s.derivedCount = 0;
-    s.spfTarget = NULL;
     return FL_OK;
 }
 
@@ -2155,9 +1669,6 @@ static int install(int targetFps, bool measureOnly) {
     //   循环里会把游戏那条 divss 的除数操作数改成 &g_constRenderFps,
     //   若那时它还是旧值,游戏第一帧就会读到错的 dt。
     g_constRenderFps  = (float)targetFps;
-    // 2026-09-21:卷屏步长常量(见 FL_G_SCROLL)。同样必须在重定向循环之前就位。
-    g_scroll100 = 100.0f * (float)g_retailFps / (float)(targetFps > 0 ? targetFps : g_retailFps);
-    g_scrollOn  = false;
 
     mem::ThreadFreezer freeze;   // 改代码期间别让别的线程跑到这些字节上
     FL_INFO("已挂起其它线程 %d 个,开始写补丁", freeze.count);
@@ -2351,216 +1862,6 @@ static int install(int targetFps, bool measureOnly) {
         }
     }
 
-    // ── ★★★ 车身外观包装(探针 / 30 Hz 节拍门,**都默认关**;2026-09-21 悬挂路径会话)──────────
-    //    把 sub_535DD0 里那条 `call sub_532CA0` 的 rel32 改指到 fl_wrap_chassis。
-    //    5 字节原地改写、长度不变、进撤销表。完整背景见 FL_G_CHASSISPROBE 定义处。
-    //    ★ 只量不改(measureex)模式下**也可以装** —— 但那时只当探针用(节拍门不生效):
-    //      原版基线必须用同一把尺子量,否则「修之前 / 修之后 / 原版」三臂没法比。
-    //    ★ 与两把动画量尺同一套取舍:没命中 / 目标不对 ⇒ 只 WARN、跳过,不拖垮其它改动;
-    //      两个全局**只在真正装成功之后**才赋值(「没装」不能伪装成「没采到」,铁律 15)。
-    //    (g_chsOrigFn 不在这里清:它是绝对 VA 的常量值,清掉只会给「上一轮还停在包装里的线程」挖坑。)
-    g_chsSite = NULL; g_chsMode = FL_CHS_MODE_PROBE;
-    if (ok && (g_groups & (FL_G_CHASSISPROBE | FL_G_CHASSIS30 | FL_G_CHASSISLERP))) {
-        Pattern pChassis = {"车身外观调用点", kSigChassisCall,
-                            (int)(sizeof kSigChassisCall / sizeof kSigChassisCall[0]), 0x00535E7B};
-        unsigned char* hit = scan(pChassis);
-        if (hit && hit != (unsigned char*)-1) {
-            unsigned char* site = hit + 12;                                 // call 指令本身(0x00535E87)
-            void* origFn = (void*)(hit + 17 + *(int*)(hit + 13));           // 原目标 = call 下一条 + rel32
-            if (origFn != (void*)kEngineChassisXformVa) {
-                FL_WARN("车身外观包装:call @%08X 的目标是 %08X,期望 %08X(sub_532CA0)—— 跳过。",
-                        (unsigned)(uintptr_t)site, (unsigned)(uintptr_t)origFn,
-                        (unsigned)kEngineChassisXformVa);
-            } else {
-                unsigned char code[5];
-                code[0] = 0xE8;                                             // call rel32
-                const int rel = (int)((unsigned char*)&fl_wrap_chassis - (site + 5));
-                memcpy(code + 1, &rel, 4);
-                // 表与总账在改字节**之前**清零:改完那一刻渲染线程就可能进来(虽然此刻它被挂起)。
-                memset(g_chsTab, 0, sizeof g_chsTab);
-                g_chsCalls = g_chsAdv = g_chsHold = g_chsZero = g_chsNoSlot = 0;
-                g_chsOrigFn = origFn;                                       // 包装一进来就要用,必须先就位
-                {
-                    const bool gate = (g_groups & (FL_G_CHASSIS30 | FL_G_CHASSISLERP)) && !measureOnly && targetFps > g_retailFps;
-                    g_chsMode = !gate ? FL_CHS_MODE_PROBE
-                                      : ((g_groups & FL_G_CHASSISLERP) ? FL_CHS_MODE_LERP : FL_CHS_MODE_HOLD);
-                }
-                ok = patch(site, code, 5, "车身外观包装(只改 call 目标)");
-                if (ok) {
-                    g_chsSite = site;                                       // ★ 只有装成功才登记
-                    FL_INFO("  车身外观包装已装:call @%08X → 包装 %08X(原目标 %08X)",
-                            (unsigned)(uintptr_t)site, (unsigned)(uintptr_t)&fl_wrap_chassis,
-                            (unsigned)(uintptr_t)origFn);
-                    if (g_chsMode != FL_CHS_MODE_PROBE)
-                        FL_INFO("    ★30 Hz 节拍门**生效**(%s):车身递推每 %d 个显示帧放行 %d 次"
-                                "(期望 chassisrate ≈ 2000)",
-                                g_chsMode == FL_CHS_MODE_LERP ? "插值:每个显示帧在相邻两个 30 Hz 位姿之间按相位取值"
-                                                              : "回放:其余显示帧原样重放上一次的位姿",
-                                targetFps, g_retailFps);
-                    else if (g_groups & (FL_G_CHASSIS30 | FL_G_CHASSISLERP))
-                        FL_INFO("    节拍门位开着但**不生效**:%s ⇒ 包装只当探针用,行为逐位不变",
-                                measureOnly ? "只量不改模式" : "目标帧率不高于原版帧率(本来就该直通)");
-                    else
-                        FL_INFO("    只读探针:每次原样转发,行为逐位不变"
-                                "(没修的 %d 帧下期望 chassisrate ≈ %d)",
-                                measureOnly ? g_retailFps : targetFps,
-                                measureOnly ? 2000 : (targetFps * 1000) / 15);
-                } else {
-                    g_chsMode = FL_CHS_MODE_PROBE;
-                }
-            }
-        } else {
-            FL_WARN("车身外观包装:特征未命中或命中多处 —— 跳过(不影响其它改动)。"
-                    "后果:车身悬挂递推仍按显示帧率走,60/90 帧下颠簸节奏快 2/3 倍。");
-        }
-    }
-
-    // ── ★★★ 弹道流 30 Hz 节拍门(默认关;2026-09-22)──────────────────────────────────────────
-    //    11 字节换成 `call fl_wrap_tracer` + 6 个 NOP。ecx 已由上一条 mov 装好,不用再取。
-    //    只量不改模式下不装(那一臂要的是原版行为)。
-    g_trcSite = NULL; g_trcOn = false; g_trcVFrame = 0xFFFFFFFFu; g_trcCalls = 0; g_trcFwd = 0;
-    if (ok && !measureOnly && (g_groups & FL_G_TRACER)) {
-        // ⚠ 把操作数通配掉之后,这段字节与紧邻的上一处(dword_CDB794 那个管理器)**完全相同** ——
-        //   所以不能用 scan()(它要求唯一命中,这里必然报「命中多处」),必须像 R1 那样**按操作数过滤**:
-        //   只认 `mov ecx,[0x00CDB79C]` 的那一处,过滤后必须恰好 1 处。
-        unsigned char* trcHits[8];
-        // 期望地址写 0:这条特征交给 scan_all(按操作数过滤),而**离线干扫不做操作数过滤** ——
-        //   它只把「第一处命中」和期望地址比,于是会误报 FAIL(实测第一处在 0x004EE6E8)。
-        //   与其它 scan_all 用例(R1 算 r、R2b 每显示帧秒数)一致:地址由运行期的操作数判据把关。
-        Pattern pTrc = {"弹道流 update 调用点", kSigTracerUpdate,
-                        (int)(sizeof kSigTracerUpdate / sizeof kSigTracerUpdate[0]), 0};
-        const int nTrc = scan_all(pTrc, 2, (void*)kEngineTracerMgrVa, trcHits, 8);
-        unsigned char* hit = (nTrc == 1) ? trcHits[0] : NULL;
-        if (!hit) {
-            FL_WARN("弹道流节拍门:按「管理器 = %08X」过滤后命中 %d 处(应恰好 1 处)—— 跳过。"
-                    "后果:60/90 帧下弹道流密度仍是原版的 2/3 倍(开火看起来像机关枪)。",
-                    (unsigned)kEngineTracerMgrVa, nTrc);
-        } else {
-            FL_INFO("  弹道流 update 调用点 @ %08X(管理器 %08X,过滤前 %d 处里唯一一处读它)",
-                    (unsigned)(uintptr_t)hit, (unsigned)kEngineTracerMgrVa, nTrc);
-            unsigned char* site = hit + 6;             // 从 test ecx,ecx 开始的 11 字节
-            unsigned char code[11];
-            memset(code, 0x90, sizeof code);
-            code[0] = 0xE8;
-            const int rel = (int)((unsigned char*)&fl_wrap_tracer - (site + 5));
-            memcpy(code + 1, &rel, 4);
-            ok = patch(site, code, (int)sizeof code, "弹道流 30 Hz 节拍门");
-            if (ok) {
-                g_trcSite = site;
-                g_trcOn   = (targetFps > g_retailFps);
-                FL_INFO("  弹道流节拍门已装 @ %08X → 包装 %08X;%s",
-                        (unsigned)(uintptr_t)site, (unsigned)(uintptr_t)&fl_wrap_tracer,
-                        g_trcOn ? "生效(每秒推进钉回 30 步 ⇒ 生成密度与原版相同)"
-                                : "目标帧率不高于原版 ⇒ 每次都转发,行为逐位不变");
-            }
-        }
-    }
-
-    // ── ★★★ 粒子系统管理器 30 Hz 节拍门(默认关;2026-09-23)─────────────────────────────────────
-    //    只改 sub_5F43A0 里那条 call sub_6D1D30 的 rel32。核对「原目标 == 0x006D1D30」才改;
-    //    g_psOrigFn 必须在改字节**之前**就位(改完那一刻渲染线程就可能进来)。只量不改模式下不装。
-    g_psSite = NULL; g_psOn = false; g_psVFrame = 0xFFFFFFFFu; g_psCalls = 0; g_psFwd = 0;
-    if (ok && !measureOnly && (g_groups & FL_G_PSYS)) {
-        Pattern pPs = {"粒子系统管理器 update 调用点", kSigPsysUpdate,
-                       (int)(sizeof kSigPsysUpdate / sizeof kSigPsysUpdate[0]), 0x005F43A7};
-        unsigned char* hit = scan(pPs);
-        if (!hit || hit == (unsigned char*)-1) {
-            FL_WARN("粒子系统节拍门:特征未命中或命中多处 —— 跳过(不影响其它改动)。"
-                    "后果:60/90 帧下粒子发射频率仍是原版的 2/3 倍(电厂 / 矿场的光闪得快)。");
-        } else {
-            unsigned char* site = hit + 6;                                  // call 指令本身(0x005F43AD)
-            void* origFn = (void*)(site + 5 + *(int*)(site + 1));           // 原目标 = call 下一条 + rel32
-            if (origFn != (void*)kEnginePsysUpdateVa) {
-                FL_WARN("粒子系统节拍门:call @%08X 的目标是 %08X,期望 %08X(sub_6D1D30)—— 跳过。",
-                        (unsigned)(uintptr_t)site, (unsigned)(uintptr_t)origFn,
-                        (unsigned)kEnginePsysUpdateVa);
-            } else {
-                unsigned char code[5];
-                code[0] = 0xE8;
-                const int rel = (int)((unsigned char*)&fl_wrap_psys - (site + 5));
-                memcpy(code + 1, &rel, 4);
-                g_psOrigFn = origFn;                                        // 包装一进来就要用,必须先就位
-                g_psOn     = (targetFps > g_retailFps);
-                ok = patch(site, code, 5, "粒子系统 30 Hz 节拍门(只改 call 目标)");
-                if (ok) {
-                    g_psSite = site;                                        // ★ 只有装成功才登记
-                    FL_INFO("  粒子系统节拍门已装:call @%08X → 包装 %08X(原目标 %08X);%s",
-                            (unsigned)(uintptr_t)site, (unsigned)(uintptr_t)&fl_wrap_psys,
-                            (unsigned)(uintptr_t)origFn,
-                            g_psOn ? "生效(起始延迟 / 爆发间隔 / 系统寿命钉回每秒 30 步 ⇒ 发射频率与原版相同)"
-                                   : "目标帧率不高于原版 ⇒ 每次都转发,行为逐位不变");
-                } else {
-                    g_psOn = false;
-                }
-            }
-        }
-    }
-
-    // ── ★★★ 战役过场运镜计时(默认关;2026-09-26)。16 处操作数改指,全中才装。──────────────────────
-    g_camOn = false; g_camSites = 0;
-    if (ok && !measureOnly && (g_groups & FL_G_CAMERA)) {
-        if (targetFps <= g_retailFps) {
-            FL_INFO("  过场运镜计时:目标帧率不高于原版 ⇒ 不需要,不装(行为逐位不变)");
-        } else {
-        Pattern pCam00 = {"镜头 005B9615", kSigCam00, (int)(sizeof kSigCam00 / sizeof kSigCam00[0]), 0x005B9615};
-        Pattern pCam01 = {"镜头 005B96C6", kSigCam01, (int)(sizeof kSigCam01 / sizeof kSigCam01[0]), 0x005B96C6};
-        Pattern pCam02 = {"镜头 005B96F2", kSigCam02, (int)(sizeof kSigCam02 / sizeof kSigCam02[0]), 0x005B96F2};
-        Pattern pCam03 = {"镜头 005B97AA", kSigCam03, (int)(sizeof kSigCam03 / sizeof kSigCam03[0]), 0x005B97AA};
-        Pattern pCam04 = {"镜头 005C3189", kSigCam04, (int)(sizeof kSigCam04 / sizeof kSigCam04[0]), 0x005C3189};
-        Pattern pCam05 = {"镜头 005C333C", kSigCam05, (int)(sizeof kSigCam05 / sizeof kSigCam05[0]), 0x005C333C};
-        Pattern pCam06 = {"镜头 005C33CC", kSigCam06, (int)(sizeof kSigCam06 / sizeof kSigCam06[0]), 0x005C33CC};
-        Pattern pCam07 = {"镜头 005C3495", kSigCam07, (int)(sizeof kSigCam07 / sizeof kSigCam07[0]), 0x005C3495};
-        Pattern pCam08 = {"镜头 005C3525", kSigCam08, (int)(sizeof kSigCam08 / sizeof kSigCam08[0]), 0x005C3525};
-        Pattern pCam09 = {"镜头 005C3607", kSigCam09, (int)(sizeof kSigCam09 / sizeof kSigCam09[0]), 0x005C3607};
-        Pattern pCam10 = {"镜头 005ED163", kSigCam10, (int)(sizeof kSigCam10 / sizeof kSigCam10[0]), 0x005ED163};
-        Pattern pCam11 = {"镜头 005EB661", kSigCam11, (int)(sizeof kSigCam11 / sizeof kSigCam11[0]), 0x005EB661};
-        Pattern pCam12 = {"镜头 005EB6A6", kSigCam12, (int)(sizeof kSigCam12 / sizeof kSigCam12[0]), 0x005EB6A6};
-        Pattern pCam13 = {"镜头 005EB769", kSigCam13, (int)(sizeof kSigCam13 / sizeof kSigCam13[0]), 0x005EB769};
-        Pattern pCam14 = {"镜头 005EB6F5", kSigCam14, (int)(sizeof kSigCam14 / sizeof kSigCam14[0]), 0x005EB6F5};
-        Pattern pCam15 = {"镜头 005EB6FA", kSigCam15, (int)(sizeof kSigCam15 / sizeof kSigCam15[0]), 0x005EB6FA};
-        unsigned char* camHit[FL_CAM_SITES] = {
-            scan(pCam00), scan(pCam01), scan(pCam02), scan(pCam03), scan(pCam04), scan(pCam05), scan(pCam06), scan(pCam07), scan(pCam08), scan(pCam09), scan(pCam10), scan(pCam11), scan(pCam12), scan(pCam13), scan(pCam14), scan(pCam15)
-        };
-        int nHit = 0;
-        for (int i = 0; i < FL_CAM_SITES; ++i)
-            if (camHit[i] && camHit[i] != (unsigned char*)-1) ++nHit;
-        if (nHit != FL_CAM_SITES) {
-            FL_WARN("过场运镜计时:16 处特征只定位到 %d 处 —— 一处都不改(不影响其它改动)。"
-                    "后果:60/90 帧下战役脚本运镜仍快 2/3 倍。", nHit);
-        } else {
-            g_camMs = (1000 + targetFps / 2) / targetFps;          // 四舍五入:30→33、60→17、90→11
-            for (int i = 0; ok && i < FL_CAM_SITES; ++i) {
-                void* p = (kCamKind[i] == 'c') ? (void*)&g_camMs
-                        : (kCamKind[i] == 'k') ? (void*)&g_msPerFrame
-                                               : (void*)&g_fpsRender;
-                ok = patch(camHit[i] + kCamOpOff[i], &p, 4, "过场运镜计时(操作数改指)");
-                if (ok) ++g_camSites;
-            }
-            g_camOn = ok && g_camSites == FL_CAM_SITES;
-            if (g_camOn)
-                FL_INFO("  过场运镜计时已装:16 处(11 处换算 → %d 毫秒/帧,3 处推进 → 时钟同步值,2 处镜头动画 → 目标 %d 帧)",
-                        g_camMs, targetFps);
-        }
-        }
-    }
-
-    // ── ★ 状态图标乒乓动画(默认关;2026-09-22)。一处 4 字节:除数 30 → 目标帧率。
-    if (ok && !measureOnly && (g_groups & FL_G_ICONANIM)) {
-        Pattern pIcon = {"状态图标乒乓(帧号×15÷帧率)", kSigIconPingPong,
-                         (int)(sizeof kSigIconPingPong / sizeof kSigIconPingPong[0]), 0x0051A4E8};
-        unsigned char* hit = scan(pIcon);
-        if (!hit || hit == (unsigned char*)-1) {
-            FL_WARN("状态图标乒乓:特征未命中 / 命中多处 —— 跳过(图标动画在 60/90 帧下仍快 2/3 倍)。");
-        } else if (*(int**)(hit + 14) != g_fpsClient) {
-            // 偏移 +14 不是 +16:8B D0(2) | A1 +操作数 4(5) | 0F AF C2(3) | 33 D2(2) | F7 35(2) ⇒ 除数在 +14。
-            FL_WARN("状态图标乒乓:除数指向 %08X,不是客户端帧率全局 %08X —— 跳过。",
-                    (unsigned)(uintptr_t)*(int**)(hit + 14), (unsigned)(uintptr_t)g_fpsClient);
-        } else {
-            void* p = (void*)&g_fpsRender;
-            ok = patch((void**)(hit + 14), &p, 4, "状态图标乒乓除数 → 目标帧率");
-        }
-    }
-
     // ── R:把「需要看到新渲染帧率」的那几条指令改指向我们的 g_fpsRender ────────────────
     // 这是本轮的设计改动:不再往游戏的客户端帧率全局里写 60(那个全局有上百处读者),
     // 改成只动我们确认需要新值的这些读者。漏掉一处的后果从「静默改错」变成「保持原样」。
@@ -2582,14 +1883,6 @@ static int install(int targetFps, bool measureOnly) {
     }
     if (ok && !measureOnly) FL_INFO("已改指向 %d 处;客户端帧率全局 %08X 仍为 %d(未改动)",
                                     s.redirectCount, (unsigned)(uintptr_t)g_fpsClient, *g_fpsClient);
-    if (ok && !measureOnly && (g_groups & FL_G_SCROLL)) {
-        g_scrollOn = (g_scrollSites == 2);
-        if (g_scrollOn)
-            FL_INFO("★卷屏归一已开:键盘 / 边缘卷屏每帧步长 100 → %.3f(= 100 × %d ÷ %d)⇒ 每秒走的距离与原版相同。"
-                    "右键拖拽卷屏不在此列。", g_scroll100, g_retailFps, targetFps);
-        else
-            FL_WARN("FL_G_SCROLL 开着,但两处卷屏步长没就位(见上面的 S WARN)—— 卷屏保持现状。");
-    }
     // ⚠ 只在 FL_G_CLOCK 真的开着时才打这条 —— 否则上面那两处重定向被跳过,
     //   还打「时钟推进量 = 11」会让人以为修好了(2026-09-17 加)。
     if (ok && !measureOnly) {
@@ -2637,18 +1930,6 @@ static int install(int targetFps, bool measureOnly) {
         ok = patch(s.derived[i].target, &s.derived[i].value, 4, "R2 派生量存量值");
         if (ok) FL_INFO("    派生量 %08X:%s → %s (%.6f)",
                         (unsigned)(uintptr_t)s.derived[i].target, oldHex, newHex, s.derived[i].value);
-    }
-
-    // ── R2b 第四个派生量的存量值(默认关;见 FL_G_DER_SPF 定义处)。与上面三个同一手法:写回按新帧率重算的值。
-    if (ok && !measureOnly && (g_groups & FL_G_DER_SPF)) {
-        if (s.spfTarget) {
-            const float v = 1.0f / (float)targetFps;
-            ok = patch(s.spfTarget, &v, 4, "R2b 每显示帧秒数存量值");
-            if (ok) FL_INFO("    每显示帧秒数 %08X → %.6f(= 1/%d;8 个读者:精灵脉动、贴花淡出、拖尾贴图滚动、子物体计时…)",
-                            (unsigned)(uintptr_t)s.spfTarget, v, targetFps);
-        } else {
-            FL_WARN("FL_G_DER_SPF 开着,但每显示帧秒数没定位到(见上面的 R2b WARN)—— 这一项没改。");
-        }
     }
 
     if (!ok) {
@@ -2731,14 +2012,6 @@ static int uninstall() {
     mem::ThreadFreezer freeze;
     FL_INFO("开始卸载,挂起其它线程 %d 个", freeze.count);
     rollback();
-    // 车身外观包装的 call 已被撤销表还原 ⇒ 登记也要清掉,否则 chassisrate 会把「已卸载」
-    // 报成「装着但没数据」(「没装」与「没采到」必须是两句不同的话)。g_chsOrigFn 故意**不清**:
-    // 万一有线程此刻正停在包装函数里,它醒来后还要用它转发一次。
-    g_chsSite = NULL; g_chsMode = FL_CHS_MODE_PROBE;
-    g_scrollOn = false;
-    g_trcSite = NULL; g_trcOn = false;
-    g_psSite = NULL; g_psOn = false;
-    g_camSites = 0; g_camOn = false;
     g_installed = false;
     FL_INFO("已卸载,全部字节还原");
     return FL_OK;
@@ -2928,53 +2201,6 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabSetGroups(int mask) {
             (fl::g_groups & FL_G_STEPPROBE)
                 ? "(只改一条 call 的目标,行为逐位不变;给 FrameLabBlendStepPerLogicFrame 用)"
                 : "(关着:量不了 P6b 的效果,clockrate 看不见这条路径)");
-    // 2026-09-22:弹道流与状态图标(用户 90 帧实机报的「开火像机关枪」)。
-    FL_INFO("  弹道流 30 Hz 节拍门=%s%s",
-            (fl::g_groups & FL_G_TRACER) ? "开" : "关",
-            (fl::g_groups & FL_G_TRACER)
-                ? "(生成密度 / 伸展 / 移动钉回每秒 30 步 —— 开火不再像机关枪;未经实机验证)"
-                : "(默认:弹道流每秒生成条数是原版的 2/3 倍)");
-    FL_INFO("  过场运镜计时=%s%s",
-            (fl::g_groups & FL_G_CAMERA) ? "开" : "关",
-            (fl::g_groups & FL_G_CAMERA)
-                ? "(战役脚本镜头的旋转 / 俯仰 / 缩放 / 移动 / 镜头动画按真实时间走;未经实机验证)"
-                : "(默认:60/90 帧下战役脚本运镜快 2/3 倍)");
-    FL_INFO("  粒子系统 30 Hz 节拍门=%s%s",
-            (fl::g_groups & FL_G_PSYS) ? "开" : "关",
-            (fl::g_groups & FL_G_PSYS)
-                ? "(起始延迟 / 爆发间隔 / 系统寿命钉回每秒 30 步 —— 电厂 / 矿场的光不再闪得快;未经实机验证)"
-                : "(默认:粒子系统每秒发射次数是原版的 2/3 倍)");
-    FL_INFO("  状态图标乒乓动画=%s%s",
-            (fl::g_groups & FL_G_ICONANIM) ? "开" : "关",
-            (fl::g_groups & FL_G_ICONANIM)
-                ? "(sub_51A4D0 的除数 30 → 目标帧率;未经实机验证)" : "");
-    // 2026-09-21:卷屏归一(用户点名要的可自选项)。
-    FL_INFO("  卷屏速度按帧率归一=%s%s",
-            (fl::g_groups & FL_G_SCROLL) ? "开" : "关",
-            (fl::g_groups & FL_G_SCROLL)
-                ? "(键盘 / 边缘卷屏每秒走的距离与原版相同;右键拖拽不在此列;未经实机验证)"
-                : "(默认:卷屏随渲染帧率变快 —— 60/90 帧下快 2/3 倍)");
-    // 2026-09-21(显示帧递推普查):第四个派生量。默认关,单独一行。
-    FL_INFO("  第四个派生量 每显示帧秒数(0x00CDBD34)=%s%s",
-            (fl::g_groups & FL_G_DER_SPF) ? "开" : "关",
-            (fl::g_groups & FL_G_DER_SPF)
-                ? "(1/30 → 1/目标帧率:精灵脉动、贴花淡出、拖尾贴图滚动、子物体计时不再快 2/3 倍;未经实机验证)"
-                : "(默认:仍是 1/30 —— 60/90 帧下那 8 个读者快 2/3 倍)");
-    // ★ 2026-09-21(悬挂路径会话):车身外观的两个位,**都默认关**。各报一行 ——
-    //   一个是尺子、一个是修复候选,混成一行会让人分不清「量的是修之前还是修之后」。
-    FL_INFO("  车身外观探针=%s%s",
-            (fl::g_groups & FL_G_CHASSISPROBE) ? "开" : "关",
-            (fl::g_groups & FL_G_CHASSISPROBE)
-                ? "(只改一条 call 的目标,原样转发;给 chassisrate / chassisslots / 黑匣子姿态轴 用)" : "");
-    FL_INFO("  ★车身外观 30 Hz 节拍门=%s%s",
-            (fl::g_groups & FL_G_CHASSIS30) ? "开" : "关",
-            (fl::g_groups & FL_G_CHASSIS30)
-                ? "(修复候选:悬挂/俯仰/侧倾递推钉回每秒 30 步,其余显示帧回放缓存)"
-                : "(默认:车身递推按显示帧率走 —— 60/90 帧下颠簸节奏快 2/3 倍)");
-    FL_INFO("  ★车身外观 位姿插值=%s%s",
-            (fl::g_groups & FL_G_CHASSISLERP) ? "开" : "关",
-            (fl::g_groups & FL_G_CHASSISLERP)
-                ? "(节拍门的插值变体:递推仍 30 Hz,显示时在相邻两个位姿之间按相位插值 —— 为 90 帧准备)" : "");
     return fl::g_groups;
 }
 
@@ -3147,479 +2373,6 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabAnimSlots(char* buf) {
     return live;
 }
 
-// ── ★★★ 2026-09-21(悬挂路径会话):车身外观的三把只读尺子 ───────────────────────────────
-// 背景与补丁点见 FL_G_CHASSISPROBE 定义处;节拍门的纯逻辑在 src/chassis_gate.h。
-//
-// ① FrameLabChassisSlots(buf)   倒出「被包装函数见过的载具」全表(按调用次数排前 24 个):
-//      Drawable 地址、locomotor 外观枚举(告诉我们它走哪个分支)、调用/放行/回放次数、最近一次四个输出。
-//      与 animslots / memscan 一样是「带输出缓冲」的命令(单参数 + 固定容量)。
-//      给脚本解析的字段全部用 **ASCII 标签**(铁律 48:别让正则依赖中文)。
-//      返回:活的格子数;-2 = 包装没装(这不是「没数据」)。
-#define FL_CHASSIS_SLOTS_CAP 16384
-#define FL_CHASSIS_SHOW      24
-extern "C" __declspec(dllexport) int __stdcall FrameLabChassisSlots(char* buf) {
-    if (!buf) return -1;
-    const int cap = FL_CHASSIS_SLOTS_CAP;
-    int used = 0;
-    anim_slots_append(buf, cap, &used,
-                      "车身外观包装:call @%08X(原目标 %08X) 模式=%d(0 探针 / 1 回放 / 2 插值) 目标帧率=%d 原版帧率=%d\r\n",
-                      (unsigned)(uintptr_t)fl::g_chsSite, (unsigned)(uintptr_t)fl::g_chsOrigFn,
-                      fl::g_chsMode, fl::g_targetFps, fl::g_retailFps);
-    anim_slots_append(buf, cap, &used,
-                      "TOTAL calls=%ld adv=%ld hold=%ld zero=%ld noslot=%ld gate=%d installed=%d\r\n",
-                      (long)fl::g_chsCalls, (long)fl::g_chsAdv, (long)fl::g_chsHold,
-                      (long)fl::g_chsZero, (long)fl::g_chsNoSlot, fl::g_chsMode,
-                      fl::g_chsSite ? 1 : 0);
-    if (!fl::g_chsSite) {
-        anim_slots_append(buf, cap, &used,
-                          "  包装**没装**(FL_G_CHASSISPROBE 0x80000 / FL_G_CHASSIS30 0x100000 都关着,"
-                          "或特征没命中)—— 这不是「没数据」,是「没装」。\r\n");
-        return -2;
-    }
-    // 取前 N 个:**先按「放行 + 回放」次数**(= 真的是载具、且在屏幕里待得久),再按调用次数。
-    //   ★ 2026-09-21 首次实机(原版基线臂)的教训:只按调用次数排,前 24 名全是**建筑**
-    //     (每帧都被画、但没有 locomotor ⇒ 原函数返回 0 ⇒ 放行恒为 0),真正的两辆车排不进榜。
-    //   表只有 1024 格,N 次线性扫描足够,不值得为它写排序。
-    static char taken[FL_CHS_SLOTS];
-    memset(taken, 0, sizeof taken);
-    int live = 0;
-    for (int i = 0; i < FL_CHS_SLOTS; ++i) if (fl::g_chsTab[i].key) ++live;
-    for (int n = 0; n < FL_CHASSIS_SHOW; ++n) {
-        int best = -1;
-        for (int i = 0; i < FL_CHS_SLOTS; ++i) {
-            if (!fl::g_chsTab[i].key || taken[i]) continue;
-            if (best < 0) { best = i; continue; }
-            const long a = fl::g_chsTab[i].advances + fl::g_chsTab[i].holds;
-            const long b = fl::g_chsTab[best].advances + fl::g_chsTab[best].holds;
-            if (a > b || (a == b && fl::g_chsTab[i].calls > fl::g_chsTab[best].calls)) best = i;
-        }
-        if (best < 0) break;
-        taken[best] = 1;
-        const FlChassisEnt e = fl::g_chsTab[best];      // 拷一份再打:渲染线程同时在改它
-        anim_slots_append(buf, cap, &used,
-                          "  drawable=%08X app=%d calls=%ld adv=%ld hold=%ld moved=%ld"
-                          "  pitch=%9.5f roll=%9.5f yaw=%9.5f z=%9.5f\r\n",
-                          (unsigned)(uintptr_t)e.key, e.appearance, e.calls, e.advances, e.holds, e.moved,
-                          e.shown[0], e.shown[1], e.shown[2], e.shown[3]);
-    }
-    anim_slots_append(buf, cap, &used,
-                      "  活的格子 %d / %d(app: 1/7=sub_526BD0 轮式悬挂 | 2/3/4=sub_51E800 | 8=sub_5262D0)\r\n",
-                      live, (int)FL_CHS_SLOTS);
-    return live;
-}
-
-// ⓪ FrameLabChassisStatus()   车身外观包装到底装上没有、处于什么模式。
-//      -2 = 没装(分组位没开,或特征没命中 / 目标地址不对 —— 后一种只会在 DLL 日志里留一条 WARN,
-//           GUI 用户根本看不见);0 = 只读探针;1 = 节拍门·回放;2 = 节拍门·插值。
-//      ★ 2026-09-21 的教训:用户第一次「验收修复」时掩码其实是出厂默认(修复关),而界面上没有任何一处
-//        能看出来。凡是「默认关 / 可能静默装不上」的东西,都必须有一个上层读得到的状态。
-extern "C" __declspec(dllexport) int __stdcall FrameLabChassisStatus() {
-    if (!fl::g_chsSite) return -2;
-    return fl::g_chsMode;
-}
-
-// FrameLabTracerStatus():弹道流节拍门的状态。-2 = 补丁点没就位;0 = 关;1 = 已生效。
-//   低 16 位另带「放行 ÷ 调用 × 1000」,给脚本当判据:90 帧生效时应 ≈ 333,60 帧 ≈ 500,没装门 = 1000。
-extern "C" __declspec(dllexport) int __stdcall FrameLabTracerStatus() {
-    if (fl::g_installed && (fl::g_groups & FL_G_TRACER) && !fl::g_trcSite) return -2;
-    if (!fl::g_trcOn) return 0;
-    const long c = fl::g_trcCalls, f = fl::g_trcFwd;
-    const int ratio = c > 0 ? (int)((long long)f * 1000 / c) : 0;
-    FL_INFO("弹道流节拍门:调用 %ld 转发 %ld ⇒ 放行比例 %d/1000(90 帧应 ≈ 333,60 帧 ≈ 500)", c, f, ratio);
-    return 1000000 + ratio;
-}
-
-// FrameLabCameraStatus():过场运镜计时的状态。-2 = 分组位开着、已安装,但 16 处没全部改指;0 = 关 / 不需要;
-//   1000 + g_camMs = 已生效(90 帧应为 1011,60 帧 1017)。
-extern "C" __declspec(dllexport) int __stdcall FrameLabCameraStatus() {
-    if (fl::g_camOn) return 1000 + fl::g_camMs;
-    if (fl::g_installed && (fl::g_groups & FL_G_CAMERA) && fl::g_targetFps > fl::g_retailFps) return -2;
-    return 0;
-}
-
-// FrameLabPsysStatus():粒子系统节拍门的状态。与 FrameLabTracerStatus 同一套约定:
-//   -2 = 分组位开着但补丁点没就位;0 = 关 / 不生效;1000000 + (放行 ÷ 调用 × 1000) = 已生效
-//   (90 帧应 ≈ 333,60 帧 ≈ 500)。
-extern "C" __declspec(dllexport) int __stdcall FrameLabPsysStatus() {
-    if (fl::g_installed && (fl::g_groups & FL_G_PSYS) && !fl::g_psSite) return -2;
-    if (!fl::g_psOn) return 0;
-    const long c = fl::g_psCalls, f = fl::g_psFwd;
-    const int ratio = c > 0 ? (int)((long long)f * 1000 / c) : 0;
-    FL_INFO("粒子系统节拍门:调用 %ld 转发 %ld ⇒ 放行比例 %d/1000(90 帧应 ≈ 333,60 帧 ≈ 500)", c, f, ratio);
-    return 1000000 + ratio;
-}
-
-// FrameLabScrollStatus():卷屏归一的状态。-2 = 两处补丁点没就位(特征没命中 / 常量不对);0 = 关;1 = 已生效。
-//   与 FrameLabChassisStatus 同一个理由:可自选的东西必须让上层读得到「到底开没开成」。
-extern "C" __declspec(dllexport) int __stdcall FrameLabScrollStatus() {
-    if (fl::g_scrollOn) return 1;
-    if (fl::g_installed && (fl::g_groups & FL_G_SCROLL) && fl::g_scrollSites != 2) return -2;
-    return 0;
-}
-
-// ② FrameLabChassisRate(逻辑帧数)   ★车身路径的**主判据**:同一辆车每逻辑帧递推了几步(×1000)。
-//      与 clockrate / blendrate 同一类「与渲染帧率无关的不变量」:
-//        原版 30 帧(r=2):每逻辑帧 2 个显示帧 × 每帧 1 步            = 2 步 ⇒ **2000**
-//        没修的 60 / 90 帧:                                           4 / 6 步 ⇒ 4000 / 6000
-//        节拍门生效的任何帧率:                                        2 步 ⇒ **2000**
-//      取「区间内 放行 + 回放 次数最多的那辆车」(真的是载具、且在屏幕里待得最久的那辆)。
-//      ★ 2026-09-21 首次实机订正:第一版取「调用次数最多的 drawable」,结果挑中一栋**建筑**
-//        (每帧都画、没有 locomotor ⇒ 放行恒 0),读数 0.000。建筑也会走到这个包装里,只是原函数返回 0。
-//      ★ 同一次实机还暴露了第二个问题:自动化回放时镜头不动,车只在屏幕里待几秒(那一局 139 / 300 帧)。
-//        「放行次数 ÷ 逻辑帧数」在车不可见时会偏低。所以读数改成**与可见时长无关**的形式:
-//            每逻辑帧递推步数 = 放行 ÷ (放行 + 回放) × (区间渲染帧数 ÷ 区间逻辑帧数)
-//        第一项 = 这辆车「每个被画到的显示帧递推几步」(没修 = 1,60 帧节拍门 = 1/2,90 帧 = 1/3),
-//        第二项 = 每逻辑帧有几个显示帧(30/60/90 帧 = 2/4/6)。两项相乘与车可见多久无关。
-//      同时仍然报**覆盖率**(这辆车被画到的帧数 ÷ 区间渲染帧数),太低说明样本少,读数只能当参考。
-//      ⚠ 内部用静态快照缓冲,**不可重入**(flctl 一次只发一条命令,够用)。
-//      返回:步数 ×1000;-1 = 区间内没有可用读数;-2 = 包装没装。
-extern "C" __declspec(dllexport) int __stdcall FrameLabChassisRate(int logicFrames) {
-    if (logicFrames <= 0 || logicFrames > 1800) logicFrames = 150;
-    FL_INFO("车身尺子:进入(量 %d 个逻辑帧)", logicFrames);
-    if (!fl::g_chsSite) {
-        FL_ERR("车身尺子:包装**没装**(FL_G_CHASSISPROBE / FL_G_CHASSIS30 都关着,或特征没命中)"
-               "—— 这不是「没数据」,是「没装」");
-        return -2;
-    }
-    const int f0 = FrameLabLogicFrame();
-    if (f0 < 0) { FL_ERR("车身尺子:取不到逻辑帧(还没进对局?)"); return -1; }
-
-    static void* snapKey[FL_CHS_SLOTS];
-    static long  snapCalls[FL_CHS_SLOTS], snapAdv[FL_CHS_SLOTS], snapHold[FL_CHS_SLOTS];
-    for (int i = 0; i < FL_CHS_SLOTS; ++i) {
-        snapKey[i]   = fl::g_chsTab[i].key;
-        snapCalls[i] = fl::g_chsTab[i].calls;
-        snapAdv[i]   = fl::g_chsTab[i].advances;
-        snapHold[i]  = fl::g_chsTab[i].holds;
-    }
-    const long calls0 = fl::g_chsCalls, adv0 = fl::g_chsAdv, hold0 = fl::g_chsHold, zero0 = fl::g_chsZero;
-    const long rend0 = fl::g_frameCount;
-
-    const DWORD t0 = GetTickCount();
-    int cur = f0;
-    while (cur - f0 < logicFrames && (GetTickCount() - t0) < 180000) {
-        Sleep(2);
-        cur = FrameLabLogicFrame();
-        if (cur < 0) break;
-    }
-    const long done = cur - f0;
-    const long rend = fl::g_frameCount - rend0;
-    const DWORD elapsed = GetTickCount() - t0;
-    if (done <= 0) { FL_ERR("车身尺子:一个逻辑帧都没走完 —— 读数无效"); return -1; }
-
-    int best = -1;
-    long bestSeen = 0;                                        // 放行 + 回放 = 这辆车被画到、且真的是载具的帧数
-    for (int i = 0; i < FL_CHS_SLOTS; ++i) {
-        const FlChassisEnt e = fl::g_chsTab[i];
-        if (!e.key) continue;
-        // 区间内才出现的车(格子在快照里还是空的 / 是别人的)从 0 算起;被换过人的旧账不能拿来相减。
-        const bool same = (e.key == snapKey[i]);
-        const long da = e.advances - (same ? snapAdv[i] : 0), dh = e.holds - (same ? snapHold[i] : 0);
-        if (da <= 0) continue;                                // 没放行过 = 不是载具(建筑 / 道具)
-        if (da + dh > bestSeen) { bestSeen = da + dh; best = i; }
-    }
-    FL_INFO("车身尺子:区间 %ld 个逻辑帧 / %ld 个渲染帧 / %u 毫秒;全体载具 调用 %ld 放行 %ld 回放 %ld 返回0 %ld",
-            done, rend, (unsigned)elapsed, (long)fl::g_chsCalls - calls0, (long)fl::g_chsAdv - adv0,
-            (long)fl::g_chsHold - hold0, (long)fl::g_chsZero - zero0);
-    if (best < 0 || bestSeen < 30 || rend <= 0) {
-        FL_ERR("车身尺子:区间内没有一辆载具被画到足够多帧(最多的一辆只有 %ld 帧,至少要 30)—— "
-               "镜头里没有载具?读数无效,别拿它当结论", bestSeen);
-        return -1;
-    }
-    const FlChassisEnt e = fl::g_chsTab[best];
-    const bool same = (e.key == snapKey[best]);
-    const long dAdv = e.advances - (same ? snapAdv[best] : 0), dHold = e.holds - (same ? snapHold[best] : 0);
-    const int out = (int)((long long)dAdv * rend * 1000 / ((long long)(dAdv + dHold) * done));
-    const int coverage = (int)((long long)bestSeen * 100 / rend);
-    FL_INFO("★车身尺子读数:drawable %08X(外观 %d)被画到 %ld 帧:放行 %ld 回放 %ld;区间每逻辑帧 %ld.%02ld 个显示帧 ⇒ "
-            "每逻辑帧递推 %d.%03d 步(原版与修好的配置都应是 2.000;没修的 60/90 帧是 4/6);覆盖率 %d%%",
-            (unsigned)(uintptr_t)e.key, e.appearance, bestSeen, dAdv, dHold,
-            rend / done, (rend * 100 / done) % 100, out / 1000, out % 1000, coverage);
-    if (coverage < 30)
-        FL_WARN("  ⚠ 覆盖率 %d%%:这辆车只在屏幕里待了很短一段,样本少;读数的形式与可见时长无关,但请换个窗口复核", coverage);
-    return out;
-}
-
-// ③ FrameLabSelfTestChassis()   节拍门的**离线自检**(纯逻辑:私有的表 + 假递推,不需要游戏)。
-//      假递推与引擎同形(离散弹簧 + 确定性的「随机」踢),所以「位姿序列逐位相同」是有意义的判据。
-//      返回位掩码,全通过 = 0x3FF:
-//        0x01  目标 30:每帧放行、零回放(直通 ⇒ 与原版逐位一致)
-//        0x02  目标 60:放行 150 / 回放 150,放行得到的位姿序列与 30 帧那一轮**逐位相同**,回放值恒等于上次放行值
-//        0x04  目标 90:放行 100 / 回放 200,同上
-//        0x08  非整数倍(45 / 75):放行次数 = 虚拟帧个数,同一虚拟帧绝不放行两次,连续回放不超过 ceil(fps/30)
-//        0x10  只开探针(门关)在 90 帧:每帧放行、零回放;且**按同一判据它不通过**(300 ≠ 100 ⇒ 闸门会红)
-//        0x20  原函数返回 0:原样返回 0、不缓存、不回放;之后恢复正常放行
-//        0x40  表满:退回直通(每次都放行、不丢姿态);全部陈旧后格子可回收
-//        0x80  陈旧重置:久未出现的同一地址回来时先重置(当成新车),第一帧必放行
-//        0x100 插值模式(60 / 90 / 45 / 75):放行次数与回放模式相同;每个虚拟帧最后一个显示帧(相位 = 1)的输出
-//              与引擎位姿**逐位相同**且该序列 == 30 帧参考序列;其余显示帧的输出落在相邻两个位姿之间
-//        0x200 插值模式的两个边界:目标 30 = 直通(逐位);位姿不相邻(车离开屏幕又回来)时**不**拿过期位姿当起点
-struct ChsFake { float pitch, rate, roll, rollRate; unsigned lcg; long runs; int returnZero; };
-static char chs_fake_orig(void* ctx, void* self, float* out) {
-    ChsFake* f = (ChsFake*)ctx;
-    (void)self;
-    if (f->returnZero) return 0;
-    ++f->runs;
-    const float ar = f->rate < 0 ? -f->rate : f->rate;
-    const float arr = f->rollRate < 0 ? -f->rollRate : f->rollRate;
-    if (ar < 0.0040f && arr < 0.0020f) {                     // 与 sub_5269C0 同形:衰减够了才再踢一次
-        f->lcg = f->lcg * 1664525u + 1013904223u;
-        const float kick = 0.016f;
-        switch ((f->lcg >> 16) & 3) {
-            case 0: f->rate -= kick; f->rollRate -= kick * 0.5f; break;
-            case 1: f->rate += kick; f->rollRate -= kick * 0.5f; break;
-            case 2: f->rate -= kick; f->rollRate += kick * 0.5f; break;
-            default: f->rate += kick; f->rollRate += kick * 0.5f; break;
-        }
-    }
-    f->rate     += -0.06f * f->pitch - 0.20f * f->rate;      // 弹簧 + 阻尼(无 dt,每次调用一步)
-    f->rollRate += -0.03f * f->roll  - 0.10f * f->rollRate;
-    f->pitch    += f->rate * 0.8f;
-    f->roll     += f->rollRate * 0.8f;
-    out[0] = f->pitch; out[1] = f->roll; out[2] = 0.0f;
-    out[3] = (f->pitch < 0 ? -f->pitch : f->pitch) * 2.5f;
-    return 1;
-}
-
-#define CHS_TEST_FRAMES 300
-#define CHS_TEST_FIRST  1200u
-static FlChassisEnt g_chsTestTab[FL_CHS_SLOTS];
-
-// 跑 CHS_TEST_FRAMES 个显示帧。poses 收集每次**放行**得到的俯仰;返回放行次数。
-static int chs_selftest_run(int fps, int gateOn, float* poses, long* holds, int* maxHoldRun,
-                            int* doubleAdvance, int* holdMismatch) {
-    memset(g_chsTestTab, 0, sizeof g_chsTestTab);
-    ChsFake f; memset(&f, 0, sizeof f); f.lcg = 20260921u;
-    void* self = (void*)(uintptr_t)0x04A51230u;
-    int adv = 0, run = 0;
-    unsigned lastVf = 0xFFFFFFFFu;
-    float lastOut[FL_CHS_OUTS] = {0, 0, 0, 0};
-    *holds = 0; *maxHoldRun = 0; *doubleAdvance = 0; *holdMismatch = 0;
-    // 起点取 1200:同时被 2 和 3 整除 ⇒ 60 / 90 帧下第一个虚拟帧是完整的,放行次数恰为 300×30÷fps。
-    for (unsigned frame = CHS_TEST_FIRST; frame < CHS_TEST_FIRST + CHS_TEST_FRAMES; ++frame) {
-        float out[FL_CHS_OUTS] = {0, 0, 0, 0};
-        int did = -1;
-        const char r = fl_chs_gate(g_chsTestTab, self, out, frame, fps, 30, gateOn,
-                                   (unsigned)(2 * fps), chs_fake_orig, &f, NULL, &did);
-        if (did == FL_CHS_DID_ADVANCE) {
-            const unsigned vf = fl_chs_vframe(frame, fps, 30);
-            if (gateOn && vf == lastVf) *doubleAdvance = 1;
-            lastVf = vf;
-            if (adv < CHS_TEST_FRAMES) poses[adv] = out[0];
-            ++adv; run = 0;
-            memcpy(lastOut, out, sizeof lastOut);
-        } else if (did == FL_CHS_DID_HOLD) {
-            ++*holds; ++run;
-            if (run > *maxHoldRun) *maxHoldRun = run;
-            if (!r || memcmp(lastOut, out, sizeof lastOut) != 0) *holdMismatch = 1;
-        }
-    }
-    return adv;
-}
-
-// 插值模式的一轮:返回是否满足 0x100 那条判据。ref = 30 帧参考位姿序列。
-//   相位在这里用**自己的**整数算术重算(不调 fl_chs_phase)—— 判据必须有独立来源。
-static bool chs_selftest_lerp(int fps, const float* ref, int* advOut, int* endsOut) {
-    memset(g_chsTestTab, 0, sizeof g_chsTestTab);
-    ChsFake f; memset(&f, 0, sizeof f); f.lcg = 20260921u;
-    void* self = (void*)(uintptr_t)0x04A51230u;
-    int adv = 0, ends = 0;
-    bool ok = true;
-    for (unsigned frame = CHS_TEST_FIRST; frame < CHS_TEST_FIRST + CHS_TEST_FRAMES; ++frame) {
-        float out[FL_CHS_OUTS] = {0, 0, 0, 0};
-        FlChassisEnt* e = NULL; int did = -1;
-        const char r = fl_chs_gate(g_chsTestTab, self, out, frame, fps, 30, FL_CHS_MODE_LERP,
-                                   (unsigned)(2 * fps), chs_fake_orig, &f, &e, &did);
-        if (!r || !e) { ok = false; break; }
-        if (did == FL_CHS_DID_ADVANCE) ++adv;
-        unsigned num = (unsigned)(((unsigned long long)frame * 30u) % (unsigned)fps) + 30u;
-        const bool atEnd = num >= (unsigned)fps;
-        for (int k = 0; k < FL_CHS_OUTS; ++k) {
-            const float lo = e->prev[k] < e->out[k] ? e->prev[k] : e->out[k];
-            const float hi = e->prev[k] < e->out[k] ? e->out[k] : e->prev[k];
-            if (atEnd) { if (memcmp(&out[k], &e->out[k], sizeof(float)) != 0) ok = false; }
-            else if (out[k] < lo || out[k] > hi) ok = false;
-            if (memcmp(&out[k], &e->shown[k], sizeof(float)) != 0) ok = false;   // shown 必须就是交出去的值
-        }
-        if (atEnd) {
-            if (ends < CHS_TEST_FRAMES && memcmp(&out[0], &ref[ends], sizeof(float)) != 0) ok = false;
-            ++ends;
-        }
-    }
-    *advOut = adv; *endsOut = ends;
-    return ok;
-}
-
-extern "C" __declspec(dllexport) int __stdcall FrameLabSelfTestChassis() {
-    static float ref[CHS_TEST_FRAMES], got[CHS_TEST_FRAMES];
-    long holds = 0; int maxRun = 0, dbl = 0, mism = 0;
-    int mask = 0;
-
-    // 0x01 直通
-    const int adv30 = chs_selftest_run(30, 1, ref, &holds, &maxRun, &dbl, &mism);
-    const bool ok30 = (adv30 == CHS_TEST_FRAMES) && holds == 0;
-    if (ok30) mask |= 0x01;
-    FL_INFO("车身门自检 目标30:放行 %d 回放 %ld(应 %d / 0)⇒ %s", adv30, holds, CHS_TEST_FRAMES, ok30 ? "通过" : "★失败");
-
-    // 0x02 / 0x04 整数倍
-    const int fpsInt[2] = {60, 90};
-    for (int t = 0; t < 2; ++t) {
-        const int fps = fpsInt[t];
-        const int adv = chs_selftest_run(fps, 1, got, &holds, &maxRun, &dbl, &mism);
-        const int wantAdv = CHS_TEST_FRAMES * 30 / fps;
-        const bool same = adv <= CHS_TEST_FRAMES && memcmp(ref, got, sizeof(float) * (size_t)adv) == 0;
-        const bool ok = adv == wantAdv && holds == CHS_TEST_FRAMES - wantAdv && same && !dbl && !mism
-                        && maxRun == fps / 30 - 1;
-        if (ok) mask |= (t == 0 ? 0x02 : 0x04);
-        FL_INFO("车身门自检 目标%d:放行 %d 回放 %ld(应 %d / %d),位姿序列与 30 帧%s,最长连续回放 %d,"
-                "同虚拟帧重复放行=%d 回放值不符=%d ⇒ %s",
-                fps, adv, holds, wantAdv, CHS_TEST_FRAMES - wantAdv, same ? "逐位相同" : "**不同**",
-                maxRun, dbl, mism, ok ? "通过" : "★失败");
-    }
-
-    // 0x08 非整数倍
-    bool okFrac = true;
-    const int fpsFrac[2] = {45, 75};
-    for (int t = 0; t < 2; ++t) {
-        const int fps = fpsFrac[t];
-        const int adv = chs_selftest_run(fps, 1, got, &holds, &maxRun, &dbl, &mism);
-        // ★ 期望值**不许**调 fl_chs_vframe 来算:故障注入实测(2026-09-21)把 fl_chs_vframe 改坏成
-        //   「恒等于显示帧号」之后,这一位照样通过 —— 因为期望值和被测值出自同一个函数,一起错。
-        //   判据必须有独立来源:这里用自己的 64 位整数算术重算「区间内有几个不同的虚拟帧」。
-        const unsigned long long vLast  = (unsigned long long)(CHS_TEST_FIRST + CHS_TEST_FRAMES - 1) * 30u / (unsigned)fps;
-        const unsigned long long vFirst = (unsigned long long)CHS_TEST_FIRST * 30u / (unsigned)fps;
-        const int wantAdv = (int)(vLast - vFirst) + 1;
-        const bool same = adv <= CHS_TEST_FRAMES && memcmp(ref, got, sizeof(float) * (size_t)adv) == 0;
-        const bool ok = adv == wantAdv && same && !dbl && !mism && maxRun <= (fps + 29) / 30;
-        if (!ok) okFrac = false;
-        FL_INFO("车身门自检 目标%d(非整数倍):放行 %d(应 %d)回放 %ld,位姿序列%s,最长连续回放 %d ⇒ %s",
-                fps, adv, wantAdv, holds, same ? "逐位相同" : "**不同**", maxRun, ok ? "通过" : "★失败");
-    }
-    if (okFrac) mask |= 0x08;
-
-    // 0x10 只开探针(门关):每帧放行;且按「90 帧应放行 100 次」这条判据它必须不通过
-    const int advOff = chs_selftest_run(90, 0, got, &holds, &maxRun, &dbl, &mism);
-    const bool okOff = advOff == CHS_TEST_FRAMES && holds == 0 && advOff != CHS_TEST_FRAMES * 30 / 90;
-    if (okOff) mask |= 0x10;
-    FL_INFO("车身门自检 门关@90:放行 %d 回放 %ld(应 %d / 0;按修好的判据应为 %d ⇒ 闸门%s)⇒ %s",
-            advOff, holds, CHS_TEST_FRAMES, CHS_TEST_FRAMES * 30 / 90,
-            advOff != CHS_TEST_FRAMES * 30 / 90 ? "会红,合格" : "★不会红", okOff ? "通过" : "★失败");
-
-    // 0x20 原函数返回 0
-    {
-        memset(g_chsTestTab, 0, sizeof g_chsTestTab);
-        ChsFake f; memset(&f, 0, sizeof f); f.lcg = 7u; f.returnZero = 1;
-        void* self = (void*)(uintptr_t)0x04B00040u;
-        float out[FL_CHS_OUTS] = {9, 9, 9, 9};
-        FlChassisEnt* e = NULL; int did = -1;
-        const char r0 = fl_chs_gate(g_chsTestTab, self, out, 3000, 90, 30, 1, 180, chs_fake_orig, &f, &e, &did);
-        const bool a = (r0 == 0) && did == FL_CHS_DID_ZERO && e && !e->hasOut && e->advances == 0;
-        const char r1 = fl_chs_gate(g_chsTestTab, self, out, 3001, 90, 30, 1, 180, chs_fake_orig, &f, &e, &did);
-        const bool b = (r1 == 0) && did == FL_CHS_DID_ZERO;            // 同一虚拟帧也不许「回放」出一个不存在的姿态
-        f.returnZero = 0;
-        const char r2 = fl_chs_gate(g_chsTestTab, self, out, 3002, 90, 30, 1, 180, chs_fake_orig, &f, &e, &did);
-        const bool c = (r2 == 1) && did == FL_CHS_DID_ADVANCE && e && e->hasOut;
-        if (a && b && c) mask |= 0x20;
-        FL_INFO("车身门自检 原函数返回0:%s/%s/%s ⇒ %s", a ? "不缓存" : "★", b ? "不回放" : "★", c ? "恢复放行" : "★",
-                (a && b && c) ? "通过" : "★失败");
-    }
-
-    // 0x40 表满直通 + 陈旧回收
-    {
-        memset(g_chsTestTab, 0, sizeof g_chsTestTab);
-        ChsFake f; memset(&f, 0, sizeof f); f.lcg = 11u;
-        int noSlot = 0, bad = 0;
-        for (unsigned k = 0; k < 5000; ++k) {
-            float out[FL_CHS_OUTS] = {0, 0, 0, 0};
-            FlChassisEnt* e = NULL; int did = -1;
-            void* self = (void*)(uintptr_t)(0x05000000u + k * 0x140u);
-            const char r = fl_chs_gate(g_chsTestTab, self, out, 5000, 90, 30, 1, 180, chs_fake_orig, &f, &e, &did);
-            if (!e) ++noSlot;
-            if (r != 1 || did != FL_CHS_DID_ADVANCE) ++bad;               // 无论有没有格子,第一次见都必须放行
-        }
-        int reclaimFail = 0;
-        for (unsigned k = 0; k < 100; ++k) {                              // 181 帧之后全部陈旧 ⇒ 新车必能占到格子
-            float out[FL_CHS_OUTS] = {0, 0, 0, 0};
-            FlChassisEnt* e = NULL; int did = -1;
-            void* self = (void*)(uintptr_t)(0x06000000u + k * 0x140u);
-            fl_chs_gate(g_chsTestTab, self, out, 5000 + 181, 90, 30, 1, 180, chs_fake_orig, &f, &e, &did);
-            if (!e) ++reclaimFail;
-        }
-        const bool ok = noSlot > 0 && bad == 0 && reclaimFail == 0;
-        if (ok) mask |= 0x40;
-        FL_INFO("车身门自检 表满:5000 辆里 %d 辆没格子(应 >0,全部直通放行,异常 %d);陈旧后 100 辆新车占格失败 %d ⇒ %s",
-                noSlot, bad, reclaimFail, ok ? "通过" : "★失败");
-    }
-
-    // 0x80 陈旧重置
-    {
-        memset(g_chsTestTab, 0, sizeof g_chsTestTab);
-        ChsFake f; memset(&f, 0, sizeof f); f.lcg = 13u;
-        void* self = (void*)(uintptr_t)0x04C00080u;
-        float out[FL_CHS_OUTS] = {0, 0, 0, 0};
-        FlChassisEnt* e = NULL; int did = -1;
-        fl_chs_gate(g_chsTestTab, self, out, 9000, 90, 30, 1, 180, chs_fake_orig, &f, &e, &did);
-        fl_chs_gate(g_chsTestTab, self, out, 9001, 90, 30, 1, 180, chs_fake_orig, &f, &e, &did);
-        const bool held = (did == FL_CHS_DID_HOLD) && e && e->calls == 2;
-        fl_chs_gate(g_chsTestTab, self, out, 9001 + 181, 90, 30, 1, 180, chs_fake_orig, &f, &e, &did);
-        const bool reset = (did == FL_CHS_DID_ADVANCE) && e && e->calls == 1 && e->holds == 0;
-        if (held && reset) mask |= 0x80;
-        FL_INFO("车身门自检 陈旧重置:%s / %s ⇒ %s", held ? "先回放过" : "★", reset ? "回来时被重置并放行" : "★",
-                (held && reset) ? "通过" : "★失败");
-    }
-
-    // 0x100 插值模式
-    {
-        bool okAll = true;
-        const int fpsL[4] = {60, 90, 45, 75};
-        for (int t = 0; t < 4; ++t) {
-            const int fps = fpsL[t];
-            int adv = 0, ends = 0;
-            const bool ok = chs_selftest_lerp(fps, ref, &adv, &ends);
-            const unsigned long long vLast  = (unsigned long long)(CHS_TEST_FIRST + CHS_TEST_FRAMES - 1) * 30u / (unsigned)fps;
-            const unsigned long long vFirst = (unsigned long long)CHS_TEST_FIRST * 30u / (unsigned)fps;
-            const int wantAdv = (int)(vLast - vFirst) + 1;
-            const bool good = ok && adv == wantAdv && ends >= wantAdv - 1;
-            if (!good) okAll = false;
-            FL_INFO("车身门自检 插值@%d:放行 %d(应 %d),相位=1 的显示帧 %d 个,端点逐位相同且中间值不越界=%d ⇒ %s",
-                    fps, adv, wantAdv, ends, ok ? 1 : 0, good ? "通过" : "★失败");
-        }
-        if (okAll) mask |= 0x100;
-    }
-
-    // 0x200 插值模式的两个边界
-    {
-        // ① 目标 30:直通,逐位
-        memset(g_chsTestTab, 0, sizeof g_chsTestTab);
-        ChsFake f; memset(&f, 0, sizeof f); f.lcg = 20260921u;
-        void* self = (void*)(uintptr_t)0x04A51230u;
-        bool pass30 = true;
-        for (unsigned frame = CHS_TEST_FIRST; frame < CHS_TEST_FIRST + 60; ++frame) {
-            float out[FL_CHS_OUTS] = {0, 0, 0, 0};
-            int did = -1;
-            fl_chs_gate(g_chsTestTab, self, out, frame, 30, 30, FL_CHS_MODE_LERP, 60, chs_fake_orig, &f, NULL, &did);
-            if (did != FL_CHS_DID_ADVANCE || memcmp(&out[0], &ref[frame - CHS_TEST_FIRST], sizeof(float)) != 0) pass30 = false;
-        }
-        // ② 位姿不相邻:90 帧下先正常跑 6 帧,再空 30 帧(车不在屏幕里),回来的第一帧相位是 1/3,
-        //    但上一次位姿已经过期 ⇒ 输出必须**等于**这一次的引擎位姿,不许从过期位姿插过来。
-        memset(g_chsTestTab, 0, sizeof g_chsTestTab);
-        ChsFake g; memset(&g, 0, sizeof g); g.lcg = 5u;
-        float out[FL_CHS_OUTS] = {0, 0, 0, 0};
-        FlChassisEnt* e = NULL; int did = -1;
-        for (unsigned frame = 1200; frame < 1206; ++frame)
-            fl_chs_gate(g_chsTestTab, self, out, frame, 90, 30, FL_CHS_MODE_LERP, 180, chs_fake_orig, &g, &e, &did);
-        fl_chs_gate(g_chsTestTab, self, out, 1236, 90, 30, FL_CHS_MODE_LERP, 180, chs_fake_orig, &g, &e, &did);
-        const bool noStale = did == FL_CHS_DID_ADVANCE && e
-                             && memcmp(out, e->out, sizeof out) == 0 && memcmp(e->prev, e->out, sizeof out) == 0;
-        if (pass30 && noStale) mask |= 0x200;
-        FL_INFO("车身门自检 插值边界:目标30直通=%d 过期位姿不当起点=%d ⇒ %s", pass30 ? 1 : 0, noStale ? 1 : 0,
-                (pass30 && noStale) ? "通过" : "★失败");
-    }
-
-    FL_INFO("车身门自检结果掩码 = 0x%03X(全通过应为 0x3FF)", mask);
-    return mask;
-}
-
 // ── ★★ 世界坐标跟踪(第十一批·续)──────────────────────────────────────────────
 // 把 memscan 找到的地址填进黑匣子的**坐标通道 0**(见 Rec.trk 的注释),这样它就会
 // 逐渲染帧记下那个地址上的三个 float。**这是「移动时上下抖动」的唯一直接读数**:
@@ -3747,15 +2500,6 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabMemScan(char* buf) {
     //   ⇒ 把「静态但至少两个分量是地图尺度」的倒出来就能回答:
     //     如果**连静态的都没有**,那布局假设就是错的 —— 该去逆向对象,而不是继续扫。
     //   ★必须放在**第二轮压紧之前** —— 第二轮会把数组前面覆盖掉。
-    // ★ 2026-09-21 订正(悬挂路径会话):下面这三个「静态兜底」用的变量原本声明在**更靠后**的位置
-    //   (Sleep(4000) 之前),而本块里已经在用它们 ⇒ C2065 未声明的标识符,整个 DLL 编不过。
-    //   那是 2026-09-20 11:18 的最后一次源码改动,之后没有再构建过(build\Ra3FrameLab.dll 停在 11:17),
-    //   所以一直没暴露。把声明挪到首次使用之前;并且每次调用先清零 —— 它们是 static,
-    //   不清的话上一次扫描留下的(可能早已释放的)地址会混进这一次的兜底候选里。
-    static unsigned staticAddr[64];
-    static float    staticVal[64 * 3];
-    static unsigned nStatic = 0;
-    nStatic = 0;
     {
         int shown = 0;
         anim_slots_append(buf, cap, &used,
@@ -3801,7 +2545,9 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabMemScan(char* buf) {
     //     把它们存下来;第三轮若一个「移动中」的都没有,就退而用静态里 **X 最大**的那个。
     //   注意:这**不是**「找到了移动中的单位」,只是「给黑匣子一个像坐标的地址去记」——
     //   所以日志里会明确标注 `FALLBACK=static`,不许当成正常结果。
-    //   (staticAddr / staticVal / nStatic 的声明已挪到上面「静态地图尺度候选」那一块之前,见那里的订正。)
+    static unsigned staticAddr[64];
+    static float    staticVal[64 * 3];
+    static unsigned nStatic = 0;
     Sleep(4000);
     //   ★为什么要「两段确认」(第三轮):实测第一版挑中的第一个候选,在 memscan 的
     //     1 秒窗口里确实动过,但真正 dump 时它的 **X 分量恒定不变**(-17.4896)——
@@ -4439,7 +3185,6 @@ static const int kRingRows = 512;    // ≈ 8.5 秒 @60fps
 static const int kMaxCrash = 40;     // 单进程最多记 40 次异常,防「热异常」刷爆磁盘
 static const int kMaxStack = 48;     // 栈回溯最多记 48 层
 static const int kMaxCodes = 16;     // 去重:记住见过的异常码,每个码最多记 5 份
-#define FL_BB_CHS_CHANNELS 4         // 姿态轴同时钉几辆车(2026-09-21,见 Rec.chs 的注释)
 
 // 一行记录。字段都是「出事后要拿来对账」的量,不是随便挑的:
 //   us          墙钟**微秒**(QPC)—— 判断「是不是卡住了」,也是帧间隔的唯一可靠来源
@@ -4500,17 +3245,6 @@ struct Rec {
     //   ⇒ 用 `flctl track <addr>` 把地址填进来,这里逐渲染帧记下它的三个 float。
     //   trk[i] 的三个分量依次是 addr+0 / addr+4 / addr+8。-1 = 该通道没配。
     float trk[4][3];
-    // ★★★ 2026-09-21(悬挂路径会话):**姿态轴** —— 车身外观(悬挂/俯仰/侧倾)的直接读数。
-    //   上面三条轴(时间 / 动画分数 / 世界坐标)都看不见「车身在颠」:它由 calcPhysicsXform
-    //   算出来、只写进**渲染矩阵**,逻辑坐标一个字节不动(所以位置轴量到 Z 恒定并不矛盾)。
-    //   chsCalls  本渲染帧车身外观包装被进入的次数(全体可见载具);-1 = 包装没装。
-    //   chsAdv    本渲染帧原函数被放行且返回非 0 的次数(= 全体载具的递推步数)。
-    //             没修时 chsAdv == 有效调用数;节拍门生效后每 N 帧才出现一次非 0。
-    //   chs[c]    通道 c 钉住的那辆车最近一次输出的 俯仰 / 侧倾 / 视觉 Z;-9 = 该通道没钉车。
-    //             通道按「车身真的在动(moved ≥ 8)且调用最多」自动钉住,闲置约 4 秒后释放。
-    int   chsCalls;
-    int   chsAdv;
-    float chs[FL_BB_CHS_CHANNELS][3];
 };
 
 static Rec           g_ring[kRingRows];
@@ -4520,16 +3254,6 @@ static volatile long g_lastAnimCalls = 0;
 // ★ 世界坐标跟踪的配置(见 Rec.trk 的注释)。由 flctl `track <addr>` 填进来。
 //   0 = 该通道没配。**只在 tick 里做一次地址范围判断,不做 read_ok**(热路径)。
 static unsigned      g_trkAddr[4] = {0, 0, 0, 0};
-// ★ 姿态轴(见 Rec.chs 的注释)。通道钉的是 fl::g_chsTab 里的**格子下标**,同时记下当时的 key:
-//   格子被别的车回收(key 变了)或这辆车约 4 秒没再被调用(不在屏幕里了)就释放通道。
-//   闲置用「calls 有没有涨」判,不去问引擎要显示帧号 —— tick 在手工 hook 的调用路径上,
-//   能不调引擎就不调。
-static volatile long g_lastChsCalls = 0, g_lastChsAdv = 0;
-static int           g_chsChanIdx[FL_BB_CHS_CHANNELS]   = {-1, -1, -1, -1};
-static void*         g_chsChanKey[FL_BB_CHS_CHANNELS]   = {NULL, NULL, NULL, NULL};
-static long          g_chsChanCalls[FL_BB_CHS_CHANNELS] = {0, 0, 0, 0};
-static int           g_chsChanIdle[FL_BB_CHS_CHANNELS]  = {0, 0, 0, 0};
-static int           g_chsPinTick = 0;
 static volatile long g_vehHits  = 0;      // VEH 被调用次数
 static volatile long g_vehSaved = 0;      // 实际落盘的报告数
 static unsigned      g_codeSeen[kMaxCodes]  = {0};   // 见过的异常码(去重用)
@@ -4679,8 +3403,7 @@ static void dump_ring(char* buf, size_t cap, size_t* used) {
     fmt_append(buf, cap, used,
         "     序号   墙钟us    逻辑帧    渲染帧   时钟ms  每帧ms   r    分组     阶段   插值      引擎FPS"
         "  动画调用    动画0     动画1     动画2     动画3"
-        "      跟踪X       跟踪Y       跟踪Z"
-        "  车身调用 车身放行  (俯仰 侧倾 视觉Z)×4\r\n");
+        "      跟踪X       跟踪Y       跟踪Z\r\n");
     for (long i = start; i < total; ++i) {
         const Rec& r = g_ring[i % kRingRows];
         // ★★ 动画轴四列 + 跟踪三列(第十一批·续)是「载具上下抖动」的唯一直接读数,见 Rec 的注释。
@@ -4703,16 +3426,8 @@ static void dump_ring(char* buf, size_t cap, size_t* used) {
         for (int k = 0; k < FL_ANIM_OWNERS; ++k)
             fmt_append(buf, cap, used, "  %9.5f", r.anim[k]);
         fmt_append(buf, cap, used,
-            "  %10.4f  %10.4f  %10.4f",
+            "  %10.4f  %10.4f  %10.4f\r\n",
             r.trk[0][0], r.trk[0][1], r.trk[0][2]);
-        // ★★★ 2026-09-21:姿态轴(车身调用 / 车身放行 + 4 个通道 × 俯仰/侧倾/视觉Z),同样追加在**行尾**,
-        //   ring_analyze.py 那边是又一个**可选组** ⇒ 本批之前的旧日志照常解析。
-        //   ⚠ 每行因此多约 150 字节 × 512 行 ⇒ write_report 的缓冲已同步从 160 KB 扩到 384 KB
-        //     (fmt_append 满了是**静默截断**,见 19.9.5 那次「找到了但没打出来」的教训)。
-        fmt_append(buf, cap, used, "  %5d  %5d", r.chsCalls, r.chsAdv);
-        for (int c = 0; c < FL_BB_CHS_CHANNELS; ++c)
-            fmt_append(buf, cap, used, "  %9.6f %9.6f %9.6f", r.chs[c][0], r.chs[c][1], r.chs[c][2]);
-        fmt_append(buf, cap, used, "\r\n");
     }
 }
 
@@ -4727,11 +3442,6 @@ static void dump_state(char* buf, size_t cap, size_t* used) {
         fl::g_installed ? 1 : 0, fl::g_targetFps, fl::g_retailFps, fl::g_ratio,
         (unsigned)fl::g_groups, fl::g_measureOnly ? 1 : 0, fl::g_msPerFrame,
         fl::g_clockAcc, fl::g_clockWant, accOn ? 1 : 0);
-    // 2026-09-21:车身外观包装的状态单独一行(不往上一行里塞:ring_analyze.py 的 STATE_RE 按那一行的字段顺序取值)。
-    fmt_append(buf, cap, used,
-        "车身外观 包装已装=%d 模式=%d 调用=%ld 放行=%ld 回放=%ld 返回0=%ld 表满直通=%ld\r\n",
-        fl::g_chsSite ? 1 : 0, fl::g_chsMode, (long)fl::g_chsCalls, (long)fl::g_chsAdv,
-        (long)fl::g_chsHold, (long)fl::g_chsZero, (long)fl::g_chsNoSlot);
 }
 
 // 报告正文 = 头部 + 状态 + 寄存器(可选) + 栈 + 模块表 + 记录仪。写成一份完整的现场。
@@ -4762,9 +3472,7 @@ static void write_report(EXCEPTION_POINTERS* ep, const char* tag, bool isCrash) 
                 g_dir, isCrash ? "crash" : "snapshot", GetCurrentProcessId(),
                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
 
-    // 2026-09-21:160 KB → 384 KB。姿态轴让每行多约 150 字节;此前一份快照已经有 147,951 字节
-    //   (离 160 KB 只差 10%),不扩就会被 fmt_append **静默截断**,而截掉的正是行尾的新列。
-    static char buf[384 * 1024];
+    static char buf[160 * 1024];
     size_t used = 0;
     char line[MAX_PATH + 96];
 
@@ -4983,62 +3691,6 @@ void tick(void* frameObj) {
         r.trk[i][1] = f[1];
         r.trk[i][2] = f[2];
     }
-    // ── 姿态轴(见 Rec.chs 的注释)────────────────────────────────────────────────
-    //   全部读我们**自己的**表(fl::g_chsTab,定长静态数组),不碰游戏内存 ⇒ 不需要任何兜底。
-    r.chsCalls = -1; r.chsAdv = -1;
-    for (int c = 0; c < FL_BB_CHS_CHANNELS; ++c) r.chs[c][0] = r.chs[c][1] = r.chs[c][2] = -9.0f;
-    if (fl::g_chsSite) {           // 非空 = 车身外观包装确实装上了
-        const long callsNow = fl::g_chsCalls, advNow = fl::g_chsAdv;
-        r.chsCalls = (int)(callsNow - g_lastChsCalls);
-        r.chsAdv   = (int)(advNow - g_lastChsAdv);
-        g_lastChsCalls = callsNow; g_lastChsAdv = advNow;
-        // ① 维护已钉的通道:格子换了人 / 约 4 秒没被调用 ⇒ 释放
-        for (int c = 0; c < FL_BB_CHS_CHANNELS; ++c) {
-            const int idx = g_chsChanIdx[c];
-            if (idx < 0) continue;
-            const FlChassisEnt& e = fl::g_chsTab[idx];
-            if (e.key != g_chsChanKey[c]) { g_chsChanIdx[c] = -1; continue; }
-            if (e.calls == g_chsChanCalls[c]) { if (++g_chsChanIdle[c] > 240) g_chsChanIdx[c] = -1; }
-            else { g_chsChanCalls[c] = e.calls; g_chsChanIdle[c] = 0; }
-        }
-        // ② 有空通道就补:每 16 帧扫一次表(1024 格的整数比较,可以忽略),挑「车身真的在动」
-        //    且调用最多、还没被钉的那辆。只钉在动的,免得四个通道全被停着的车占掉。
-        if ((++g_chsPinTick & 15) == 0) {
-            for (int c = 0; c < FL_BB_CHS_CHANNELS; ++c) {
-                if (g_chsChanIdx[c] >= 0) continue;
-                int best = -1;
-                for (int i = 0; i < FL_CHS_SLOTS; ++i) {
-                    const FlChassisEnt& e = fl::g_chsTab[i];
-                    if (!e.key || e.moved < 8) continue;
-                    bool pinned = false;
-                    for (int k = 0; k < FL_BB_CHS_CHANNELS; ++k)
-                        if (g_chsChanIdx[k] == i) pinned = true;
-                    if (pinned) continue;
-                    if (best < 0 || e.calls > fl::g_chsTab[best].calls) best = i;
-                }
-                if (best < 0) break;
-                g_chsChanIdx[c]   = best;
-                g_chsChanKey[c]   = fl::g_chsTab[best].key;
-                g_chsChanCalls[c] = fl::g_chsTab[best].calls;
-                g_chsChanIdle[c]  = 0;
-            }
-        }
-        // ③ 记录
-        for (int c = 0; c < FL_BB_CHS_CHANNELS; ++c) {
-            const int idx = g_chsChanIdx[c];
-            if (idx < 0) continue;
-            const FlChassisEnt& e = fl::g_chsTab[idx];
-            if (!e.hasOut) continue;
-            // ★ 只记「这一帧真的被画到」的车(idle == 0,见上面 ①)。首次实机:钉住的那辆车开出屏幕后
-            //   位姿停在最后一次的值上,把「每逻辑帧位姿变化次数」稀释成了 0.87(应为 2)。
-            if (g_chsChanIdle[c] != 0) continue;
-            // 记的是**真正交给引擎的**位姿(shown):回放模式下它 == 递推结果,插值模式下它在相邻两个
-            //   递推结果之间 —— 「屏幕上车身怎么动」要看这个,不是看递推的原始结果。
-            r.chs[c][0] = e.shown[0];     // 俯仰
-            r.chs[c][1] = e.shown[1];     // 侧倾
-            r.chs[c][2] = e.shown[3];     // 视觉 Z
-        }
-    }
     g_ring[g_ringPos % kRingRows] = r;
     ++g_ringPos;
 }
@@ -5072,9 +3724,6 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabBlackBox(int on) {
             bb::g_ring[i].renderFrame = -1;
         }
         bb::g_ringPos = 0;
-        // 姿态轴的「本帧增量」基线也要对齐到现在,否则第一行会把记录仪关着期间攒下的调用数一次吐出来。
-        bb::g_lastChsCalls = fl::g_chsCalls;
-        bb::g_lastChsAdv   = fl::g_chsAdv;
     }
     bb::g_on = want;
     FL_INFO("黑匣子飞行记录仪:%s(缓冲 %d 行 ≈ %.1f 秒 @60fps;VEH %s,已落盘 %ld 份)",

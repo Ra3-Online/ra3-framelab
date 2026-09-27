@@ -33,13 +33,6 @@
 //                           ⇒ 三个派生量必须整体按目标帧率重算(开 FL_G_DERIVED2 = 0xE00),
 //                           否则「毫秒↔帧号」换算差一倍,建筑解包动画快一倍跑完。
 //                           (2026-09-17 第七批新增;见 FrameLabDisplayClock)
-//   flctl groups <掩码>      逐组开关;**十进制或 0x 十六进制都行**(2026-09-21 起按 0x 前缀解析,
-//                           此前 atoi("0x…") 静默得到 0 ⇒ 回落默认集合)。必须在 enable / measureex **之前**调。
-//   flctl chassisrate <逻辑帧> ★车身(悬挂/俯仰/侧倾)路径的主判据:同一辆车每逻辑帧递推几步 ×1000。
-//                           原版与修好的配置 = 2000;没修的 60 / 90 帧 = 4000 / 6000。
-//                           需要先开探针位 0x80000(或节拍门位 0x100000)。-2 = 包装没装。
-//                           (2026-09-21 悬挂路径会话新增;见 FrameLabChassisRate)
-//   flctl chassisslots       倒出被车身外观包装见过的载具全表(外观枚举、调用/放行/回放、最近输出)。
 // 所有命令都可以在最后再跟一个**进程号**,指定就只动那个进程(自动化时必须给,免得误伤用户正在玩的那局)。
 // 说明:只对**已经在运行**的游戏进程操作;不改游戏文件,不随游戏自动启动。
 //       找不到游戏进程就直接退出,不会去动别的程序。
@@ -187,15 +180,7 @@ int main(int argc, char** argv) {
         exportName = "FrameLabMeasureOnlyEx";
         arg = (void*)(uintptr_t)strtoul(argc > 2 ? argv[2] : "0", NULL, 0);
     }
-    // ★ 2026-09-21 订正:`groups` 必须按 0x 前缀解析(strtoul base 0,十进制照旧可用)。
-    //   原来走的是上面那个 `fps = atoi(argv[2])` —— atoi("0x2CFFE") = 0,而 FrameLabSetGroups(0)
-    //   的含义是「取默认集合」⇒ **静默回落到 0x28FFF,不报错**。tools\mask_fps_probe.ps1 传的正是
-    //   十六进制字符串,所以它那一轮五条臂实际全是默认掩码(DLL 日志里每一臂都记着 0x28FFF),
-    //   HANDOFF §18.6b「五条臂全部真的跑在 60 帧」那张表因此无效。与下面 `read` / `track` 同一个坑。
-    else if (_stricmp(cmd, "groups") == 0) {
-        exportName = "FrameLabSetGroups";
-        arg = (void*)(uintptr_t)strtoul(argc > 2 ? argv[2] : "0", NULL, 0);
-    }
+    else if (_stricmp(cmd, "groups") == 0) { exportName = "FrameLabSetGroups"; arg = (void*)(uintptr_t)fps; }
     else if (_stricmp(cmd, "frames") == 0) exportName = "FrameLabFrameCount";
     else if (_stricmp(cmd, "logicframe") == 0) exportName = "FrameLabLogicFrame";
     else if (_stricmp(cmd, "waitframe") == 0) { exportName = "FrameLabWaitFrame"; arg = (void*)(uintptr_t)fps; }
@@ -257,14 +242,6 @@ int main(int argc, char** argv) {
         exportName = "FrameLabTrack";
         arg = (void*)(uintptr_t)strtoul(argc > 2 ? argv[2] : "0", NULL, 0);
     }
-    // 2026-09-21(悬挂路径会话)车身外观的两把尺子(先 `groups` 开 0x80000 探针位,再 enable / measureex):
-    //   chassisrate  <逻辑帧>  ★车身路径的主判据:同一辆车每逻辑帧递推几步 ×1000。
-    //                          原版 / 修好的配置 = 2000;没修的 60 / 90 帧 = 4000 / 6000。
-    //                          -1 = 没有可用读数;-2 = 包装没装(两者不是一回事)。
-    //   chassisslots           「带输出缓冲」的命令:倒出被包装函数见过的载具全表
-    //                          (Drawable 地址、locomotor 外观枚举、调用/放行/回放次数、最近一次四个输出)。
-    else if (_stricmp(cmd, "chassisrate") == 0) { exportName = "FrameLabChassisRate"; arg = (void*)(uintptr_t)fps; }
-    else if (_stricmp(cmd, "chassisslots") == 0) exportName = "FrameLabChassisSlots";
     else if (_stricmp(cmd, "disable") == 0) exportName = "FrameLabDisable";
     else if (_stricmp(cmd, "diag") == 0) exportName = "FrameLabDumpDiagnostics";
 
@@ -282,7 +259,7 @@ int main(int argc, char** argv) {
     //   自己调用、自己读回来打印,不走下面那条通用路径。
     // ★ 这两条命令都需要「目标进程里的输出缓冲」,走同一条特例路径。
     //   (通用路径的 arg 只能是一个整数,因为 CreateRemoteThread 只传一个 lpParameter。)
-    if (_stricmp(cmd, "animslots") == 0 || _stricmp(cmd, "memscan") == 0 || _stricmp(cmd, "chassisslots") == 0) {
+    if (_stricmp(cmd, "animslots") == 0 || _stricmp(cmd, "memscan") == 0) {
         const SIZE_T kCap = 16384;  // 必须与 DLL 里的 FL_ANIM_SLOTS_CAP / FL_MEMSCAN_CAP 一致
                                     // (4096 会让 memscan 的报告被静默截断,见 framelab.cpp 的注释)
         void* rbuf = VirtualAllocEx(proc, NULL, kCap, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);

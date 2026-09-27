@@ -434,10 +434,8 @@ static const short kSigMsPerFrameSetter[] = {
 // 实测供参考(历史,不当理由用):关掉后渲染 89.75 / 逻辑 14.97,与全开无差别 ——
 // **那条读数看不见建筑解包动画**,所以它对这个问题没有鉴别力。
 #define FL_G_ANIMGATE  0x1000        // P7 逐帧绘制更新的**次数门**(修动画过快;见下面 kSigFrameUpdate)
-#define FL_G_EVERYTHING 0xFFFFFFF      // 含派生量 + P8 + 动画标尺 + 混合斜坡量尺 + 时钟修正 + P6b + 原版帧率下的时钟修正
+#define FL_G_EVERYTHING 0xFFFFFF      // 含派生量 + P8 + 动画标尺 + 混合斜坡量尺 + 时钟修正 + P6b + 原版帧率下的时钟修正
                                       // + 车身外观探针/节拍门/插值(2026-09-21,0x80000 / 0x100000 / 0x200000)+ 第四个派生量(0x400000),仅供对照实验
-                                      // + 卷屏 / 弹道流 / 图标(0x800000 / 0x1000000 / 0x2000000)+ 粒子系统节拍门(0x4000000,2026-09-23)
-                                      // + 过场运镜计时(0x8000000,2026-09-26)
 // ⛔ 2026-09-17 P7「动画次数门」已从默认集合**移除**,理由见 kSigFrameUpdate 上方的订正。
 //    实测:开了它,录像回放**当场不同步** —— 它删的是模拟步骤,不是动画。
 // ★ 2026-09-17 动画定位会话:默认集合加入 FL_G_CLOCK(0x8000)。
@@ -721,170 +719,6 @@ static const short kSigMsPerFrameSetter[] = {
 //     它的调用节拍(每帧 / 每次鼠标消息)静态没定下来,先不碰,见 RE-按显示帧递推普查-2026-09-21.md。
 //   状态:2026-09-21 静态定位 + 离线构建;**实机一次都没跑过**。
 #define FL_G_SCROLL       0x800000
-
-// ── ★★★ 2026-09-22(用户 90 帧实机报告 #2):弹道流(TheTracerManager)30 Hz 节拍门,**默认关** ──────
-//   用户原话:帝国武士(JapanAntiInfantryInfantry)开火「原速一轮射击开不了几发子弹,60/90 帧下像机关枪,
-//   射速极高」,**但总伤害量没变** ⇒ 模拟侧是对的,快的是纯视觉。
-//   真因与车身悬挂是**同一个形状**:`dword_CDB79C`(由 sub_98D690(..., "TheTracerManager") 确证)的
-//   update(vtable +20 = sub_5F4960)开头就按显示帧号去重:
-//       v2 = (*(vtbl+116))(dword_CDB750);                    // 显示帧号
-//       if (v2 != this[42]) { this[42] = v2; sub_5F48C0(this, v2); ... }   // 一次调用 = 推进一步
-//   ⇒ 原版每秒推进 30 步,90 帧下每秒 90 步。而生成密度(sub_5F1D30,转储 419149 起)是
-//   「每次推进生成 rand(模板+36, 模板+40) 条」(带小数进位器 this[34]),伸展进度 this[38] 同样每次推进一步
-//   ⇒ **每秒生成的弹道流条数是原版的 2 / 3 倍** —— 正是「看起来子弹多得像机关枪」。
-//   弹道流是纯客户端视觉(不碰模拟),与「总伤害没变」完全一致。
-//
-//   补丁点 = 客户端逐帧更新总入口 sub_542DF0 里那次调用,11 字节窗口(现场字节已核):
-//       00542E49  8B 0D 9C B7 CD 00   mov  ecx,[0x00CDB79C]   ; TheTracerManager ← 让签名唯一的就是它
-//       00542E4F  85 C9               test ecx, ecx           ; ★ 窗口从这里开始
-//       00542E51  74 07               je   0x542E5A
-//       00542E53  8B 01               mov  eax,[ecx]
-//       00542E55  8B 50 14            mov  edx,[eax+0x14]
-//       00542E58  FF D2               call edx
-//   ⚠ 紧邻的上一处(dword_CDB794)后 11 个字节**完全相同**,所以特征必须带上 `mov ecx,[0xCDB79C]`。
-//   换成 `call fl_wrap_tracer`(5 字节)+ 6 个 NOP;包装函数拿 ecx = 管理器,只在「30 Hz 虚拟帧号变化」
-//   时才转发 vtbl[0x14]。**不需要插值**:原版本来就是 30 Hz 步进,这样与原版逐步相同。
-#define FL_G_TRACER       0x1000000
-static const short kSigTracerUpdate[] = {
-    0x8B,0x0D,W,W,W,W,                    // mov  ecx,[TheTracerManager]   ← 操作数在 +2,必须是 0x00CDB79C
-    0x85,0xC9,                            // test ecx, ecx                 ← 窗口起点在 +6
-    0x74,0x07,                            // je   +7
-    0x8B,0x01,                            // mov  eax,[ecx]
-    0x8B,0x50,0x14,                       // mov  edx,[eax+0x14]
-    0xFF,0xD2                             // call edx
-};
-
-// ── ★ 2026-09-22:单位头顶状态图标的乒乓动画,**默认关** ────────────────────────────────────────
-//   sub_51A4D0:`帧 = 显示帧号 × dword_CAD5F4(=15) ÷ dword_CAF9D4(=30) % (2N)`,再折回来做乒乓。
-//   分子 15 = 逻辑帧率、除数 30 = **原版**客户端帧率,而补丁故意不写 0xCAF9D4(它仍是 30)
-//   ⇒ 90 帧下这组图标动画快 3 倍。调用点在 sub_527900 / sub_528860,取的是 dword_CDB7A0 那组共享图标。
-//   修法是一处 4 字节:把那条 `div [0x00CAF9D4]` 的操作数改指 g_fpsRender ⇒ `帧号 × 15 ÷ 目标帧率`
-//   = 逻辑帧数,与原版逐帧相同。**不是**用户说的熔炉光,只是顺手修掉的同类。
-#define FL_G_ICONANIM     0x2000000
-
-// ── ★★★ 2026-09-23(用户 90 帧实机报告 #3):粒子系统管理器 30 Hz 节拍门,**默认关** ──────────────
-//   用户原话:苏联电厂灯口、矿场熔炉的光「一闪一闪,闪得特别快(原速闪得较慢)」。
-//   ⛔ 先订正上一轮的头号候选:RE 文档 §6.8 押的是 RadiusDecal(flt_CDBD34)—— **错了**。
-//     用户这次开着「修复过快的视觉效果」(含 0x400000,而同包的弹道流确实修好了),光照样快。
-//     真正画那团光的是**粒子系统**:sovietpowerplant.xml / sovietrefinery.xml 里都挂着
-//     <ParticleSysBone BoneName="FX_STEAM01" FXParticleSystemTemplate="SovietPowerGlow"/>,
-//     帝国矿场挂的是 JapanPowerGlow(Remix 源码 Data/ 下的 XML 逐条读过)。
-//   真因(伪代码逐行读过):
-//     TheFXParticleSystemManager = dword_CE3F04(sub_98D690(..., "TheFXParticleSystemManager") 确证),
-//     它的 update(vtbl+20 = sub_5F43A0,W3D 派生类)由 sub_5D9A50 调用 —— 那是**画一帧**("FullFrame")的函数,
-//     所以每个**显示帧**跑一次,不含 dt。sub_5F43A0 先 call sub_6D1D30(基类:逐个系统 sub_6D18F0),
-//     再清空并重建 47 个按着色器分组的绘制桶。而 sub_6D18F0 里全是「每调用减一」的帧计数器:
-//       this+60   起始延迟(A8)          每次 --                         ⇒ 延迟缩到 1/2、1/3
-//       this+260  爆发间隔(sub_6BF1F0)   每次 --,到 0 发射 rand(模板+168)×this+80 颗,再装填 rand(模板+156)
-//                                                                          ⇒ **每秒发射次数是原版的 2 / 3 倍**
-//       this+268  系统寿命(sub_6B7530)   每次 --                         ⇒ 系统提前消失
-//     粒子**个体**的寿命走时钟(P4 已钉,见 RE §6.9),所以不是「粒子活得短」,而是「新粒子冒得勤」——
-//     一团由随机大小 / 亮度的加色粒子叠出来的光,每冒一颗亮度就跳一下 ⇒ 肉眼就是「闪得快 3 倍」。
-//   补丁点 = sub_5F43A0 开头那条 call sub_6D1D30(只改 rel32,5 字节;现场字节已核,全镜像唯一):
-//       005F43A7  8B F9               mov  edi, ecx
-//       005F43A9  89 7C 24 14         mov  [esp+0x14], edi
-//       005F43AD  E8 7E D9 0D 00      call sub_6D1D30        ; ★ ecx = 管理器(上面没动过 ecx)
-//       005F43B2  C7 87 84 00 00 00 00 00 00 00   mov dword [edi+0x84], 0
-//       005F43BC  81 C7 E4 00 00 00   add  edi, 0xE4
-//       005F43C2  BD 2F 00 00 00      mov  ebp, 47          ; 47 个绘制桶
-//   ★ 为什么只门住这一条 call、**不**门住整个 sub_5F43A0:后半段每帧清空并重建绘制桶(存的是系统指针)。
-//     整个跳过 ⇒ 桶里留着上一帧的指针,期间若有系统被别的路径销毁就是悬空指针。只门基类 update
-//     ⇒ 桶照旧每帧重建,只有「推进一步」按 30 Hz 虚拟帧放行 ⇒ 三个计数器与原版逐步相同。
-//   代价(已知、可接受):跟随骨骼的系统,其发射点 / 变换也按 30 Hz 刷新 —— 这正是原版 30 帧下的节拍;
-//     GPU 粒子的运动在着色器里按时钟算(age = Time × 30 − CreationFrame),仍然每个显示帧都在动。
-//     死掉的系统最多晚 2 个显示帧才从表里摘掉(它们已经没有粒子,画出来是空的)。
-#define FL_G_PSYS         0x4000000
-static const short kSigPsysUpdate[] = {                  // sub_5F43A0 开头,命中 0x005F43A7
-    0x8B,0xF9,                            // mov  edi, ecx
-    0x89,0x7C,0x24,0x14,                  // mov  [esp+0x14], edi
-    0xE8,W,W,W,W,                         // call sub_6D1D30               ← call 在 +6,rel32 在 +7
-    0xC7,0x87,0x84,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,   // mov dword [edi+0x84], 0
-    0x81,0xC7,0xE4,0x00,0x00,0x00,        // add  edi, 0xE4
-    0xBD,0x2F,0x00,0x00,0x00              // mov  ebp, 47
-};
-
-// ── ★★★ 2026-09-26(用户 90 帧实机报告 #4):战役过场「运镜一下就过去了」—— 脚本镜头计时,**默认关** ─────
-//   用户原话:90 帧下过场镜头跑得飞快,提前到了地方等了一会飞机才过来(正常应镜头跟着飞机),约快 3 倍;
-//   但有些过场(如苏联第一关开场)又是正常的。录像抽帧核对:镜头 ~3 秒扫完、4~8 秒原地等、8.3 秒飞机才到。
-//   真因(伪代码逐行读过;与 Generals W3DView::update 的写法 1:1):
-//     视角更新 sub_5EB7D0 → sub_5EB5E0(每个**显示帧**一次)推进所有脚本镜头动作,全部按「每次调用走一帧」:
-//       旋转 sub_5B9920 / 俯仰 sub_5B99A0 / 缩放 sub_5B9A40 / 视角 sub_5B9AC0 / 移动 sub_5E5910 / 模式 3 sub_5C3980:
-//           `++当前帧; 进度 = 当前帧 ÷ 总帧数`,而总帧数在发起时算:`总帧数 = 毫秒 ÷ dword_CE176C`(9 处 idiv)
-//       沿路径移动 sub_5C4070 / 模式 1 sub_5C3A20 / 模式 2:每次调用推进 `dword_CE176C` 毫秒(3 处读)
-//       模式 4 镜头动画(sub_5B98B0 发起,sub_913AE0 推进):`帧 += 显示帧差 × 30.0 ÷ dword_CAF9D4`(2 处读)
-//     dword_CE176C = 原版「每客户端帧毫秒」33,dword_CAF9D4 = 原版名义帧率 30;补丁故意**不写**这两个共享全局
-//     (FL_G_CLOCK 只改指了时钟那两处读者)⇒ 90 帧下每秒走 90 步 ⇒ 所有脚本运镜快 3 倍。
-//     跟随单位的镜头(镜头绑在移动的单位上)按单位的逻辑位置走,本来就对 —— 这大概就是「有些过场正常」。
-//   普查:全镜像读 0x00CE176C 的指令一共 18 条 = 2 个写者(已隔离)+ 2 条时钟(FL_G_CLOCK 已改指)+ **14 条全在镜头代码里**。
-//   修法 = 只改指操作数(16 处,每处 4 字节;不写共享全局,铁律同 R1):
-//     9 条 idiv + 2 条 imul(毫秒↔帧数换算)→ g_camMs = round(1000 ÷ 目标帧率)(固定值;90 → 11,60 → 17)
-//         ⚠ 不能用 g_msPerFrame:那是时钟累加器逐帧摆动的值(90 帧下 11/12),拿它当除数会让单次运镜时长抖 ±9%。
-//     3 条「每次调用推进毫秒」→ g_msPerFrame(与游戏时钟同一个精确平均值)
-//     2 条读 dword_CAF9D4 → g_fpsRender(= 目标帧率)⇒ 镜头动画每显示帧走 30 ÷ 目标帧率 帧 —— 正是公式本意。
-//   目标帧率 ≤ 原版时不装(那时两套值与原版逐位相同)。16 处全部命中才装,否则一处都不改(只 WARN)。
-//   ⚠ 若战役脚本在逻辑侧等待「镜头动作完成」,这一修正会把等待时长恢复成原版 —— 这正是要的;
-//     但它确实影响逻辑时序,联机合作战役里双方配置不同必然更早不同步(本来就不同步,见 HANDOFF §22)。
-#define FL_G_CAMERA       0x8000000
-#define FL_CAM_SITES      16
-static const short kSigCam00[] = {   // 005B9615  sub_5B95F0  idiv [CE176C]  镜头移动(+1048)帧数 = 毫秒 ÷ 每帧毫秒  (操作数在 +2)
-    0xF7,0x3D,0x6C,0x17,0xCE,0x00,0x83,0xF8,0x01,0x89,0x86,0xE8,0x03,0x00,0x00,0x7D,0x0A,0xC7,0x86,0xE8,0x03,0x00,0x00,0x01,0x00,0x00,0x00,0xF3
-};
-static const short kSigCam01[] = {   // 005B96C6  sub_5B96B0  idiv [CE176C]  镜头移动帧数(第 1 处)  (操作数在 +2)
-    0xF7,0x3D,0x6C,0x17,0xCE,0x00,0x83,0xF8,0x01,0x89,0x86,0xF8
-};
-static const short kSigCam02[] = {   // 005B96F2  sub_5B96B0  idiv [CE176C]  镜头移动帧数(第 2 处)  (操作数在 +2)
-    0xF7,0x3D,0x6C,0x17,0xCE,0x00,0x83,0xF8,0x01,0x89,0x86,0xE8,0x03,0x00,0x00,0x7D,0x0A,0xC7,0x86,0xE8,0x03,0x00,0x00,0x01,0x00,0x00,0x00,0x8B,0x44,0x24,0x08
-};
-static const short kSigCam03[] = {   // 005B97AA  sub_5B9780  imul [CE176C]  剩余帧 → 剩余毫秒  (操作数在 +3)
-    0x0F,0xAF,0x05,0x6C,0x17,0xCE,0x00,0xF3,0x0F,0x2A
-};
-static const short kSigCam04[] = {   // 005C3189  sub_5C3160  idiv [CE176C]  镜头移动帧数  (操作数在 +2)
-    0xF7,0x3D,0x6C,0x17,0xCE,0x00,0x83,0xF8,0x01,0x89,0x86,0xE8,0x03,0x00,0x00,0x7D,0x0A,0xC7,0x86,0xE8,0x03,0x00,0x00,0x01,0x00,0x00,0x00,0x8B,0x44,0x24,0x14
-};
-static const short kSigCam05[] = {   // 005C333C  sub_5C3320  idiv [CE176C]  旋转帧数(+1092)  (操作数在 +2)
-    0xF7,0x3D,0x6C,0x17,0xCE,0x00,0x83,0xF8,0x01,0x7D,0x05,0xB8,0x01,0x00,0x00,0x00,0xD9
-};
-static const short kSigCam06[] = {   // 005C33CC  sub_5C33B0  idiv [CE176C]  俯仰帧数(+1128)  (操作数在 +2)
-    0xF7,0x3D,0x6C,0x17,0xCE,0x00,0x83,0xF8,0x01,0x7D,0x05,0xB8,0x01,0x00,0x00,0x00,0xF3
-};
-static const short kSigCam07[] = {   // 005C3495  sub_5C3480  idiv [CE176C]  缩放帧数(+1052)  (操作数在 +2)
-    0xF7,0x3D,0x6C,0x17,0xCE,0x00,0x83,0xF8,0x01,0x89,0x86,0x1C
-};
-static const short kSigCam08[] = {   // 005C3525  sub_5C3510  idiv [CE176C]  高度/视角帧数(+1172)  (操作数在 +2)
-    0xF7,0x3D,0x6C,0x17,0xCE,0x00,0x83,0xF8,0x01,0x89,0x86,0x94
-};
-static const short kSigCam09[] = {   // 005C3607  sub_5C35A0  imul [CE176C]  剩余帧 → 剩余毫秒  (操作数在 +3)
-    0x0F,0xAF,0x05,0x6C,0x17,0xCE,0x00,0xD8,0x4C,0x24
-};
-static const short kSigCam10[] = {   // 005ED163  sub_5ECF00  idiv [CE176C]  变换插值帧数(模式 3,+984)  (操作数在 +2)
-    0xF7,0x3D,0x6C,0x17,0xCE,0x00,0x83,0xF8,0x01,0x89,0x86,0xD8
-};
-static const short kSigCam11[] = {   // 005EB661  sub_5EB5E0  mov eax,[CE176C]  沿路径移动:每次调用推进的毫秒  (操作数在 +1)
-    0xA1,0x6C,0x17,0xCE,0x00,0x6A,0x01,0x50,0x8B,0xCE
-};
-static const short kSigCam12[] = {   // 005EB6A6  sub_5EB5E0  mov ecx,[CE176C]  模式 1:每次调用推进的毫秒  (操作数在 +2)
-    0x8B,0x0D,0x6C,0x17,0xCE,0x00,0x51,0x8B,0xCE,0xE8
-};
-static const short kSigCam13[] = {   // 005EB769  sub_5EB5E0  mov eax,[CE176C]  模式 2:每次调用推进的毫秒  (操作数在 +1)
-    0xA1,0x6C,0x17,0xCE,0x00,0x6A,0x00,0x50,0x8B,0xCE
-};
-static const short kSigCam14[] = {   // 005EB6F5  sub_5EB5E0  mov eax,[CAF9D4]  模式 4 镜头动画:符号检查  (操作数在 +1)
-    0xA1,0xD4,0xF9,0xCA,0x00,0xDB,0x05,0xD4,0xF9,0xCA,0x00,0x85,0xC0,0x7D,0x06,0xD8,0x05,0x74,0x8F,0xBE,0x00,0xD8,0x3D,0xFC
-};
-static const short kSigCam15[] = {   // 005EB6FA  sub_5EB5E0  fild [CAF9D4]     模式 4 镜头动画:显示帧差 × 30 ÷ 它  (操作数在 +2)
-    0xDB,0x05,0xD4,0xF9,0xCA,0x00,0x85,0xC0,0x7D,0x06,0xD8,0x05,0x74,0x8F,0xBE,0x00,0xD8,0x3D,0xFC
-};
-// 每条特征里「要改指的操作数」的偏移,以及改指到哪:c = g_camMs(换算用固定值)/ k = g_msPerFrame(每次推进)/ f = g_fpsRender
-static const unsigned char kCamOpOff[FL_CAM_SITES] = {2,2,2,3,2,2,2,2,2,3,2, 1,2,1, 1,2};
-static const char          kCamKind[FL_CAM_SITES + 1] = "ccccccccccckkkff";
-static const short kSigIconPingPong[] = {
-    0x8B,0xD0,                            // mov  edx, eax                 (显示帧号)
-    0xA1,W,W,W,W,                         // mov  eax,[dword_CAD5F4]
-    0x0F,0xAF,0xC2,                       // imul eax, edx
-    0x33,0xD2,                            // xor  edx, edx
-    0xF7,0x35,W,W,W,W,                    // div  dword [0x00CAF9D4]       ← 操作数在 +16
-    0x8D,0x0C,0x36                        // lea  ecx,[esi+esi]
-};
 static const short kSigScrollStep1[] = {                 // sub_AC0070 稳态段,命中 0x00AC0263
     0x89,0x4C,0x24,0x10,                  // mov  [esp+0x10], ecx         帧号差
     0xDB,0x44,0x24,0x10,                  // fild dword [esp+0x10]
@@ -1159,31 +993,10 @@ static volatile long  g_stepMaxDt  = 0;      // 见过的最大 dt × 1000000(�
 // calcPhysicsXform(sub_532CA0)的绝对 VA —— 用来核对「那条 call 真的调去了它」。
 // ⚠ 绝对 VA,不是 RVA;**不要再加 g_base**(同 kEngineBlendStepVa 的坑)。
 static const uintptr_t kEngineChassisXformVa = 0x00532CA0;
-// 2026-09-22:TheTracerManager 的全局(sub_98D690(..., "TheTracerManager") 确证)。只用来核对特征没认错。
-static const uintptr_t kEngineTracerMgrVa = 0x00CDB79C;
 // 2026-09-21:卷屏归一(见 FL_G_SCROLL)。被改指过来的两条 movss 直接读这个常量。
 static float g_scroll100   = 100.0f;      // = 100 × 原版帧率 ÷ 目标帧率,install() 里算
-// 2026-09-23:粒子系统管理器节拍门(见 FL_G_PSYS)。基类 update 的绝对 VA,用来核对「那条 call 真的调去了它」。
-static const uintptr_t kEnginePsysUpdateVa = 0x006D1D30;
-static unsigned char* g_psSite   = NULL;    // 被改的那条 call 的地址(应为 0x005F43AD);NULL = 没装
-static void*          g_psOrigFn = NULL;    // 它原来的目标 sub_6D1D30(不在卸载时清,理由同 g_chsOrigFn)
-static unsigned       g_psVFrame = 0xFFFFFFFFu;  // 上一次放行时的 30 Hz 虚拟帧号
-static bool           g_psOn     = false;   // 节拍门是否真的生效
-static volatile long  g_psCalls  = 0;       // 包装被进入的次数
-static volatile long  g_psFwd    = 0;       // 真的转发给引擎的次数(放行 ÷ 调用 应 ≈ 30 ÷ 目标帧率)
-// 2026-09-26:过场运镜计时(见 FL_G_CAMERA)。被改指过来的 11 条换算指令直接读 g_camMs。
-static int            g_camMs    = 33;      // round(1000 ÷ 目标帧率),install() 里算
-static int            g_camSites = 0;       // 实际改指成功的处数(应为 16)
-static bool           g_camOn    = false;   // 16 处全部改指成功
 static int   g_scrollSites = 0;           // resolve 时定位并核对通过的补丁点个数(应为 2;不是 2 就一处都不登记)
 static bool  g_scrollOn    = false;       // 两处是否真的改指了(给 FrameLabScrollStatus 用)
-// 2026-09-22:弹道流节拍门(见 FL_G_TRACER)。只需要一个「上次转发时的 30 Hz 虚拟帧号」,不需要表 ——
-//   全进程只有一个 TheTracerManager。
-static unsigned char* g_trcSite   = NULL;    // 被改的那 11 字节的起点(应为 0x00542E4F);NULL = 没装
-static unsigned       g_trcVFrame = 0xFFFFFFFFu;  // 上一次放行时的虚拟帧号
-static bool           g_trcOn     = false;   // 节拍门是否真的生效
-static volatile long  g_trcCalls  = 0;       // 包装被进入的次数
-static volatile long  g_trcFwd    = 0;       // 真的转发给引擎的次数(放行 ÷ 调用 应 ≈ 30 ÷ 目标帧率)
 static unsigned char* g_chsSite   = NULL;    // 被改的那条 call 的地址(应为 0x00535E87);NULL = 没装
 static void*          g_chsOrigFn = NULL;    // 它原来的目标 sub_532CA0
 static int            g_chsMode   = FL_CHS_MODE_PROBE;   // 0 探针 / 1 节拍门·回放 / 2 节拍门·插值(只量不改或目标帧率 <= 原版时恒为 0)
@@ -1566,52 +1379,6 @@ extern "C" char __fastcall fl_wrap_chassis(void* self, void* unused, float* out)
         if (tmpl) ent->appearance = *(int*)(tmpl + 100);
     }
     return r;
-}
-
-// ── ★★★ 2026-09-22:弹道流 30 Hz 节拍门的包装(见 FL_G_TRACER)────────────────────────────────
-// 被改的 11 字节里,ecx 在进入时**已经**装着 TheTracerManager(上一条 `mov ecx,[0xCDB79C]` 没被动),
-// 所以这里用 __fastcall 接住它;原代码的 null 判断由我们自己做(那条 test/je 被我们覆盖掉了)。
-// 只读我们自己的两个全局 + 一次虚拟帧号计算,不分配、不用 SEH;转发就是原来那条 `call [vtbl+0x14]`。
-// 节拍门关着(只读计数)时每次都转发 ⇒ 行为逐位不变。
-typedef void (__thiscall *FnTracerUpdate)(void* self);
-extern "C" void __fastcall fl_wrap_tracer(void* mgr, void* unused) {
-    (void)unused;
-    if (!mgr) return;                                  // 原代码的 test ecx,ecx / je
-    ++g_trcCalls;
-    if (g_trcOn) {
-        void* client = *(void**)kDisplayClockVa;
-        if (client) {
-            typedef int (__thiscall *FnClientFrame2)(void*);
-            const unsigned frame = (unsigned)((FnClientFrame2)(*(void***)client)[0x74 / 4])(client);
-            const unsigned vf = fl_chs_vframe(frame, g_targetFps, g_retailFps);
-            if (vf == g_trcVFrame) return;             // 这个 30 Hz 虚拟帧已经推进过了
-            g_trcVFrame = vf;
-        }
-    }
-    ++g_trcFwd;
-    ((FnTracerUpdate)(*(void***)mgr)[0x14 / 4])(mgr);
-}
-
-// ── ★★★ 2026-09-23:粒子系统管理器 30 Hz 节拍门的包装(见 FL_G_PSYS)────────────────────────────
-// 进来时 ecx = W3D 粒子管理器(原 call 前没动过 ecx),__fastcall 接住;原目标 sub_6D1D30 是 __thiscall、
-// 无栈参数 ⇒ 我们也无栈参数,调用约定对得上。与弹道流包装同一个形状:只读自己的全局 + 一次虚拟帧号计算,
-// 不分配、不用 SEH。节拍门不生效时每次都转发 ⇒ 行为逐位不变。
-typedef void (__thiscall *FnPsysUpdate)(void* self);
-extern "C" void __fastcall fl_wrap_psys(void* mgr, void* unused) {
-    (void)unused;
-    ++g_psCalls;
-    if (g_psOn) {
-        void* client = *(void**)kDisplayClockVa;
-        if (client) {
-            typedef int (__thiscall *FnClientFrame3)(void*);
-            const unsigned frame = (unsigned)((FnClientFrame3)(*(void***)client)[0x74 / 4])(client);
-            const unsigned vf = fl_chs_vframe(frame, g_targetFps, g_retailFps);
-            if (vf == g_psVFrame) return;              // 这个 30 Hz 虚拟帧已经推进过了
-            g_psVFrame = vf;
-        }
-    }
-    ++g_psFwd;
-    ((FnPsysUpdate)g_psOrigFn)(mgr);
 }
 
 // ───────────────────────────── 安装 / 卸载 ─────────────────────────────
@@ -2415,152 +2182,6 @@ static int install(int targetFps, bool measureOnly) {
         }
     }
 
-    // ── ★★★ 弹道流 30 Hz 节拍门(默认关;2026-09-22)──────────────────────────────────────────
-    //    11 字节换成 `call fl_wrap_tracer` + 6 个 NOP。ecx 已由上一条 mov 装好,不用再取。
-    //    只量不改模式下不装(那一臂要的是原版行为)。
-    g_trcSite = NULL; g_trcOn = false; g_trcVFrame = 0xFFFFFFFFu; g_trcCalls = 0; g_trcFwd = 0;
-    if (ok && !measureOnly && (g_groups & FL_G_TRACER)) {
-        // ⚠ 把操作数通配掉之后,这段字节与紧邻的上一处(dword_CDB794 那个管理器)**完全相同** ——
-        //   所以不能用 scan()(它要求唯一命中,这里必然报「命中多处」),必须像 R1 那样**按操作数过滤**:
-        //   只认 `mov ecx,[0x00CDB79C]` 的那一处,过滤后必须恰好 1 处。
-        unsigned char* trcHits[8];
-        // 期望地址写 0:这条特征交给 scan_all(按操作数过滤),而**离线干扫不做操作数过滤** ——
-        //   它只把「第一处命中」和期望地址比,于是会误报 FAIL(实测第一处在 0x004EE6E8)。
-        //   与其它 scan_all 用例(R1 算 r、R2b 每显示帧秒数)一致:地址由运行期的操作数判据把关。
-        Pattern pTrc = {"弹道流 update 调用点", kSigTracerUpdate,
-                        (int)(sizeof kSigTracerUpdate / sizeof kSigTracerUpdate[0]), 0};
-        const int nTrc = scan_all(pTrc, 2, (void*)kEngineTracerMgrVa, trcHits, 8);
-        unsigned char* hit = (nTrc == 1) ? trcHits[0] : NULL;
-        if (!hit) {
-            FL_WARN("弹道流节拍门:按「管理器 = %08X」过滤后命中 %d 处(应恰好 1 处)—— 跳过。"
-                    "后果:60/90 帧下弹道流密度仍是原版的 2/3 倍(开火看起来像机关枪)。",
-                    (unsigned)kEngineTracerMgrVa, nTrc);
-        } else {
-            FL_INFO("  弹道流 update 调用点 @ %08X(管理器 %08X,过滤前 %d 处里唯一一处读它)",
-                    (unsigned)(uintptr_t)hit, (unsigned)kEngineTracerMgrVa, nTrc);
-            unsigned char* site = hit + 6;             // 从 test ecx,ecx 开始的 11 字节
-            unsigned char code[11];
-            memset(code, 0x90, sizeof code);
-            code[0] = 0xE8;
-            const int rel = (int)((unsigned char*)&fl_wrap_tracer - (site + 5));
-            memcpy(code + 1, &rel, 4);
-            ok = patch(site, code, (int)sizeof code, "弹道流 30 Hz 节拍门");
-            if (ok) {
-                g_trcSite = site;
-                g_trcOn   = (targetFps > g_retailFps);
-                FL_INFO("  弹道流节拍门已装 @ %08X → 包装 %08X;%s",
-                        (unsigned)(uintptr_t)site, (unsigned)(uintptr_t)&fl_wrap_tracer,
-                        g_trcOn ? "生效(每秒推进钉回 30 步 ⇒ 生成密度与原版相同)"
-                                : "目标帧率不高于原版 ⇒ 每次都转发,行为逐位不变");
-            }
-        }
-    }
-
-    // ── ★★★ 粒子系统管理器 30 Hz 节拍门(默认关;2026-09-23)─────────────────────────────────────
-    //    只改 sub_5F43A0 里那条 call sub_6D1D30 的 rel32。核对「原目标 == 0x006D1D30」才改;
-    //    g_psOrigFn 必须在改字节**之前**就位(改完那一刻渲染线程就可能进来)。只量不改模式下不装。
-    g_psSite = NULL; g_psOn = false; g_psVFrame = 0xFFFFFFFFu; g_psCalls = 0; g_psFwd = 0;
-    if (ok && !measureOnly && (g_groups & FL_G_PSYS)) {
-        Pattern pPs = {"粒子系统管理器 update 调用点", kSigPsysUpdate,
-                       (int)(sizeof kSigPsysUpdate / sizeof kSigPsysUpdate[0]), 0x005F43A7};
-        unsigned char* hit = scan(pPs);
-        if (!hit || hit == (unsigned char*)-1) {
-            FL_WARN("粒子系统节拍门:特征未命中或命中多处 —— 跳过(不影响其它改动)。"
-                    "后果:60/90 帧下粒子发射频率仍是原版的 2/3 倍(电厂 / 矿场的光闪得快)。");
-        } else {
-            unsigned char* site = hit + 6;                                  // call 指令本身(0x005F43AD)
-            void* origFn = (void*)(site + 5 + *(int*)(site + 1));           // 原目标 = call 下一条 + rel32
-            if (origFn != (void*)kEnginePsysUpdateVa) {
-                FL_WARN("粒子系统节拍门:call @%08X 的目标是 %08X,期望 %08X(sub_6D1D30)—— 跳过。",
-                        (unsigned)(uintptr_t)site, (unsigned)(uintptr_t)origFn,
-                        (unsigned)kEnginePsysUpdateVa);
-            } else {
-                unsigned char code[5];
-                code[0] = 0xE8;
-                const int rel = (int)((unsigned char*)&fl_wrap_psys - (site + 5));
-                memcpy(code + 1, &rel, 4);
-                g_psOrigFn = origFn;                                        // 包装一进来就要用,必须先就位
-                g_psOn     = (targetFps > g_retailFps);
-                ok = patch(site, code, 5, "粒子系统 30 Hz 节拍门(只改 call 目标)");
-                if (ok) {
-                    g_psSite = site;                                        // ★ 只有装成功才登记
-                    FL_INFO("  粒子系统节拍门已装:call @%08X → 包装 %08X(原目标 %08X);%s",
-                            (unsigned)(uintptr_t)site, (unsigned)(uintptr_t)&fl_wrap_psys,
-                            (unsigned)(uintptr_t)origFn,
-                            g_psOn ? "生效(起始延迟 / 爆发间隔 / 系统寿命钉回每秒 30 步 ⇒ 发射频率与原版相同)"
-                                   : "目标帧率不高于原版 ⇒ 每次都转发,行为逐位不变");
-                } else {
-                    g_psOn = false;
-                }
-            }
-        }
-    }
-
-    // ── ★★★ 战役过场运镜计时(默认关;2026-09-26)。16 处操作数改指,全中才装。──────────────────────
-    g_camOn = false; g_camSites = 0;
-    if (ok && !measureOnly && (g_groups & FL_G_CAMERA)) {
-        if (targetFps <= g_retailFps) {
-            FL_INFO("  过场运镜计时:目标帧率不高于原版 ⇒ 不需要,不装(行为逐位不变)");
-        } else {
-        Pattern pCam00 = {"镜头 005B9615", kSigCam00, (int)(sizeof kSigCam00 / sizeof kSigCam00[0]), 0x005B9615};
-        Pattern pCam01 = {"镜头 005B96C6", kSigCam01, (int)(sizeof kSigCam01 / sizeof kSigCam01[0]), 0x005B96C6};
-        Pattern pCam02 = {"镜头 005B96F2", kSigCam02, (int)(sizeof kSigCam02 / sizeof kSigCam02[0]), 0x005B96F2};
-        Pattern pCam03 = {"镜头 005B97AA", kSigCam03, (int)(sizeof kSigCam03 / sizeof kSigCam03[0]), 0x005B97AA};
-        Pattern pCam04 = {"镜头 005C3189", kSigCam04, (int)(sizeof kSigCam04 / sizeof kSigCam04[0]), 0x005C3189};
-        Pattern pCam05 = {"镜头 005C333C", kSigCam05, (int)(sizeof kSigCam05 / sizeof kSigCam05[0]), 0x005C333C};
-        Pattern pCam06 = {"镜头 005C33CC", kSigCam06, (int)(sizeof kSigCam06 / sizeof kSigCam06[0]), 0x005C33CC};
-        Pattern pCam07 = {"镜头 005C3495", kSigCam07, (int)(sizeof kSigCam07 / sizeof kSigCam07[0]), 0x005C3495};
-        Pattern pCam08 = {"镜头 005C3525", kSigCam08, (int)(sizeof kSigCam08 / sizeof kSigCam08[0]), 0x005C3525};
-        Pattern pCam09 = {"镜头 005C3607", kSigCam09, (int)(sizeof kSigCam09 / sizeof kSigCam09[0]), 0x005C3607};
-        Pattern pCam10 = {"镜头 005ED163", kSigCam10, (int)(sizeof kSigCam10 / sizeof kSigCam10[0]), 0x005ED163};
-        Pattern pCam11 = {"镜头 005EB661", kSigCam11, (int)(sizeof kSigCam11 / sizeof kSigCam11[0]), 0x005EB661};
-        Pattern pCam12 = {"镜头 005EB6A6", kSigCam12, (int)(sizeof kSigCam12 / sizeof kSigCam12[0]), 0x005EB6A6};
-        Pattern pCam13 = {"镜头 005EB769", kSigCam13, (int)(sizeof kSigCam13 / sizeof kSigCam13[0]), 0x005EB769};
-        Pattern pCam14 = {"镜头 005EB6F5", kSigCam14, (int)(sizeof kSigCam14 / sizeof kSigCam14[0]), 0x005EB6F5};
-        Pattern pCam15 = {"镜头 005EB6FA", kSigCam15, (int)(sizeof kSigCam15 / sizeof kSigCam15[0]), 0x005EB6FA};
-        unsigned char* camHit[FL_CAM_SITES] = {
-            scan(pCam00), scan(pCam01), scan(pCam02), scan(pCam03), scan(pCam04), scan(pCam05), scan(pCam06), scan(pCam07), scan(pCam08), scan(pCam09), scan(pCam10), scan(pCam11), scan(pCam12), scan(pCam13), scan(pCam14), scan(pCam15)
-        };
-        int nHit = 0;
-        for (int i = 0; i < FL_CAM_SITES; ++i)
-            if (camHit[i] && camHit[i] != (unsigned char*)-1) ++nHit;
-        if (nHit != FL_CAM_SITES) {
-            FL_WARN("过场运镜计时:16 处特征只定位到 %d 处 —— 一处都不改(不影响其它改动)。"
-                    "后果:60/90 帧下战役脚本运镜仍快 2/3 倍。", nHit);
-        } else {
-            g_camMs = (1000 + targetFps / 2) / targetFps;          // 四舍五入:30→33、60→17、90→11
-            for (int i = 0; ok && i < FL_CAM_SITES; ++i) {
-                void* p = (kCamKind[i] == 'c') ? (void*)&g_camMs
-                        : (kCamKind[i] == 'k') ? (void*)&g_msPerFrame
-                                               : (void*)&g_fpsRender;
-                ok = patch(camHit[i] + kCamOpOff[i], &p, 4, "过场运镜计时(操作数改指)");
-                if (ok) ++g_camSites;
-            }
-            g_camOn = ok && g_camSites == FL_CAM_SITES;
-            if (g_camOn)
-                FL_INFO("  过场运镜计时已装:16 处(11 处换算 → %d 毫秒/帧,3 处推进 → 时钟同步值,2 处镜头动画 → 目标 %d 帧)",
-                        g_camMs, targetFps);
-        }
-        }
-    }
-
-    // ── ★ 状态图标乒乓动画(默认关;2026-09-22)。一处 4 字节:除数 30 → 目标帧率。
-    if (ok && !measureOnly && (g_groups & FL_G_ICONANIM)) {
-        Pattern pIcon = {"状态图标乒乓(帧号×15÷帧率)", kSigIconPingPong,
-                         (int)(sizeof kSigIconPingPong / sizeof kSigIconPingPong[0]), 0x0051A4E8};
-        unsigned char* hit = scan(pIcon);
-        if (!hit || hit == (unsigned char*)-1) {
-            FL_WARN("状态图标乒乓:特征未命中 / 命中多处 —— 跳过(图标动画在 60/90 帧下仍快 2/3 倍)。");
-        } else if (*(int**)(hit + 14) != g_fpsClient) {
-            // 偏移 +14 不是 +16:8B D0(2) | A1 +操作数 4(5) | 0F AF C2(3) | 33 D2(2) | F7 35(2) ⇒ 除数在 +14。
-            FL_WARN("状态图标乒乓:除数指向 %08X,不是客户端帧率全局 %08X —— 跳过。",
-                    (unsigned)(uintptr_t)*(int**)(hit + 14), (unsigned)(uintptr_t)g_fpsClient);
-        } else {
-            void* p = (void*)&g_fpsRender;
-            ok = patch((void**)(hit + 14), &p, 4, "状态图标乒乓除数 → 目标帧率");
-        }
-    }
-
     // ── R:把「需要看到新渲染帧率」的那几条指令改指向我们的 g_fpsRender ────────────────
     // 这是本轮的设计改动:不再往游戏的客户端帧率全局里写 60(那个全局有上百处读者),
     // 改成只动我们确认需要新值的这些读者。漏掉一处的后果从「静默改错」变成「保持原样」。
@@ -2736,9 +2357,6 @@ static int uninstall() {
     // 万一有线程此刻正停在包装函数里,它醒来后还要用它转发一次。
     g_chsSite = NULL; g_chsMode = FL_CHS_MODE_PROBE;
     g_scrollOn = false;
-    g_trcSite = NULL; g_trcOn = false;
-    g_psSite = NULL; g_psOn = false;
-    g_camSites = 0; g_camOn = false;
     g_installed = false;
     FL_INFO("已卸载,全部字节还原");
     return FL_OK;
@@ -2928,26 +2546,6 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabSetGroups(int mask) {
             (fl::g_groups & FL_G_STEPPROBE)
                 ? "(只改一条 call 的目标,行为逐位不变;给 FrameLabBlendStepPerLogicFrame 用)"
                 : "(关着:量不了 P6b 的效果,clockrate 看不见这条路径)");
-    // 2026-09-22:弹道流与状态图标(用户 90 帧实机报的「开火像机关枪」)。
-    FL_INFO("  弹道流 30 Hz 节拍门=%s%s",
-            (fl::g_groups & FL_G_TRACER) ? "开" : "关",
-            (fl::g_groups & FL_G_TRACER)
-                ? "(生成密度 / 伸展 / 移动钉回每秒 30 步 —— 开火不再像机关枪;未经实机验证)"
-                : "(默认:弹道流每秒生成条数是原版的 2/3 倍)");
-    FL_INFO("  过场运镜计时=%s%s",
-            (fl::g_groups & FL_G_CAMERA) ? "开" : "关",
-            (fl::g_groups & FL_G_CAMERA)
-                ? "(战役脚本镜头的旋转 / 俯仰 / 缩放 / 移动 / 镜头动画按真实时间走;未经实机验证)"
-                : "(默认:60/90 帧下战役脚本运镜快 2/3 倍)");
-    FL_INFO("  粒子系统 30 Hz 节拍门=%s%s",
-            (fl::g_groups & FL_G_PSYS) ? "开" : "关",
-            (fl::g_groups & FL_G_PSYS)
-                ? "(起始延迟 / 爆发间隔 / 系统寿命钉回每秒 30 步 —— 电厂 / 矿场的光不再闪得快;未经实机验证)"
-                : "(默认:粒子系统每秒发射次数是原版的 2/3 倍)");
-    FL_INFO("  状态图标乒乓动画=%s%s",
-            (fl::g_groups & FL_G_ICONANIM) ? "开" : "关",
-            (fl::g_groups & FL_G_ICONANIM)
-                ? "(sub_51A4D0 的除数 30 → 目标帧率;未经实机验证)" : "");
     // 2026-09-21:卷屏归一(用户点名要的可自选项)。
     FL_INFO("  卷屏速度按帧率归一=%s%s",
             (fl::g_groups & FL_G_SCROLL) ? "开" : "关",
@@ -3216,37 +2814,6 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabChassisSlots(char* buf) {
 extern "C" __declspec(dllexport) int __stdcall FrameLabChassisStatus() {
     if (!fl::g_chsSite) return -2;
     return fl::g_chsMode;
-}
-
-// FrameLabTracerStatus():弹道流节拍门的状态。-2 = 补丁点没就位;0 = 关;1 = 已生效。
-//   低 16 位另带「放行 ÷ 调用 × 1000」,给脚本当判据:90 帧生效时应 ≈ 333,60 帧 ≈ 500,没装门 = 1000。
-extern "C" __declspec(dllexport) int __stdcall FrameLabTracerStatus() {
-    if (fl::g_installed && (fl::g_groups & FL_G_TRACER) && !fl::g_trcSite) return -2;
-    if (!fl::g_trcOn) return 0;
-    const long c = fl::g_trcCalls, f = fl::g_trcFwd;
-    const int ratio = c > 0 ? (int)((long long)f * 1000 / c) : 0;
-    FL_INFO("弹道流节拍门:调用 %ld 转发 %ld ⇒ 放行比例 %d/1000(90 帧应 ≈ 333,60 帧 ≈ 500)", c, f, ratio);
-    return 1000000 + ratio;
-}
-
-// FrameLabCameraStatus():过场运镜计时的状态。-2 = 分组位开着、已安装,但 16 处没全部改指;0 = 关 / 不需要;
-//   1000 + g_camMs = 已生效(90 帧应为 1011,60 帧 1017)。
-extern "C" __declspec(dllexport) int __stdcall FrameLabCameraStatus() {
-    if (fl::g_camOn) return 1000 + fl::g_camMs;
-    if (fl::g_installed && (fl::g_groups & FL_G_CAMERA) && fl::g_targetFps > fl::g_retailFps) return -2;
-    return 0;
-}
-
-// FrameLabPsysStatus():粒子系统节拍门的状态。与 FrameLabTracerStatus 同一套约定:
-//   -2 = 分组位开着但补丁点没就位;0 = 关 / 不生效;1000000 + (放行 ÷ 调用 × 1000) = 已生效
-//   (90 帧应 ≈ 333,60 帧 ≈ 500)。
-extern "C" __declspec(dllexport) int __stdcall FrameLabPsysStatus() {
-    if (fl::g_installed && (fl::g_groups & FL_G_PSYS) && !fl::g_psSite) return -2;
-    if (!fl::g_psOn) return 0;
-    const long c = fl::g_psCalls, f = fl::g_psFwd;
-    const int ratio = c > 0 ? (int)((long long)f * 1000 / c) : 0;
-    FL_INFO("粒子系统节拍门:调用 %ld 转发 %ld ⇒ 放行比例 %d/1000(90 帧应 ≈ 333,60 帧 ≈ 500)", c, f, ratio);
-    return 1000000 + ratio;
 }
 
 // FrameLabScrollStatus():卷屏归一的状态。-2 = 两处补丁点没就位(特征没命中 / 常量不对);0 = 关;1 = 已生效。

@@ -118,59 +118,6 @@ int main(int argc, char** argv) {
         check(bbOn(0) == 0, "黑匣子:飞行记录仪可关闭", bbOn(0));
     }
 
-    // 车身外观 30 Hz 节拍门的离线自检(2026-09-21 悬挂路径会话,Claude)。
-    // 动机:用户在真 90 帧的机器上录到「海啸坦克上下颠簸剧烈」。车身的悬挂/俯仰/侧倾由引擎的
-    //   calcPhysicsXform 每**显示帧**递推一步、不含 dt ⇒ 90 帧下每秒递推 90 步(原版 30)。
-    //   节拍门只在「30 Hz 虚拟帧」变化的显示帧放行原函数,其余帧回放缓存(src/chassis_gate.h)。
-    // 这段逻辑是纯算术 + 一张定长表,不需要游戏:自检用一个与引擎同形的假弹簧递推来驱动它,
-    //   判据是「任何目标帧率下,放行得到的位姿序列与 30 帧逐位相同」。
-    // ★同一条纪律:闸门必须能被证明会红 —— 0x10 那一位同时断言「门关着的 90 帧按同一判据不通过」。
-    FnVoid selftestChassis = (FnVoid)GetProcAddress(h, "FrameLabSelfTestChassis");
-    FnInt  chassisRate     = (FnInt)GetProcAddress(h, "FrameLabChassisRate");
-    typedef int(__stdcall* FnBuf)(char*);
-    FnBuf  chassisSlots    = (FnBuf)GetProcAddress(h, "FrameLabChassisSlots");
-    check(selftestChassis != NULL && chassisRate != NULL && chassisSlots != NULL, "车身外观三个导出都取得到");
-    if (selftestChassis) {
-        const int rcCh = selftestChassis();
-        check((rcCh & 0x01) != 0, "车身门·目标 30:每帧放行、零回放(直通,与原版逐位一致)", rcCh);
-        check((rcCh & 0x06) == 0x06, "车身门·目标 60 / 90:放行次数钉回每秒 30 步,位姿序列与 30 帧逐位相同", rcCh);
-        check((rcCh & 0x08) != 0, "车身门·非整数倍(45 / 75):同一虚拟帧不重复放行,序列仍逐位相同", rcCh);
-        check((rcCh & 0x10) != 0, "车身门·自检资格:门关着的 90 帧每帧放行,按同一判据不通过(闸门真的会红)", rcCh);
-        check((rcCh & 0x20) != 0, "车身门·原函数返回 0:原样返回、不缓存、不回放", rcCh);
-        check((rcCh & 0xC0) == 0xC0, "车身门·表满退回直通(不丢姿态)+ 陈旧格子可回收 / 重置", rcCh);
-        // 2026-09-21 同日追加:插值模式(为 90 帧准备 —— 递推仍 30 Hz,显示时在相邻两个位姿之间按相位插值)。
-        check((rcCh & 0x100) != 0, "车身门·插值(60/90/45/75):虚拟帧末的输出与引擎位姿逐位相同,中间帧不越界", rcCh);
-        check((rcCh & 0x200) != 0, "车身门·插值边界:目标 30 直通;过期位姿不当插值起点", rcCh);
-    }
-    if (chassisRate) {
-        // 没装包装时必须返回 -2(「没装」),而不是 -1(「没数据」)—— 两种情况绝不能长得一样。
-        const int rcRate = chassisRate(1);
-        check(rcRate == -2, "车身尺子:包装没装时返回 -2(「没装」≠「没数据」)", rcRate);
-    }
-    if (chassisSlots) {
-        static char slotBuf[16384];
-        const int rcSlots = chassisSlots(slotBuf);
-        check(rcSlots == -2 && slotBuf[0] != 0, "车身全表:包装没装时返回 -2 且说明原因", rcSlots);
-    }
-
-    // 2026-09-23:粒子系统节拍门(电厂 / 矿场的光)。GUI 靠这个导出报「到底装没装上」——
-    //   没装时必须是 0(关),不能是 -2(「开了但没装上」只在装过之后才有意义)。
-    typedef int(__stdcall* FnStatus)();
-    FnStatus psysStatus = (FnStatus)GetProcAddress(h, "FrameLabPsysStatus");
-    check(psysStatus != NULL, "粒子系统节拍门的状态导出取得到");
-    if (psysStatus) {
-        const int rcPs = psysStatus();
-        check(rcPs == 0, "粒子系统节拍门:没安装时状态 = 0(关),不是 -2", rcPs);
-    }
-
-    // 2026-09-26:过场运镜计时。没安装时必须是 0(关),不能是 -2。
-    FnStatus camStatus = (FnStatus)GetProcAddress(h, "FrameLabCameraStatus");
-    check(camStatus != NULL, "过场运镜计时的状态导出取得到");
-    if (camStatus) {
-        const int rcCam = camStatus();
-        check(rcCam == 0, "过场运镜计时:没安装时状态 = 0(关),不是 -2", rcCam);
-    }
-
     const int rcDisable = disable();
     check(rcDisable == 1, "没装过时关闭返回「未安装」(1)", rcDisable);
 

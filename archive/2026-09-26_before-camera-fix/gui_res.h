@@ -57,8 +57,7 @@
 //                      constant 0xCDBD34 = seconds per display frame) | 0x1000000 (tracer-stream
 //                      30 Hz cadence gate -- the "fires like a machine gun" symptom) | 0x2000000
 //                      (status-icon ping-pong divisor) | 0x4000000 (particle-system manager 30 Hz
-//                      cadence gate, added 2026-09-23 -- the power-plant / refinery glow) | 0x8000000
-//                      (scripted-camera timing, added 2026-09-26 -- campaign cutscene camera). One checkbox
+//                      cadence gate, added 2026-09-23 -- the power-plant / refinery glow). One checkbox
 //                      rather than four because they
 //                      are one class of bug; flctl still has each bit separately for bisection.
 #define IDC_FX_FIX         1010

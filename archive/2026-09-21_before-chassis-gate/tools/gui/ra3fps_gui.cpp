@@ -108,67 +108,6 @@
 //     0x2CFFF = fixed (shipped)   0x2C1FF = triple OFF (batch-6 behaviour)
 static const unsigned kGroups = 0x2CFFFu;
 
-// 2026-09-21 (chassis-suspension session): OPTIONAL override of the groups mask, read once from
-// the environment variable RA3FL_GROUPS (decimal or 0x-hex). Absent / empty / unparsable / 0
-// => the shipped default above, i.e. nothing changes for a normal user.
-// Why it exists: the new chassis bits (0x80000 probe, 0x100000 30 Hz cadence gate, 0x200000
-// pose interpolation) are default-OFF until they are verified on a machine that really renders
-// 90 fps -- and on that machine this single exe is often the only tool at hand. With this the
-// A/B is one line in a console, no rebuild:
-//     set RA3FL_GROUPS=0x3ACFFF  &&  Ra3FpsTest.exe      (shipped set + probe + gate + interpolation)
-//     set RA3FL_GROUPS=0x1ACFFF  &&  Ra3FpsTest.exe      (shipped set + probe + gate, hold mode)
-//     set RA3FL_GROUPS=          &&  Ra3FpsTest.exe      (back to the shipped default)
-// The log states the effective mask AND whether it came from the override, so a log sent back
-// to us can never be mistaken for a default run.
-// 2026-09-21 (later the same day): the chassis-bounce fix is a CHECKBOX on the window, default ON.
-//   Bits: 0x80000 probe (feeds the black box pose axis) | 0x100000 30 Hz cadence gate |
-//   0x200000 pose interpolation. In-engine readings on the dev machine at target 60: recurrence
-//   steps per logic frame 2000 (vanilla) / 3993 (unfixed) / 2003 (this setting); dominant pitch
-//   frequency in logic time 1.6 Hz / 3.9 Hz / 1.8 Hz. Unchecked = exactly the old shipped mask.
-//   An RA3FL_GROUPS override, when present, still wins over the checkbox (expert use).
-static const unsigned kChassisFixBits = 0x380000u;
-static volatile LONG g_chassisFix = 1;
-// 2026-09-21:卷屏归一 —— 用户点名「做成可自选的」。默认**不勾**(= 现状:卷屏随帧率变快),勾上 = 键盘 / 边缘卷屏
-//   每秒走的距离与原版相同。这是手感问题不是对错问题,而且实机还没验过,所以默认保持现状。
-static const unsigned kScrollFixBits = 0x800000u;
-static volatile LONG g_scrollFix = 0;
-// 2026-09-22:用户在 90 帧实机报的两个新现象 ——「矿场熔炉 / 电厂灯口的光闪得特别快」和
-//   「帝国武士开火像机关枪(但伤害没变)」。它们与车身颠簸是**同一类 bug**:某个视觉效果
-//   每显示帧推进一步、不含 dt,于是 60/90 帧下时间轴被压缩 2/3 倍。
-//   这一个复选框打包三位:0x400000 第四个帧率派生量(每显示帧的秒数,影响贴花淡出 / 拖尾贴图滚动 /
-//   子物体淡出 / 精灵脉动)| 0x1000000 弹道流 30 Hz 节拍门(开火密度)| 0x2000000 状态图标乒乓。
-//   打包而不是三个勾:对用户它们是同一件事;要二分仍可用 flctl 逐位控制。
-//   **默认不勾**:三位都还没在游戏里跑过,车身那一项刚验收通过,不要把变量混在一起。
-// 2026-09-23:打包里再加 0x4000000 粒子系统节拍门 —— 用户实测「光仍然闪得快」,而同包的弹道流已修好
-//   ⇒ 0x400000(RadiusDecal)不是那盏光;真凶是粒子系统管理器每显示帧推进一步(见 framelab.cpp FL_G_PSYS)。
-// 2026-09-26:再加 0x8000000 过场运镜计时 —— 用户实测战役过场「镜头一下就过去、到了地方等飞机」,约快 3 倍。
-static const unsigned kFxFixBits = 0xF400000u;
-static volatile LONG g_fxFix = 0;
-static bool g_groupsOverridden = false;
-static unsigned EnvGroups();
-static unsigned EffectiveGroups() {
-    const unsigned env = EnvGroups();
-    if (g_groupsOverridden) return env;
-    return kGroups | (g_chassisFix ? kChassisFixBits : 0u) | (g_scrollFix ? kScrollFixBits : 0u)
-                   | (g_fxFix ? kFxFixBits : 0u);
-}
-static unsigned EnvGroups() {
-    static bool resolved = false;
-    static unsigned value = kGroups;
-    if (!resolved) {
-        resolved = true;
-        wchar_t buf[40] = {0};
-        const DWORD n = GetEnvironmentVariableW(L"RA3FL_GROUPS", buf, 40);
-        if (n > 0 && n < 40) {
-            wchar_t* end = NULL;
-            const unsigned long v = wcstoul(buf, &end, 0);
-            while (end && (*end == L' ' || *end == L'\t')) ++end;
-            if (v != 0 && end && *end == 0) { value = (unsigned)v; g_groupsOverridden = true; }
-        }
-    }
-    return value;
-}
-
 // Base name of the patcher DLL. The file we actually write to disk carries a per-process
 // suffix (see ExtractDll) so that two copies of this tool -- or two sessions on a shared
 // machine -- can never fight over one file, because Windows refuses to overwrite a DLL that
@@ -202,9 +141,6 @@ static HWND      g_hStart     = NULL;
 static HWND      g_hLog       = NULL;
 static HWND      g_hBbDump    = NULL;   // 「立即保存现场」
 static HWND      g_hBbTest    = NULL;   // 「记录器自检」
-static HWND      g_hChassis   = NULL;   // 「修复载具颠簸」复选框(2026-09-21)
-static HWND      g_hScroll    = NULL;   // 「卷屏保持原版速度」复选框(2026-09-21,默认不勾)
-static HWND      g_hFx        = NULL;   // 「修复过快的视觉效果」复选框(2026-09-22,默认不勾)
 static HFONT     g_hFont      = NULL;
 
 static volatile LONG g_busy   = 0;   // a job is running; disable the controls
@@ -906,9 +842,8 @@ static bool JobPatch(DWORD& outPid, HANDLE& outProc, JobCtx& ctx) {
                 break;
             }
             DWORD gr = 0;
-            if (RemoteCall(proc, setGroups, (void*)(uintptr_t)EffectiveGroups(), &gr, 60000)) {
-                LogF(L"[OK]   改动分组 = 0x%04X（返回 %lu）%s", EffectiveGroups(), (unsigned long)gr,
-                     g_groupsOverridden ? L" ★由环境变量 RA3FL_GROUPS 覆盖，不是出厂默认 0x2CFFF" : L"");
+            if (RemoteCall(proc, setGroups, (void*)(uintptr_t)kGroups, &gr, 60000)) {
+                LogF(L"[OK]   改动分组 = 0x%04X（返回 %lu）", kGroups, (unsigned long)gr);
             } else {
                 LogLine(L"[WARN] 设置改动分组失败，继续尝试启用。");
             }
@@ -924,97 +859,6 @@ static bool JobPatch(DWORD& outPid, HANDLE& outProc, JobCtx& ctx) {
         if (rc == 0 || rc == 2) {
             installed = true;
             LogF(L"[OK]   补丁已生效：目标 %d 帧（返回 %lu，%s）", ctx.fps, (unsigned long)rc, Explain(lastRc));
-            // 2026-09-21:载具颠簸修复到底有没有真的装上?分组位开了 ≠ 装上了(特征没命中只在 DLL 日志里留 WARN)。
-            {
-                void* chsStatus = RemoteExport(pid, localBase, "FrameLabChassisStatus");
-                DWORD cs = 0;
-                const bool wanted = (EffectiveGroups() & 0x300000u) != 0;
-                if (chsStatus && RemoteCall(proc, chsStatus, NULL, &cs, 60000)) {
-                    const int st = (int)cs;
-                    if (st == 2)      LogLine(L"[OK]   载具颠簸修复已生效：车身悬挂递推 = 每秒 30 步 + 位姿插值。");
-                    else if (st == 1) LogLine(L"[OK]   载具颠簸修复已生效：车身悬挂递推 = 每秒 30 步（回放，无插值）。");
-                    // 目标 30 帧要先判:那时包装是装着的(st == 0,只当探针),但节拍门本来就不该生效 ——
-                    //   照下面那条 st == 0 的话术报「未生效」会把一个正常状态说成故障。
-                    else if (wanted && ctx.fps <= 30)
-                        LogLine(L"[..]   目标 30 帧：就是原版节拍，载具颠簸修复不需要生效。");
-                    else if (st == 0) LogLine(L"[..]   车身探针已装，但节拍门没开：载具颠簸修复【未生效】。");
-                    else if (wanted)
-                        LogLine(L"[!!]   载具颠簸修复【没装上】（特征未命中？）。60/90 帧下载具仍会上下颠簸 —— 请把 logs 里的日志发给开发者。");
-                    else              LogLine(L"[..]   载具颠簸修复：关（复选框没勾）。60/90 帧下载具会上下颠簸。");
-                } else if (wanted) {
-                    LogLine(L"[WARN] 读不到载具颠簸修复的状态（DLL 太旧？）。");
-                }
-            }
-            // 2026-09-26:过场运镜计时同样报「到底开没开成」。
-            if ((EffectiveGroups() & 0x8000000u) != 0) {
-                void* camStatus = RemoteExport(pid, localBase, "FrameLabCameraStatus");
-                DWORD cs2 = 0;
-                if (camStatus && RemoteCall(proc, camStatus, NULL, &cs2, 60000)) {
-                    const int v = (int)cs2;
-                    if (v >= 1000)
-                        LogF(L"[OK]   过场运镜计时已生效（换算按每帧 %d 毫秒；90 帧应为 11、60 帧应为 17）。", v - 1000);
-                    else if (v == -2)
-                        LogLine(L"[!!]   过场运镜计时【没装上】（16 处特征没全部命中？）—— 战役过场镜头仍会跑太快。");
-                    else
-                        LogLine(L"[..]   过场运镜计时未生效（目标帧率不高于原版？）。");
-                } else {
-                    LogLine(L"[WARN] 读不到过场运镜计时的状态（DLL 太旧？）。");
-                }
-            }
-            // 2026-09-23:粒子系统节拍门(电厂 / 矿场的光)同样报「到底开没开成」+ 放行比例。
-            if ((EffectiveGroups() & 0x4000000u) != 0) {
-                void* psStatus = RemoteExport(pid, localBase, "FrameLabPsysStatus");
-                DWORD ps = 0;
-                if (psStatus && RemoteCall(proc, psStatus, NULL, &ps, 60000)) {
-                    const int v = (int)ps;
-                    if (v >= 1000000)
-                        LogF(L"[OK]   粒子系统节拍门已生效（放行比例 %d/1000，90 帧应约 333、60 帧约 500）。", v - 1000000);
-                    else if (v == -2)
-                        LogLine(L"[!!]   粒子系统节拍门【没装上】（特征未命中？）—— 电厂 / 矿场的光仍会闪得快。");
-                    else
-                        LogLine(L"[..]   粒子系统节拍门未生效（目标帧率不高于原版？）。");
-                } else {
-                    LogLine(L"[WARN] 读不到粒子系统节拍门的状态（DLL 太旧？）。");
-                }
-            }
-            // 弹道流节拍门:报「到底开没开成」,并带上实测放行比例。
-            if ((EffectiveGroups() & 0x1000000u) != 0) {
-                void* trcStatus = RemoteExport(pid, localBase, "FrameLabTracerStatus");
-                DWORD ts = 0;
-                if (trcStatus && RemoteCall(proc, trcStatus, NULL, &ts, 60000)) {
-                    const int v = (int)ts;
-                    if (v >= 1000000)
-                        LogF(L"[OK]   弹道流节拍门已生效（放行比例 %d/1000，90 帧应约 333、60 帧约 500）。", v - 1000000);
-                    else if (v == -2)
-                        LogLine(L"[!!]   弹道流节拍门【没装上】（特征未命中？）—— 开火仍会像机关枪。");
-                    else
-                        LogLine(L"[..]   弹道流节拍门未生效（目标帧率不高于原版？）。");
-                } else {
-                    LogLine(L"[WARN] 读不到弹道流节拍门的状态（DLL 太旧？）。");
-                }
-            }
-            // 卷屏归一:同样报「到底开没开成」。
-            if ((EffectiveGroups() & kScrollFixBits) != 0) {
-                void* scStatus = RemoteExport(pid, localBase, "FrameLabScrollStatus");
-                DWORD ss = 0;
-                if (scStatus && RemoteCall(proc, scStatus, NULL, &ss, 60000)) {
-                    if ((int)ss == 1) LogLine(L"[OK]   卷屏归一已生效：键盘 / 边缘卷屏速度与原版相同。");
-                    else LogF(L"[!!]   卷屏归一【没开成】（状态 %d；特征未命中？）—— 卷屏保持随帧率变快。", (int)ss);
-                } else {
-                    LogLine(L"[WARN] 读不到卷屏归一的状态（DLL 太旧？）。");
-                }
-            }
-            // 2026-09-22:用户实测「30 帧原版玩家 ＋ 90 帧补丁玩家」同场对战 → 不同步。
-            //   锁步模型要求两端算出逐位相同的模拟状态。**原版本身允许两台机器渲染帧率不同**
-            //   (慢机渲染 18 帧、快机 30 帧照样同步),所以「渲染变快」本身不应该导致不同步;
-            //   实测却不同步 ⇒ 补丁改的某个量被模拟侧读到了。是哪一个还没逐字段对账清楚,
-            //   所以这里只给保守建议,不把它说成「锁步的必然结果」(那是把未知说成已知)。
-            if (ctx.fps > 30) {
-                LogLine(L"[!!]   联机提醒：实测「30 帧原版玩家 ＋ 90 帧补丁玩家」同场对战 = 不同步。");
-                LogLine(L"       在查清原因之前，请只和【同样装了这个补丁、且目标帧率相同】的玩家联机；");
-                LogLine(L"       即便双方都装、帧率相同，也【从未测过】，不保证同步。");
-                LogLine(L"       单机 / 战役 / 遭遇战 / 自己看自己录的录像，都不受影响。");
-            }
             break;
         }
         if (Retryable(lastRc)) {
@@ -1243,20 +1087,7 @@ static void JobMeasureLoop(DWORD pid, HANDLE gameProc, int targetFps, int maxCyc
 // --auto usable from a script: an always-zero exit code would make a failing run look fine.
 static bool RunJob(JobCtx ctx) {
     LogF(L"===== 目标 %d 帧 ｜ 目录 %s =====", ctx.fps, ctx.dir.c_str());
-    LogF(L"补丁版本 %s ｜ 改动分组 0x%04X%s", L"0.2.0", EffectiveGroups(),
-         g_groupsOverridden ? L"（★环境变量 RA3FL_GROUPS 覆盖；出厂默认是 0x2CFFF）" : L"");
-    if (!g_groupsOverridden)
-        LogF(L"载具颠簸修复 = %s", g_chassisFix
-             ? L"开（车身悬挂递推钉回每秒 30 步 + 位姿插值；分组多出 0x380000）"
-             : L"关（与旧版逐位相同的出厂分组 0x2CFFF —— 60/90 帧下载具会上下颠簸）");
-    if (!g_groupsOverridden)
-        LogF(L"卷屏速度 = %s", g_scrollFix
-             ? L"保持原版（键盘 / 边缘卷屏每秒距离不随帧率变；分组多出 0x800000；右键拖拽不在此列）"
-             : L"随帧率变快（现状：60 帧约 2 倍、90 帧约 3 倍）");
-    if (!g_groupsOverridden)
-        LogF(L"过快视觉效果修复 = %s", g_fxFix
-             ? L"开（弹道流密度 + 粒子发射 + 光效 / 淡出 / 图标 + 战役过场运镜钉回原版；分组多出 0xF400000）"
-             : L"关（现状：弹道流、贴花淡出、拖尾滚动等在 60/90 帧下快 2/3 倍）");
+    LogF(L"补丁版本 %s ｜ 改动分组 0x%04X", L"0.2.0", kGroups);
 
     // Warn about a mismatch between the requested rate and the panel BEFORE launching, so the
     // reading further down cannot be misread as a patch bug.
@@ -1316,9 +1147,6 @@ static void SetBusy(bool busy) {
     EnableWindow(g_hFps, e);
     EnableWindow(g_hDir, e);
     EnableWindow(g_hBrowse, e);
-    EnableWindow(g_hChassis, e);
-    EnableWindow(g_hScroll, e);
-    EnableWindow(g_hFx, e);
     EnableWindow(g_hStart, e);
     SetWindowTextW(g_hStart, busy ? L"运行中…" : L"开始游戏");
 }
@@ -1478,49 +1306,33 @@ static void CreateUi(HWND h) {
     SendMessageW(g_hFps, CB_ADDSTRING, 0, (LPARAM)L"90 帧（r = 6，需要 ≥90Hz 屏幕）");
     SendMessageW(g_hFps, CB_SETCURSEL, 1, 0);   // default 60: correct on every machine
 
-    // 2026-09-21:载具颠簸修复的开关,放在帧数下拉框右边,默认勾上。取消勾选 = 与旧版逐位相同的出厂掩码(做 A/B 用)。
-    g_hChassis = CreateWindowExW(0, L"BUTTON", L"修复载具上下颠簸（60/90 帧，实验）",
-                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                                 312, 8, 290, 20, h, (HMENU)IDC_CHASSIS_FIX, g_hInst, NULL);
-    SendMessageW(g_hChassis, BM_SETCHECK, g_chassisFix ? BST_CHECKED : BST_UNCHECKED, 0);
-    // 卷屏:可自选,默认不勾。放在上一个复选框正下方。
-    g_hScroll = CreateWindowExW(0, L"BUTTON", L"卷屏保持原版速度（不勾 = 随帧率变快）",
-                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                                312, 29, 290, 20, h, (HMENU)IDC_SCROLL_FIX, g_hInst, NULL);
-    SendMessageW(g_hScroll, BM_SETCHECK, g_scrollFix ? BST_CHECKED : BST_UNCHECKED, 0);
-    // 2026-09-22:过快视觉效果的打包开关,默认不勾。
-    g_hFx = CreateWindowExW(0, L"BUTTON", L"修复过快的特效与过场运镜（实验）",
-                            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                            312, 50, 290, 20, h, (HMENU)IDC_FX_FIX, g_hInst, NULL);
-    SendMessageW(g_hFx, BM_SETCHECK, g_fxFix ? BST_CHECKED : BST_UNCHECKED, 0);
-
-    HWND l2 = CreateWindowExW(0, L"STATIC", L"游戏目录：", st, 14, 81, 70, 20, h, NULL, g_hInst, NULL);
+    HWND l2 = CreateWindowExW(0, L"STATIC", L"游戏目录：", st, 14, 57, 70, 20, h, NULL, g_hInst, NULL);
     g_hDir = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                             ed | ES_READONLY, 92, 78, 400, 24, h, (HMENU)IDC_DIR_EDIT, g_hInst, NULL);
+                             ed | ES_READONLY, 92, 54, 400, 24, h, (HMENU)IDC_DIR_EDIT, g_hInst, NULL);
     g_hBrowse = CreateWindowExW(0, L"BUTTON", L"浏览…",
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                502, 77, 100, 26, h, (HMENU)IDC_DIR_BROWSE, g_hInst, NULL);
+                                502, 53, 100, 26, h, (HMENU)IDC_DIR_BROWSE, g_hInst, NULL);
 
     g_hStart = CreateWindowExW(0, L"BUTTON", L"开始游戏",
                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                               92, 120, 170, 36, h, (HMENU)IDC_START, g_hInst, NULL);
+                               92, 96, 170, 36, h, (HMENU)IDC_START, g_hInst, NULL);
 
     // 黑匣子的两个按钮(2026-09-18 第十一批)。**只有游戏已经在跑并且打上补丁之后才有意义**,
     // 所以初始状态是禁用的 —— 一个点了没反应的按钮比没有按钮更让人困惑。它们由
     // UpdateBbButtons() 在补丁装上之后打开。
     g_hBbDump = CreateWindowExW(0, L"BUTTON", L"保存现场（不同步时点）",
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                270, 120, 178, 36, h, (HMENU)IDC_BB_DUMP, g_hInst, NULL);
+                                270, 96, 178, 36, h, (HMENU)IDC_BB_DUMP, g_hInst, NULL);
     g_hBbTest = CreateWindowExW(0, L"BUTTON", L"记录器自检",
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                456, 120, 100, 36, h, (HMENU)IDC_BB_TEST, g_hInst, NULL);
+                                456, 96, 100, 36, h, (HMENU)IDC_BB_TEST, g_hInst, NULL);
 
-    HWND l3 = CreateWindowExW(0, L"STATIC", L"运行日志（可截图发给开发者）：", st, 14, 170, 400, 20, h, NULL, g_hInst, NULL);
+    HWND l3 = CreateWindowExW(0, L"STATIC", L"运行日志（可截图发给开发者）：", st, 14, 146, 400, 20, h, NULL, g_hInst, NULL);
     g_hLog = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                              WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-                             14, 192, 588, 290, h, (HMENU)IDC_LOG, g_hInst, NULL);
+                             14, 168, 588, 290, h, (HMENU)IDC_LOG, g_hInst, NULL);
 
-    HWND all[] = { l1, l2, l3, g_hFps, g_hDir, g_hBrowse, g_hStart, g_hLog, g_hBbDump, g_hBbTest, g_hChassis, g_hScroll, g_hFx };
+    HWND all[] = { l1, l2, l3, g_hFps, g_hDir, g_hBrowse, g_hStart, g_hLog, g_hBbDump, g_hBbTest };
     for (int i = 0; i < (int)(sizeof all / sizeof all[0]); ++i) SendMessageW(all[i], WM_SETFONT, (WPARAM)g_hFont, TRUE);
     UpdateBbButtons();
 }
@@ -1592,13 +1404,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             static const int kFps[3] = { 30, 60, 90 };
             if (sel < 0 || sel > 2) { InterlockedExchange(&g_busy, 0); return 0; }
 
-            // 复选框状态在 UI 线程上读一次,工作线程只读这个全局(EffectiveGroups 在工作线程里被调)。
-            InterlockedExchange(&g_chassisFix,
-                                SendMessageW(g_hChassis, BM_GETCHECK, 0, 0) == BST_CHECKED ? 1 : 0);
-            InterlockedExchange(&g_scrollFix,
-                                SendMessageW(g_hScroll, BM_GETCHECK, 0, 0) == BST_CHECKED ? 1 : 0);
-            InterlockedExchange(&g_fxFix,
-                                SendMessageW(g_hFx, BM_GETCHECK, 0, 0) == BST_CHECKED ? 1 : 0);
             AppendLog(L"\r\n");
             SetBusy(true);
             ThreadArg* a = new ThreadArg;
@@ -1722,8 +1527,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR /*lpCmdLine*/, int) {
     wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
     if (!RegisterClassExW(&wc)) return 1;
 
-    // 2026-09-22:高度 472 → 496,给第三个复选框腾出那 24 px(实测截图发现它压在「游戏目录」行上)。
-    RECT rc = { 0, 0, 616, 496 };
+    RECT rc = { 0, 0, 616, 472 };
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
     g_hMain = CreateWindowExW(0, wc.lpszClassName, L"红警3 帧率测试工具（只改内存，不动游戏文件）",
                               WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
