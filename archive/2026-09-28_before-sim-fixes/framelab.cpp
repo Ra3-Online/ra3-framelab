@@ -39,7 +39,6 @@
 #include <cstring>
 
 #include "schedule.h"
-#include "sim_gate.h"      // 2026-09-28:相位边界门 / 迷雾可见性相位的纯逻辑(与 test_schedule 共用)
 #include "chassis_gate.h"   // 2026-09-21:车身外观 30 Hz 节拍门的纯逻辑(与离线自检共用)
 
 // ───────────────────────────── 版本与状态码 ─────────────────────────────
@@ -435,11 +434,10 @@ static const short kSigMsPerFrameSetter[] = {
 // 实测供参考(历史,不当理由用):关掉后渲染 89.75 / 逻辑 14.97,与全开无差别 ——
 // **那条读数看不见建筑解包动画**,所以它对这个问题没有鉴别力。
 #define FL_G_ANIMGATE  0x1000        // P7 逐帧绘制更新的**次数门**(修动画过快;见下面 kSigFrameUpdate)
-#define FL_G_EVERYTHING 0x7FFFFFFF     // 含派生量 + P8 + 动画标尺 + 混合斜坡量尺 + 时钟修正 + P6b + 原版帧率下的时钟修正
+#define FL_G_EVERYTHING 0x1FFFFFFF     // 含派生量 + P8 + 动画标尺 + 混合斜坡量尺 + 时钟修正 + P6b + 原版帧率下的时钟修正
                                       // + 车身外观探针/节拍门/插值(2026-09-21,0x80000 / 0x100000 / 0x200000)+ 第四个派生量(0x400000),仅供对照实验
                                       // + 卷屏 / 弹道流 / 图标(0x800000 / 0x1000000 / 0x2000000)+ 粒子系统节拍门(0x4000000,2026-09-23)
                                       // + 过场运镜计时(0x8000000,2026-09-26)+ 单位闪烁 / 染色计时(0x10000000,2026-09-28)
-                                      // + 模拟侧常量钉住 / 相位边界门(0x20000000 / 0x40000000,2026-09-28)。已用满 31 位。
 // ⛔ 2026-09-17 P7「动画次数门」已从默认集合**移除**,理由见 kSigFrameUpdate 上方的订正。
 //    实测:开了它,录像回放**当场不同步** —— 它删的是模拟步骤,不是动画。
 // ★ 2026-09-17 动画定位会话:默认集合加入 FL_G_CLOCK(0x8000)。
@@ -931,52 +929,6 @@ static const short kSigTintSet5[] = {   // 命中 0x0052E8CA(站点 0x0052E8CA,�
 static const short kSigTintHold10[] = {   // 命中 0x00525FE4(站点 0x00525FE4,关注字节在 +3)  sub_525FC0  mov dword [eax+34h], 10  状态解除后的保持帧数
     0xC7,0x40,0x34,0x0A,0x00,0x00,0x00,0x8B,0x89,0x88
 };
-
-// ── ★★★ 2026-09-28:联机安全修正 + 敌方单位偶尔「隐身」(HANDOFF §27 / §28;审计材料 audit-2026-09-28/)──────────
-//   原版每个逻辑帧固定 2 个客户端帧,6 个阶段分两批 [1,2,3] [4,5,6]。引擎在**每个客户端帧开头**(sub_6027D0 → vt+148 =
-//   sub_626620)做几件会改模拟状态的延迟工作,原版里它们永远落在「阶段 3 之后 / 阶段 6 之后」。r 提到 4 / 6 后,
-//   客户端帧边界变成 {2,3,5,6} / {1..6} ⇒ 这些工作挪到了别的阶段之间(纯静态审计结论,对抗复核见审计材料):
-//     0x0062666B call sub_6FDC60  ModelCondition 延迟同步(写 Drawable+612,逻辑侧骨骼查询 sub_51E180 以它为键)
-//     0x006266F7 call sub_4D5600  对象变换变更延迟冲刷(shroud / partition 脏标记、容器乘员跟随)
-//     0x006266FE call sub_619BD0  销毁表(请求由阶段 5 发出 [engine+0x180],原版只在阶段 6 之后消费)
-//   FL_G_SIMGATE 把这三条 call 改指包装,只在原版边界放行(判据在 sim_gate.h,test_schedule 有离线自证)。
-//   FL_G_SIMPIN:运动器切换的高度斜坡长度 = 本机 flt_CDBC50 × 0.5(sub_73ABC0 写、sub_715ED0 / sub_778AA0 按逻辑帧消费),
-//     而 FL_G_DERIVED2 把 flt_CDBC50 改成了目标帧率 ⇒ 不同帧率的机器同一逻辑帧算出的单位高度不同。把这三条 movss 的
-//     操作数改指补丁自己的常量 30.0f ⇒ 与原版逐位相同。
-//   随 FL_G_RATIO 一起装(不占新位):sub_542DF0(GameClient::update)里决定「本帧刷不刷迷雾可见性 / 模型状态快照 / 残影」
-//     的那条 call sub_5FFAD0(phase == 6/r,R1 站点)—— 60 帧下它**永远不成立**(帧边界 {2,3,5,6} 里没有 1),
-//     90 帧下在阶段 1 之后成立(原版是阶段 3 之后)。它刷的是 Drawable+316 bit3「被迷雾遮住」,为真时模型走隐藏绘制 ——
-//     这正是用户报的「敌方步兵偶尔隐身、自己的同种单位正常」的头号嫌疑(自己的单位从不被迷雾遮)。
-//     只改这一个调用点,改成「上一个完成的阶段 == 本 r 下第一个 >= 3 的帧边界」(30/60/90 帧 = 3,45/75 帧 = 4);
-//     sub_5FFAD0 的另外 3 个调用者(节拍、插值、联机跳帧)不动。
-//   另:R4(Drawable 构造函数把帧率写进 +0x1DC = 隐身淡入计数器初值)不再改指 —— 目标帧率 90 时计数器从 90 起跳,
-//     sub_532AC0 的淡入系数 (v3 − 计数器) ÷ v3 在头 (90 − v3) 帧是负数 ⇒ 模型完全透明。原版值 30 = 原版行为。
-#define FL_G_SIMPIN       0x20000000
-#define FL_G_SIMGATE      0x40000000
-static const short kSigSimPin0[] = {   // 命中 0x0073AC7C(关注字节在 +4)  sub_73ABC0  movss xmm0,[0xCDBC50]  高度斜坡倒计时初值 = 帧率 x 0.5
-    0xF3,0x0F,0x10,0x05,0x50,0xBC,0xCD,0x00,0xF3,0x0F
-};
-static const short kSigSimPin1[] = {   // 命中 0x00715FD9(关注字节在 +4)  sub_715ED0  movss xmm4,[0xCDBC50]  高度斜坡消费端
-    0xF3,0x0F,0x10,0x25,0x50,0xBC,0xCD,0x00,0xF3,0x0F
-};
-static const short kSigSimPin2[] = {   // 命中 0x00778B4B(关注字节在 +4)  sub_778AA0  movss xmm3,[0xCDBC50]  高度斜坡消费端
-    0xF3,0x0F,0x10,0x1D,0x50,0xBC,0xCD,0x00,0xF3,0x0F
-};
-static const short kSigPhase3Call[] = {   // 命中 0x0054306D(关注字节在 +6)  sub_542DF0  mov ecx,[0xCE2F8C]; call sub_5FFAD0  迷雾可见性 / 模型状态 / 残影 的相位测试
-    0x8B,0x0D,0x8C,0x2F,0xCE,0x00,0xE8,W,W,W,W,0x80,0x7C,0x24
-};
-static const short kSigMcSyncCall[] = {   // 命中 0x0062666B(关注字节在 +0)  sub_626620  call sub_6FDC60  ModelCondition 延迟同步
-    0xE8,W,W,W,W,0x8B,0x0D,0xE4,0x8C,0xCD,0x00,0xC6,0x81,0xA1
-};
-static const short kSigXfFlushCall[] = {   // 命中 0x006266F7(关注字节在 +0)  sub_626620  call sub_4D5600  对象变换变更延迟冲刷
-    0xE8,W,W,W,W,0x8B,0xCF,0xE8,0xCD,0x34,0xFF,0xFF,0x8B,0x0D
-};
-static const short kSigDestroyCall[] = {   // 命中 0x006266FE(关注字节在 +0)  sub_626620  call sub_619BD0  销毁表 processDestroyList
-    0xE8,W,W,W,W,0x8B,0x0D,0x04,0x3F,0xCE,0x00,0xE8,0x62,0xB4
-};
-static const short kSigSkipGateCall[] = {   // 命中 0x0060274A(关注字节在 +9)  sub_602720  comiss xmm0,[0xCAFF7C]; ja; call sub_5FFAD0  联机跳过 GameClient::update 的保护帧判定
-    0x0F,0x2F,0x05,0x7C,0xFF,0xCA,0x00,0x77,0x60,0xE8
-};
 static const short kSigIconPingPong[] = {
     0x8B,0xD0,                            // mov  edx, eax                 (显示帧号)
     0xA1,W,W,W,W,                         // mov  eax,[dword_CAD5F4]
@@ -1155,9 +1107,7 @@ static int g_ratio = 4;            // r = 客户端帧率 ÷ 逻辑帧率
 // 2026-09-16 会话 68ee9b9d:容量从 16 提到 48。改成「重定向读者」的设计后改动点有 18 处,
 // 原来满了之后 remember() 是**静默返回**,会留下一份残缺的撤销表 —— 回滚时还不回去,比不装还糟。
 // 现在满了/超长一律返回 false,让 patch() 当场失败并整体回滚。
-// 2026-09-28 复核订正:48 不够了 —— GUI 勾上「修复过快的特效与过场运镜」时 60/90 帧要改 54 处(运镜 16 + 染色 8 …),
-//   第 49 处 patch() 失败 ⇒ **整个安装回滚、一处都没装**。提到 128,并在安装完成时打出用量,下次加分组时一眼看到余量。
-static Undo g_undo[128];
+static Undo g_undo[48];
 static const int kUndoMax = (int)(sizeof g_undo / sizeof g_undo[0]);
 static int g_undoCount = 0;
 static bool g_installed = false;
@@ -1284,19 +1234,6 @@ static unsigned       g_tintBeat  = 15;     // round(15 × 目标帧率 ÷ 30),i
 static int            g_tintSites = 0;      // 实际改成功的处数(应为 8)
 static bool           g_tintOn    = false;  // 包装是否放大帧数
 static volatile long  g_tintCalls = 0;      // 包装放大过的次数(给状态导出看「真的在走」)
-// 2026-09-28:迷雾可见性相位 / 模拟侧常量钉住 / 相位边界门(见 FL_G_SIMPIN / FL_G_SIMGATE)。
-static const uintptr_t kEngineGlobalVa    = 0x00CE2F8C;   // TheGameEngine(阶段字段在 +0x58,销毁请求在 +0x180)
-static const uintptr_t kEnginePhaseTestVa = 0x005FFAD0;   // sub_5FFAD0:phase == 6/r
-static const uintptr_t kEngineMcSyncVa    = 0x006FDC60;   // ModelCondition 延迟同步(无参数,ret)
-static const uintptr_t kEngineXfFlushVa   = 0x004D5600;   // 变换变更冲刷(__thiscall,ecx = GameLogic,ret)
-static const uintptr_t kEngineDestroyVa   = 0x00619BD0;   // 销毁表等(__thiscall,ecx = 引擎,ret)
-static const float     g_simFps30         = 30.0f;        // = 原版 flt_CDBC50;R-1 改指到这里
-static int            g_visPhase     = 3;       // 本 r 下迷雾可见性测试的相位(fl_vis_phase)
-static bool           g_visPhaseOn   = false;   // 迷雾可见性相位测试是否已改回原版语义
-static int            g_simPinSites  = 0;       // R-1 改指成功的处数(应为 3)
-static int            g_simGateSites = 0;       // 边界门改指成功的处数(应为 3)
-static bool           g_simGateOn    = false;
-static volatile long  g_simGateHeld  = 0;       // 边界门挡下的次数(只做记账)
 static int   g_scrollSites = 0;           // resolve 时定位并核对通过的补丁点个数(应为 2;不是 2 就一处都不登记)
 static bool  g_scrollOn    = false;       // 两处是否真的改指了(给 FrameLabScrollStatus 用)
 // 2026-09-22:弹道流节拍门(见 FL_G_TRACER)。只需要一个「上次转发时的 30 Hz 虚拟帧号」,不需要表 ——
@@ -1757,41 +1694,6 @@ extern "C" char __fastcall fl_wrap_tintset(void* env, void* unused, void* color,
     return ((FnTintSet)kEngineTintSetVa)(env, color, attack, decay, sustain);
 }
 
-// ── ★★★ 2026-09-28:迷雾可见性相位测试 / 相位边界门的包装(判据在 sim_gate.h)────────────────────────
-// 调用点之后都不读 ecx / edx(已逐条反汇编核对);被包的四个函数都是无栈参数的 ret ⇒ __fastcall / __cdecl 包装直接对得上。
-static int fl_engine_phase() {
-    char* eng = *(char**)kEngineGlobalVa;
-    return eng ? *(int*)(eng + FL_SIM_PHASE_OFFSET) : 0;
-}
-// 原 sub_5FFAD0 在 sub_542DF0 里的那一处调用:ecx = 引擎;调用方只用 AL。
-extern "C" bool __fastcall fl_wrap_visphase(void* engine, void* unused) {
-    (void)unused;
-    return engine && *(int*)((char*)engine + FL_SIM_PHASE_OFFSET) == g_visPhase;
-}
-typedef void (__cdecl *FnSimVoid)(void);
-typedef void (__thiscall *FnSimThis)(void* self);
-extern "C" void __cdecl fl_wrap_mcsync(void) {
-    if (fl_sim_boundary_ok(fl_engine_phase())) ((FnSimVoid)kEngineMcSyncVa)();
-    else ++g_simGateHeld;                          // 表继续累积,到原版边界再一次性排空
-}
-extern "C" void __fastcall fl_wrap_xfflush(void* gl, void* unused) {
-    (void)unused;
-    if (fl_sim_boundary_ok(fl_engine_phase())) ((FnSimThis)kEngineXfFlushVa)(gl);
-    else ++g_simGateHeld;                          // GL+0x31C 保持 0,双缓冲表继续累积,首次快照保留
-}
-extern "C" void __fastcall fl_wrap_destroy(void* engine, void* unused) {
-    (void)unused;
-    const int ph = engine ? *(int*)((char*)engine + FL_SIM_PHASE_OFFSET) : 0;
-    if (!engine || fl_sim_destroy_ok(ph)) { ((FnSimThis)kEngineDestroyVa)(engine); return; }
-    // sub_619BD0 除了销毁表还做别的事,所以不能整个跳过:只在调用期间把「销毁请求」藏起来,调完再并回去。
-    unsigned char* req = (unsigned char*)engine + 0x180;
-    const unsigned char saved = *req;
-    *req = 0;
-    ((FnSimThis)kEngineDestroyVa)(engine);
-    *req = (unsigned char)(*req | saved);
-    if (saved) ++g_simGateHeld;
-}
-
 // ───────────────────────────── 安装 / 卸载 ─────────────────────────────
 static void log_environment() {
     char path[MAX_PATH] = {0};
@@ -2036,10 +1938,8 @@ static int resolve_and_verify(int targetFps, Sites& s) {
         // LIVE 若出怪相,这两处是第一批该摘掉的。
         Pattern pCache = {"缓存进对象字段", kSigCacheField, (int)(sizeof kSigCacheField / sizeof(short)), 0};
         const int nCache = scan_all(pCache, 1, g_fpsClient, hits, 16);
-        // ⛔ 2026-09-28:R4 **不再改指**。审计查明 +0x1DC 唯一的读者是 sub_532AC0 的隐身 / 淡入计数器(+476):
-        //   计数器每显示帧减一,淡入系数 = (v3 − 计数器) ÷ v3(v3 = dword_CE9808+76)。构造函数把它初始化成 90 时,
-        //   头 (90 − v3) 帧系数为负 ⇒ 模型完全透明。保留原版的 30 = 原版行为(见 HANDOFF §28)。
-        FL_INFO("  R4 缓存字段 %d 处:保持原版值(不改指;它是隐身淡入计数器初值,改成目标帧率会让单位短暂透明)", nCache);
+        for (int i = 0; i < nCache; ++i)
+            if (!add_redirect(s, (void**)(hits[i] + 1), "R4 缓存字段(用途未独立确认)", FL_G_UNSURE)) return FL_ERR_SIG_AMBIGUOUS;
 
         Pattern pMovEsi = {"mov esi + 64000", kSigMovEsiFps, (int)(sizeof kSigMovEsiFps / sizeof(short)), 0};
         const int nMov = scan_all(pMovEsi, 2, g_fpsClient, hits, 16);
@@ -2410,11 +2310,7 @@ static int install(int targetFps, bool measureOnly) {
     //    原地把 `mov edx,[esi] / push eax / mov eax,[edx+0x90] / mov ecx,esi / call eax`
     //    换成 `push eax(阶段) / push esi(this) / call 我们的钩子`,由钩子决定要不要转发。
     //    栈是平的:原来被调方(__thiscall,1 个栈参)清 4 字节,现在我们的 __stdcall 清 8 字节,各自平衡。
-    // ⛔ 2026-09-28(审计 R-7,复核 3/3):P7 只转发阶段 4,r > 2 时会丢逻辑阶段 ⇒ 必然不同步。目标帧率 > 原版时拒装这一组。
-    const bool p7Refused = (g_groups & FL_G_ANIMGATE) && !measureOnly && targetFps > g_retailFps;
-    if (p7Refused)
-        FL_ERR("FL_G_ANIMGATE(P7)在目标帧率 > 原版时会丢逻辑阶段、必然不同步 —— 已拒绝安装这一组(其它改动照常)");
-    if (ok && (g_groups & FL_G_ANIMGATE) && !p7Refused) {
+    if (ok && (g_groups & FL_G_ANIMGATE)) {
         unsigned char* site = s.frameUpdate;
         unsigned char code[13];
         memset(code, 0x90, sizeof code);
@@ -2785,104 +2681,6 @@ static int install(int targetFps, bool measureOnly) {
         }
     }
 
-    // ── ★★★ 2026-09-28:迷雾可见性相位测试改回原版语义(随 FL_G_RATIO;它纠正的正是 RATIO 自己的副作用)─────────
-    g_visPhaseOn = false; g_visPhase = 3;
-    // 2026-09-28 复核订正:原版里还有**第二个**调用者必须与这里用同一个判据 —— sub_602720(联机时决定本帧跳不跳
-    //   GameClient::update:本机帧率撑不住时只保留相位测试为真的那一帧)。两处原本调的是同一个 sub_5FFAD0,所以
-    //   「被保留的帧」恰好就是「刷新迷雾可见性的帧」。只改一处会把两者拆开:90 帧联机掉帧时保留的是阶段 1 帧,
-    //   刷新却要阶段 3 帧 ⇒ 整段时间里迷雾可见性一次都不刷。所以两处**一起**改指 fl_wrap_visphase,缺一处就都不改。
-    if (ok && !measureOnly && (g_groups & FL_G_RATIO) && targetFps > g_retailFps) {
-        Pattern pPhase3Call = {"迷雾可见性相位测试调用点", kSigPhase3Call, (int)(sizeof kSigPhase3Call / sizeof kSigPhase3Call[0]), 0x0054306D};
-        Pattern pSkipGateCall = {"联机跳帧保护帧判定调用点", kSigSkipGateCall, (int)(sizeof kSigSkipGateCall / sizeof kSigSkipGateCall[0]), 0x0060274A};
-        unsigned char* hit = scan(pPhase3Call);
-        unsigned char* hit2 = scan(pSkipGateCall);
-        unsigned char* site  = (hit  && hit  != (unsigned char*)-1) ? hit + 6  : NULL;
-        unsigned char* site2 = (hit2 && hit2 != (unsigned char*)-1) ? hit2 + 9 : NULL;
-        const bool good1 = site && *(unsigned*)(hit + 2) == (unsigned)kEngineGlobalVa && site[0] == 0xE8 &&
-                           (uintptr_t)(site + 5 + *(int*)(site + 1)) == kEnginePhaseTestVa;
-        const bool good2 = site2 && site2[0] == 0xE8 &&
-                           (uintptr_t)(site2 + 5 + *(int*)(site2 + 1)) == kEnginePhaseTestVa;
-        if (!good1 || !good2) {
-            FL_WARN("迷雾可见性相位测试:两个调用点没全部核对上(刷新 %s、联机跳帧 %s)—— 一处都不改。后果:60 帧下敌方单位的"
-                    "迷雾可见性从不刷新、90 帧下刷新相位不对(可能表现为敌方单位偶尔隐身)。",
-                    good1 ? "OK" : "缺", good2 ? "OK" : "缺");
-        } else {
-            g_visPhase = fl_vis_phase(g_ratio);
-            unsigned char* sites[2] = { site, site2 };
-            for (int k = 0; ok && k < 2; ++k) {
-                unsigned char code[5];
-                code[0] = 0xE8;
-                const int rel = (int)((unsigned char*)&fl_wrap_visphase - (sites[k] + 5));
-                memcpy(code + 1, &rel, 4);
-                ok = patch(sites[k], code, 5, "迷雾可见性相位测试改回原版语义");
-            }
-            if (ok) {
-                g_visPhaseOn = true;
-                FL_INFO("  迷雾可见性 / 模型状态 / 残影 相位测试:call @%08X 与联机跳帧判定 call @%08X → 包装"
-                        "(每逻辑帧一次,在阶段 %d 之后;原 phase == 6/r = %d)",
-                        (unsigned)(uintptr_t)site, (unsigned)(uintptr_t)site2, g_visPhase, 6 / (g_ratio > 0 ? g_ratio : 1));
-            }
-        }
-    }
-
-    // ── ★★★ FL_G_SIMPIN(默认关;2026-09-28):运动器高度斜坡的三处 flt_CDBC50 读者钉回 30.0 ─────────────
-    g_simPinSites = 0;
-    if (ok && !measureOnly && (g_groups & FL_G_SIMPIN) && targetFps > g_retailFps) {
-        Pattern pSimPin0 = {"高度斜坡 初值(sub_73ABC0)", kSigSimPin0, (int)(sizeof kSigSimPin0 / sizeof kSigSimPin0[0]), 0x0073AC7C};
-        Pattern pSimPin1 = {"高度斜坡 消费(sub_715ED0)", kSigSimPin1, (int)(sizeof kSigSimPin1 / sizeof kSigSimPin1[0]), 0x00715FD9};
-        Pattern pSimPin2 = {"高度斜坡 消费(sub_778AA0)", kSigSimPin2, (int)(sizeof kSigSimPin2 / sizeof kSigSimPin2[0]), 0x00778B4B};
-        unsigned char* pins[3] = { scan(pSimPin0), scan(pSimPin1), scan(pSimPin2) };
-        int nOk = 0;
-        for (int i = 0; i < 3; ++i)
-            if (pins[i] && pins[i] != (unsigned char*)-1 && *(unsigned*)(pins[i] + 4) == (unsigned)kEngineFpsFloatVa) ++nOk;
-        if (nOk != 3) {
-            FL_WARN("模拟侧常量钉住:3 处只核对上 %d 处 —— 一处都不改。", nOk);
-        } else {
-            const void* p = (const void*)&g_simFps30;
-            for (int i = 0; ok && i < 3; ++i) {
-                ok = patch(pins[i] + 4, &p, 4, "高度斜坡 flt_CDBC50 → 常量 30");
-                if (ok) ++g_simPinSites;
-            }
-            if (ok) FL_INFO("  模拟侧常量钉住已装:高度斜坡 3 处改读常量 30.0(与原版逐位相同)");
-        }
-    }
-
-    // ── ★★★ FL_G_SIMGATE(默认关;2026-09-28):客户端帧开头的三件模拟工作按原版相位边界放行 ───────────────
-    g_simGateSites = 0; g_simGateOn = false; g_simGateHeld = 0;
-    if (ok && !measureOnly && (g_groups & FL_G_SIMGATE) && targetFps > g_retailFps) {
-        if (!fl_sim_gate_exact(g_ratio)) {
-            FL_WARN("相位边界门:目标 %d 帧(r = %d)的客户端帧边界里没有阶段 3,做不到与原版逐位等价 —— 不装。联机请用 60 或 90 帧。",
-                    targetFps, g_ratio);
-        } else {
-            // 三处**先全部扫完再改**:XfFlushCall 的特征里含着 DestroyCall 那条 call 的原 rel32。
-            Pattern pMcSyncCall  = {"ModelCondition 同步调用点", kSigMcSyncCall, (int)(sizeof kSigMcSyncCall / sizeof kSigMcSyncCall[0]), 0x0062666B};
-            Pattern pXfFlushCall = {"变换冲刷调用点", kSigXfFlushCall, (int)(sizeof kSigXfFlushCall / sizeof kSigXfFlushCall[0]), 0x006266F7};
-            Pattern pDestroyCall = {"销毁表调用点", kSigDestroyCall, (int)(sizeof kSigDestroyCall / sizeof kSigDestroyCall[0]), 0x006266FE};
-            unsigned char* site[3] = { scan(pMcSyncCall), scan(pXfFlushCall), scan(pDestroyCall) };
-            const uintptr_t want[3] = { kEngineMcSyncVa, kEngineXfFlushVa, kEngineDestroyVa };
-            void* wrap[3] = { (void*)&fl_wrap_mcsync, (void*)&fl_wrap_xfflush, (void*)&fl_wrap_destroy };
-            int nOk = 0;
-            for (int i = 0; i < 3; ++i)
-                if (site[i] && site[i] != (unsigned char*)-1 && site[i][0] == 0xE8 &&
-                    (uintptr_t)(site[i] + 5 + *(int*)(site[i] + 1)) == want[i]) ++nOk;
-            if (nOk != 3) {
-                FL_WARN("相位边界门:3 处调用点只核对上 %d 处 —— 一处都不改。", nOk);
-            } else {
-                for (int i = 0; ok && i < 3; ++i) {
-                    unsigned char code[5];
-                    code[0] = 0xE8;
-                    const int rel = (int)((unsigned char*)wrap[i] - (site[i] + 5));
-                    memcpy(code + 1, &rel, 4);
-                    ok = patch(site[i], code, 5, "相位边界门(只改 call 目标)");
-                    if (ok) ++g_simGateSites;
-                }
-                g_simGateOn = ok && g_simGateSites == 3;
-                if (g_simGateOn)
-                    FL_INFO("  相位边界门已装:ModelCondition 同步 / 变换冲刷 只在阶段 3、6 之后,销毁表只在阶段 6 之后(r = %d)", g_ratio);
-            }
-        }
-    }
-
     // ── ★ 状态图标乒乓动画(默认关;2026-09-22)。一处 4 字节:除数 30 → 目标帧率。
     if (ok && !measureOnly && (g_groups & FL_G_ICONANIM)) {
         Pattern pIcon = {"状态图标乒乓(帧号×15÷帧率)", kSigIconPingPong,
@@ -2997,9 +2795,6 @@ static int install(int targetFps, bool measureOnly) {
     }
     g_installed = true;
     g_frameCount = 0;
-    FL_INFO("撤销表用量 %d / %d 处", g_undoCount, kUndoMax);
-    if (g_undoCount * 4 > kUndoMax * 3)
-        FL_WARN("撤销表已用掉四分之三以上(%d / %d)—— 再加分组前先扩容 g_undo", g_undoCount, kUndoMax);
     if (measureOnly) {
         FL_INFO("只量不改模式就位:只装了插值系数钩子,返回值与原版逐位相同,帧率**未改**(共 %d 处改动)。"
                 "它是基线组的量具,和实验组用的是同一个。", g_undoCount);
@@ -3082,7 +2877,6 @@ static int uninstall() {
     g_psSite = NULL; g_psOn = false;
     g_camSites = 0; g_camOn = false;
     g_tintSites = 0; g_tintOn = false;
-    g_visPhaseOn = false; g_simPinSites = 0; g_simGateSites = 0; g_simGateOn = false;
     g_installed = false;
     FL_INFO("已卸载,全部字节还原");
     return FL_OK;
@@ -3278,13 +3072,6 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabSetGroups(int mask) {
             (fl::g_groups & FL_G_TRACER)
                 ? "(生成密度 / 伸展 / 移动钉回每秒 30 步 —— 开火不再像机关枪;未经实机验证)"
                 : "(默认:弹道流每秒生成条数是原版的 2/3 倍)");
-    FL_INFO("  模拟侧常量钉住(高度斜坡)=%s%s",
-            (fl::g_groups & FL_G_SIMPIN) ? "开" : "关",
-            (fl::g_groups & FL_G_SIMPIN) ? "(联机安全修正 R-1;未经实机验证)" : "(默认:高度斜坡长度随本机帧率,联机会分歧)");
-    FL_INFO("  相位边界门=%s%s",
-            (fl::g_groups & FL_G_SIMGATE) ? "开" : "关",
-            (fl::g_groups & FL_G_SIMGATE) ? "(联机安全修正 R-2/R-3/R-6a;只在 60 / 90 帧生效;未经实机验证)"
-                                          : "(默认:销毁表 / 变换冲刷 / ModelCondition 同步随 r 换位置,联机会分歧)");
     FL_INFO("  单位闪烁 / 染色计时=%s%s",
             (fl::g_groups & FL_G_TINT) ? "开" : "关",
             (fl::g_groups & FL_G_TINT)
@@ -3583,23 +3370,6 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabTracerStatus() {
     const int ratio = c > 0 ? (int)((long long)f * 1000 / c) : 0;
     FL_INFO("弹道流节拍门:调用 %ld 转发 %ld ⇒ 放行比例 %d/1000(90 帧应 ≈ 333,60 帧 ≈ 500)", c, f, ratio);
     return 1000000 + ratio;
-}
-
-// FrameLabSimStatus():2026-09-28 可见性 / 联机修正的状态。0 = 没装;否则按位:1 = 迷雾可见性相位已改回原版语义,
-//   2 = 高度斜坡已钉住(3/3),4 = 相位边界门已装(3/3),8 = R4 保持原版。-2 = 请求了 SIMPIN / SIMGATE 却没装上
-//   (SIMGATE 在 45 / 75 帧下按设计拒装,不算失败)。
-extern "C" __declspec(dllexport) int __stdcall FrameLabSimStatus() {
-    if (!fl::g_installed) return 0;
-    int v = 8;
-    if (fl::g_visPhaseOn) v |= 1;
-    if (fl::g_simPinSites == 3) v |= 2;
-    if (fl::g_simGateOn) v |= 4;
-    const bool above = !fl::g_measureOnly && fl::g_targetFps > fl::g_retailFps;   // 只量不改按设计不装这些
-    const bool wantPin  = above && (fl::g_groups & FL_G_SIMPIN) != 0;
-    const bool wantGate = above && (fl::g_groups & FL_G_SIMGATE) != 0 && fl_sim_gate_exact(fl::g_ratio);
-    if ((wantPin && !(v & 2)) || (wantGate && !(v & 4))) return -2;
-    FL_INFO("可见性 / 联机修正状态 0x%X(边界门挡下 %ld 次)", v, fl::g_simGateHeld);
-    return v;
 }
 
 // FrameLabTintStatus():单位闪烁 / 染色计时的状态。-2 = 分组位开着、已安装,但 8 处没全部改成;0 = 关 / 不需要;

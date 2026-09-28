@@ -179,14 +179,6 @@ int main(int argc, char** argv) {
         check(rcTint == 0, "单位闪烁 / 染色计时:没安装时状态 = 0(关),不是 -2", rcTint);
     }
 
-    // 2026-09-28:可见性 / 联机修正状态。没安装时必须是 0。
-    FnStatus simStatus = (FnStatus)GetProcAddress(h, "FrameLabSimStatus");
-    check(simStatus != NULL, "可见性 / 联机修正的状态导出取得到");
-    if (simStatus) {
-        const int rcSim = simStatus();
-        check(rcSim == 0, "可见性 / 联机修正:没安装时状态 = 0", rcSim);
-    }
-
     const int rcDisable = disable();
     check(rcDisable == 1, "没装过时关闭返回「未安装」(1)", rcDisable);
 

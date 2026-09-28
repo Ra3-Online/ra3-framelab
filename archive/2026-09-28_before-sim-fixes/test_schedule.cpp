@@ -10,7 +10,6 @@
 //   ④ 插值系数单调递增、最后一帧 = 1.0、第一帧 = 1/r —— 消除参考补丁的顿挫;
 //   ⑤ 原版公式在 r = 4 时确实会慢(反证:说明我们的改动必要,同时证明测试本身有分辨力)。
 #include "../src/schedule.h"
-#include "../src/sim_gate.h"   // 2026-09-28:相位边界门 / 迷雾可见性相位
 
 #include <cstdio>
 #include <cstring>
@@ -186,82 +185,6 @@ int main() {
         check(!uniform, "反证:原版系数「阶段÷6」在 r=4 时步长不均匀(参考补丁的顿挫来源)");
         std::printf("     原版系数步长: %.3f %.3f %.3f %.3f | 我们的: %.3f 均匀\n",
                     steps[0], steps[1], steps[2], steps[3], 1.0f / 4.0f);
-    }
-
-    // ── 2026-09-28:相位边界门(sim_gate.h)——「逐客户端帧执行、会碰模拟」的工作必须落在原版边界上 ──────────
-    // 原版(r=2,原版批次公式)每逻辑帧的客户端帧边界 = {3, 6}。下一个客户端帧开头读到的「已完成阶段」就是这些值。
-    {
-        char name[160];
-        const std::vector<int> retail = run_logic_frame(2, retail_target);
-        const std::vector<int> retail6(1, 6);
-        const int exactR[3] = {2, 4, 6};
-        for (int ri = 0; ri < 3; ++ri) {
-            const int r = exactR[ri];
-            const std::vector<int> ends = run_logic_frame(r, fl_target_phase);
-            std::vector<int> flush, destroy;
-            int vis = 0, visAt = -1;
-            for (int ph : ends) {
-                if (fl_sim_boundary_ok(ph)) flush.push_back(ph);
-                if (fl_sim_destroy_ok(ph)) destroy.push_back(ph);
-                if (ph == fl_vis_phase(r)) { ++vis; visAt = ph; }
-            }
-            std::snprintf(name, sizeof name, "边界门 r=%d:冲刷 / ModelCondition 同步只落在原版边界(阶段 3、6 之后)", r);
-            check(flush == retail, name);
-            std::snprintf(name, sizeof name, "边界门 r=%d:销毁表只在阶段 6 之后消费", r);
-            check(destroy == retail6, name);
-            std::snprintf(name, sizeof name, "可见性相位 r=%d:每逻辑帧恰好一次,且在阶段 3 之后(与原版相同)", r);
-            check(vis == 1 && visAt == 3, name);
-            std::snprintf(name, sizeof name, "边界门 r=%d:可以做到与原版逐位等价", r);
-            check(fl_sim_gate_exact(r) != 0, name);
-        }
-        // 45 / 75 帧:帧边界里没有阶段 3 ⇒ 边界门做不到逐位等价(DLL 必须拒装);可见性测试仍每逻辑帧一次。
-        const int inexactR[2] = {3, 5};
-        for (int ri = 0; ri < 2; ++ri) {
-            const int r = inexactR[ri];
-            const std::vector<int> ends = run_logic_frame(r, fl_target_phase);
-            int vis = 0;
-            for (int ph : ends) vis += (ph == fl_vis_phase(r));
-            std::snprintf(name, sizeof name, "r=%d(%d 帧):边界门判定为「做不到逐位等价」(DLL 拒装)", r, r * 15);
-            check(fl_sim_gate_exact(r) == 0, name);
-            std::snprintf(name, sizeof name, "r=%d:可见性相位测试仍每逻辑帧恰好一次", r);
-            check(vis == 1, name);
-        }
-        // 故障注入(闸门必须能被证明会红):不加门时 r=4 的边界 ≠ 原版;旧的相位测试 phase == 6/r 在 r=4 下一次都不成立。
-        const std::vector<int> ungated = run_logic_frame(4, fl_target_phase);
-        check(ungated != retail, "反证:不加门时 r=4 的客户端帧边界 = {2,3,5,6},与原版 {3,6} 不同(闸门有分辨力)");
-        int oldHits4 = 0;
-        for (int ph : ungated) oldHits4 += (ph == 6 / 4);
-        check(oldHits4 == 0, "反证:旧的相位测试 phase == 6/r 在 r=4(60 帧)下从不成立 ⇒ 迷雾可见性从不刷新");
-        const std::vector<int> ungated6 = run_logic_frame(6, fl_target_phase);
-        int oldAt6 = -1;
-        for (int ph : ungated6) if (ph == 6 / 6) oldAt6 = ph;
-        check(oldAt6 == 1, "反证:旧的相位测试在 r=6(90 帧)下落在阶段 1 之后(原版是阶段 3 之后)");
-        check(fl_sim_boundary_ok(7) && fl_sim_destroy_ok(8) && fl_sim_boundary_ok(0) && fl_sim_destroy_ok(0),
-              "空转帧(>= 7)与开局初值(0)放行");
-        check(!fl_sim_boundary_ok(1) && !fl_sim_boundary_ok(2) && !fl_sim_boundary_ok(4) && !fl_sim_boundary_ok(5),
-              "阶段 1 / 2 / 4 / 5 之后挡住冲刷");
-        check(!fl_sim_destroy_ok(3) && !fl_sim_destroy_ok(5), "阶段 3 / 5 之后挡住销毁表");
-
-        // 2026-09-28 复核:联机掉帧时 sub_602720 只保留「保护判定为真」的那一帧的 GameClient::update。
-        //   原版里保护判定与迷雾可见性刷新是同一个函数 ⇒ 被保留的帧就是刷新帧。两者必须一起改指,
-        //   否则掉帧期间一次都不刷新(反证:保护仍用旧的 6/r、刷新用新相位 ⇒ r=4 / 6 下刷新 0 次)。
-        for (int ri = 0; ri < 3; ++ri) {
-            const int r = exactR[ri];
-            const std::vector<int> ends = run_logic_frame(r, fl_target_phase);
-            int coupled = 0, split = 0;
-            for (int ph : ends) {
-                const bool keptNew = (ph == fl_vis_phase(r));        // 两处都改:保护 = 刷新判据
-                const bool keptOld = (ph == (r < 6 ? 6 / r : 1));   // 只改刷新、保护仍是旧判据
-                coupled += keptNew && (ph == fl_vis_phase(r));
-                split   += keptOld && (ph == fl_vis_phase(r));
-            }
-            std::snprintf(name, sizeof name, "联机掉帧 r=%d:保护帧与刷新帧同一判据 ⇒ 每逻辑帧仍刷新一次", r);
-            check(coupled == 1, name);
-            if (r > 2) {
-                std::snprintf(name, sizeof name, "反证 r=%d:只改刷新、不改保护 ⇒ 掉帧期间刷新 0 次(复核发现的回归)", r);
-                check(split == 0, name);
-            }
-        }
     }
 
     std::printf("---- %d PASS / %d FAIL\n", passed, failed);

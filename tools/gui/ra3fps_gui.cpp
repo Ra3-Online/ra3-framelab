@@ -946,6 +946,25 @@ static bool JobPatch(DWORD& outPid, HANDLE& outProc, JobCtx& ctx) {
                     LogLine(L"[WARN] 读不到载具颠簸修复的状态（DLL 太旧？）。");
                 }
             }
+            // 2026-09-28:迷雾可见性相位(随默认分组生效,修「敌方单位偶尔隐身」)+ 联机修正(0x20000000 / 0x40000000,
+            //   默认关,只能用 RA3FL_GROUPS 打开)—— 同样报「到底开没开成」。
+            if (ctx.fps > 30) {
+                void* simStatus = RemoteExport(pid, localBase, "FrameLabSimStatus");
+                DWORD ss3 = 0;
+                if (simStatus && RemoteCall(proc, simStatus, NULL, &ss3, 60000)) {
+                    const int v = (int)ss3;
+                    if (v == -2) {
+                        LogLine(L"[!!]   联机修正【没装上】（特征未命中？）—— 请把 logs 里的日志发给开发者。");
+                    } else if (v > 0) {
+                        if (v & 1) LogLine(L"[OK]   迷雾可见性相位已改回原版（每逻辑帧刷新一次，修敌方单位偶尔「隐身」）。");
+                        else       LogLine(L"[!!]   迷雾可见性相位【没改成】—— 60/90 帧下敌方单位可能偶尔「隐身」。");
+                        if (v & 2) LogLine(L"[OK]   联机修正：高度斜坡已钉回原版（0x20000000）。");
+                        if (v & 4) LogLine(L"[OK]   联机修正：相位边界门已生效（0x40000000）。");
+                    }
+                } else {
+                    LogLine(L"[WARN] 读不到迷雾可见性 / 联机修正的状态（DLL 太旧？）。");
+                }
+            }
             // 2026-09-28:单位闪烁 / 染色计时同样报「到底开没开成」。
             if ((EffectiveGroups() & 0x10000000u) != 0) {
                 void* tintStatus = RemoteExport(pid, localBase, "FrameLabTintStatus");

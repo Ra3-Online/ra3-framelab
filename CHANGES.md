@@ -1580,3 +1580,21 @@ DLL / flctl 的默认集合不变(三个车身位仍默认关)。
 
 `HANDOFF.md` §26:机制(LightSource 点光粒子 → `sub_9AFB80` 合并且不封顶 → 泛光),结论取决于粒子节拍门是否生效;
 `src/framelab.cpp` 只改了 `FL_G_PSYS` 的一段注释(CPU 粒子寿命是每调用减一,不是走时钟)。DLL / GUI 按新源码重建,二进制行为不变。
+
+
+### §AG(2026-09-28):敌方单位偶尔隐身 + 联机修正第一批
+
+| 文件 | 改动 |
+|---|---|
+| `src/sim_gate.h`(新) | 相位边界门 / 迷雾可见性相位的纯逻辑 |
+| `src/framelab.cpp` | 迷雾可见性相位包装(随 `FL_G_RATIO`,`0x00543073`);R4 不再改指;`FL_G_SIMPIN 0x20000000`(R-1 三处常量钉住);`FL_G_SIMGATE 0x40000000`(三处客户端帧开头的模拟工作按原版边界放行,只在 60/90 帧装);P7 在目标 > 30 帧时拒装;7 条新特征全进干扫;`FL_G_EVERYTHING` → `0x7FFFFFFF`;导出 `FrameLabSimStatus` |
+| `src/framelab.def` | +1 导出(44) |
+| `tools/gui/ra3fps_gui.cpp` | 目标 > 30 帧时报可见性 / 联机修正状态 |
+| `tests/test_schedule.cpp` | +22 条(49 / 0),含反证 |
+| `tests/test_loader.cpp` | +2 条(42 / 0) |
+| `HANDOFF.md` §28 | 机制、修法、验证方法 |
+
+
+### §AG.2(2026-09-28):对抗复核后的订正
+撤销表 48 → 128(勾上特效打包时原来会整体回滚、一处都不装)+ 安装后打印用量;`0x00602753` 联机跳帧判定与迷雾刷新一起改指(否则 90 帧联机掉帧时迷雾不刷新);
+`FrameLabSimStatus` 只量不改模式不再误报;`test_schedule` +5 条(54 / 0);干扫 58 条。详见 HANDOFF §28.5。

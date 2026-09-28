@@ -974,9 +974,6 @@ static const short kSigXfFlushCall[] = {   // 命中 0x006266F7(关注字节在 
 static const short kSigDestroyCall[] = {   // 命中 0x006266FE(关注字节在 +0)  sub_626620  call sub_619BD0  销毁表 processDestroyList
     0xE8,W,W,W,W,0x8B,0x0D,0x04,0x3F,0xCE,0x00,0xE8,0x62,0xB4
 };
-static const short kSigSkipGateCall[] = {   // 命中 0x0060274A(关注字节在 +9)  sub_602720  comiss xmm0,[0xCAFF7C]; ja; call sub_5FFAD0  联机跳过 GameClient::update 的保护帧判定
-    0x0F,0x2F,0x05,0x7C,0xFF,0xCA,0x00,0x77,0x60,0xE8
-};
 static const short kSigIconPingPong[] = {
     0x8B,0xD0,                            // mov  edx, eax                 (显示帧号)
     0xA1,W,W,W,W,                         // mov  eax,[dword_CAD5F4]
@@ -1155,9 +1152,7 @@ static int g_ratio = 4;            // r = 客户端帧率 ÷ 逻辑帧率
 // 2026-09-16 会话 68ee9b9d:容量从 16 提到 48。改成「重定向读者」的设计后改动点有 18 处,
 // 原来满了之后 remember() 是**静默返回**,会留下一份残缺的撤销表 —— 回滚时还不回去,比不装还糟。
 // 现在满了/超长一律返回 false,让 patch() 当场失败并整体回滚。
-// 2026-09-28 复核订正:48 不够了 —— GUI 勾上「修复过快的特效与过场运镜」时 60/90 帧要改 54 处(运镜 16 + 染色 8 …),
-//   第 49 处 patch() 失败 ⇒ **整个安装回滚、一处都没装**。提到 128,并在安装完成时打出用量,下次加分组时一眼看到余量。
-static Undo g_undo[128];
+static Undo g_undo[48];
 static const int kUndoMax = (int)(sizeof g_undo / sizeof g_undo[0]);
 static int g_undoCount = 0;
 static bool g_installed = false;
@@ -2787,40 +2782,26 @@ static int install(int targetFps, bool measureOnly) {
 
     // ── ★★★ 2026-09-28:迷雾可见性相位测试改回原版语义(随 FL_G_RATIO;它纠正的正是 RATIO 自己的副作用)─────────
     g_visPhaseOn = false; g_visPhase = 3;
-    // 2026-09-28 复核订正:原版里还有**第二个**调用者必须与这里用同一个判据 —— sub_602720(联机时决定本帧跳不跳
-    //   GameClient::update:本机帧率撑不住时只保留相位测试为真的那一帧)。两处原本调的是同一个 sub_5FFAD0,所以
-    //   「被保留的帧」恰好就是「刷新迷雾可见性的帧」。只改一处会把两者拆开:90 帧联机掉帧时保留的是阶段 1 帧,
-    //   刷新却要阶段 3 帧 ⇒ 整段时间里迷雾可见性一次都不刷。所以两处**一起**改指 fl_wrap_visphase,缺一处就都不改。
     if (ok && !measureOnly && (g_groups & FL_G_RATIO) && targetFps > g_retailFps) {
         Pattern pPhase3Call = {"迷雾可见性相位测试调用点", kSigPhase3Call, (int)(sizeof kSigPhase3Call / sizeof kSigPhase3Call[0]), 0x0054306D};
-        Pattern pSkipGateCall = {"联机跳帧保护帧判定调用点", kSigSkipGateCall, (int)(sizeof kSigSkipGateCall / sizeof kSigSkipGateCall[0]), 0x0060274A};
         unsigned char* hit = scan(pPhase3Call);
-        unsigned char* hit2 = scan(pSkipGateCall);
-        unsigned char* site  = (hit  && hit  != (unsigned char*)-1) ? hit + 6  : NULL;
-        unsigned char* site2 = (hit2 && hit2 != (unsigned char*)-1) ? hit2 + 9 : NULL;
-        const bool good1 = site && *(unsigned*)(hit + 2) == (unsigned)kEngineGlobalVa && site[0] == 0xE8 &&
-                           (uintptr_t)(site + 5 + *(int*)(site + 1)) == kEnginePhaseTestVa;
-        const bool good2 = site2 && site2[0] == 0xE8 &&
-                           (uintptr_t)(site2 + 5 + *(int*)(site2 + 1)) == kEnginePhaseTestVa;
-        if (!good1 || !good2) {
-            FL_WARN("迷雾可见性相位测试:两个调用点没全部核对上(刷新 %s、联机跳帧 %s)—— 一处都不改。后果:60 帧下敌方单位的"
-                    "迷雾可见性从不刷新、90 帧下刷新相位不对(可能表现为敌方单位偶尔隐身)。",
-                    good1 ? "OK" : "缺", good2 ? "OK" : "缺");
+        unsigned char* site = (hit && hit != (unsigned char*)-1) ? hit + 6 : NULL;
+        const bool good = site && *(unsigned*)(hit + 2) == (unsigned)kEngineGlobalVa && site[0] == 0xE8 &&
+                          (uintptr_t)(site + 5 + *(int*)(site + 1)) == kEnginePhaseTestVa;
+        if (!good) {
+            FL_WARN("迷雾可见性相位测试:调用点没核对上 —— 跳过。后果:60 帧下敌方单位的迷雾可见性从不刷新、90 帧下刷新相位不对"
+                    "(可能表现为敌方单位偶尔隐身)。");
         } else {
             g_visPhase = fl_vis_phase(g_ratio);
-            unsigned char* sites[2] = { site, site2 };
-            for (int k = 0; ok && k < 2; ++k) {
-                unsigned char code[5];
-                code[0] = 0xE8;
-                const int rel = (int)((unsigned char*)&fl_wrap_visphase - (sites[k] + 5));
-                memcpy(code + 1, &rel, 4);
-                ok = patch(sites[k], code, 5, "迷雾可见性相位测试改回原版语义");
-            }
+            unsigned char code[5];
+            code[0] = 0xE8;
+            const int rel = (int)((unsigned char*)&fl_wrap_visphase - (site + 5));
+            memcpy(code + 1, &rel, 4);
+            ok = patch(site, code, 5, "迷雾可见性相位测试改回原版语义");
             if (ok) {
                 g_visPhaseOn = true;
-                FL_INFO("  迷雾可见性 / 模型状态 / 残影 相位测试:call @%08X 与联机跳帧判定 call @%08X → 包装"
-                        "(每逻辑帧一次,在阶段 %d 之后;原 phase == 6/r = %d)",
-                        (unsigned)(uintptr_t)site, (unsigned)(uintptr_t)site2, g_visPhase, 6 / (g_ratio > 0 ? g_ratio : 1));
+                FL_INFO("  迷雾可见性 / 模型状态 / 残影 相位测试:call @%08X → 包装(每逻辑帧一次,在阶段 %d 之后;原 phase == 6/r = %d)",
+                        (unsigned)(uintptr_t)site, g_visPhase, 6 / (g_ratio > 0 ? g_ratio : 1));
             }
         }
     }
@@ -2997,9 +2978,6 @@ static int install(int targetFps, bool measureOnly) {
     }
     g_installed = true;
     g_frameCount = 0;
-    FL_INFO("撤销表用量 %d / %d 处", g_undoCount, kUndoMax);
-    if (g_undoCount * 4 > kUndoMax * 3)
-        FL_WARN("撤销表已用掉四分之三以上(%d / %d)—— 再加分组前先扩容 g_undo", g_undoCount, kUndoMax);
     if (measureOnly) {
         FL_INFO("只量不改模式就位:只装了插值系数钩子,返回值与原版逐位相同,帧率**未改**(共 %d 处改动)。"
                 "它是基线组的量具,和实验组用的是同一个。", g_undoCount);
@@ -3594,7 +3572,7 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabSimStatus() {
     if (fl::g_visPhaseOn) v |= 1;
     if (fl::g_simPinSites == 3) v |= 2;
     if (fl::g_simGateOn) v |= 4;
-    const bool above = !fl::g_measureOnly && fl::g_targetFps > fl::g_retailFps;   // 只量不改按设计不装这些
+    const bool above = fl::g_targetFps > fl::g_retailFps;
     const bool wantPin  = above && (fl::g_groups & FL_G_SIMPIN) != 0;
     const bool wantGate = above && (fl::g_groups & FL_G_SIMGATE) != 0 && fl_sim_gate_exact(fl::g_ratio);
     if ((wantPin && !(v & 2)) || (wantGate && !(v & 4))) return -2;

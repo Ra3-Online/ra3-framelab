@@ -123,10 +123,6 @@ EXPORTS
     ; 2026-09-28: drawable flash / tint envelope timing (group 0x10000000, default off).
     ; FrameLabTintStatus(): -2 = not all 8 sites patched, 0 = off / not needed, 1000+beat = engaged.
     FrameLabTintStatus
-    ; 2026-09-28: fog-visibility phase fix (with FL_G_RATIO), R4 kept vanilla,
-    ; FL_G_SIMPIN 0x20000000 and FL_G_SIMGATE 0x40000000 (multiplayer determinism, default off).
-    ; FrameLabSimStatus(): 0 = not installed; bits 1 vis-phase, 2 pin, 4 gate, 8 R4 vanilla; -2 = requested but missing.
-    FrameLabSimStatus
     FrameLabChassisRate
     FrameLabChassisSlots
     FrameLabSelfTestChassis
