@@ -171,14 +171,6 @@ int main(int argc, char** argv) {
         check(rcCam == 0, "过场运镜计时:没安装时状态 = 0(关),不是 -2", rcCam);
     }
 
-    // 2026-09-28:单位闪烁 / 染色计时。没安装时必须是 0(关),不能是 -2。
-    FnStatus tintStatus = (FnStatus)GetProcAddress(h, "FrameLabTintStatus");
-    check(tintStatus != NULL, "单位闪烁 / 染色计时的状态导出取得到");
-    if (tintStatus) {
-        const int rcTint = tintStatus();
-        check(rcTint == 0, "单位闪烁 / 染色计时:没安装时状态 = 0(关),不是 -2", rcTint);
-    }
-
     const int rcDisable = disable();
     check(rcDisable == 1, "没装过时关闭返回「未安装」(1)", rcDisable);
 

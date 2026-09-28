@@ -120,9 +120,6 @@ EXPORTS
     ; 2026-09-26: scripted-camera timing fix (group 0x8000000, default off).
     ; FrameLabCameraStatus(): -2 = not all 16 sites patched, 0 = off / not needed, 1000+ms = engaged.
     FrameLabCameraStatus
-    ; 2026-09-28: drawable flash / tint envelope timing (group 0x10000000, default off).
-    ; FrameLabTintStatus(): -2 = not all 8 sites patched, 0 = off / not needed, 1000+beat = engaged.
-    FrameLabTintStatus
     FrameLabChassisRate
     FrameLabChassisSlots
     FrameLabSelfTestChassis

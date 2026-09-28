@@ -434,10 +434,10 @@ static const short kSigMsPerFrameSetter[] = {
 // 实测供参考(历史,不当理由用):关掉后渲染 89.75 / 逻辑 14.97,与全开无差别 ——
 // **那条读数看不见建筑解包动画**,所以它对这个问题没有鉴别力。
 #define FL_G_ANIMGATE  0x1000        // P7 逐帧绘制更新的**次数门**(修动画过快;见下面 kSigFrameUpdate)
-#define FL_G_EVERYTHING 0x1FFFFFFF     // 含派生量 + P8 + 动画标尺 + 混合斜坡量尺 + 时钟修正 + P6b + 原版帧率下的时钟修正
+#define FL_G_EVERYTHING 0xFFFFFFF      // 含派生量 + P8 + 动画标尺 + 混合斜坡量尺 + 时钟修正 + P6b + 原版帧率下的时钟修正
                                       // + 车身外观探针/节拍门/插值(2026-09-21,0x80000 / 0x100000 / 0x200000)+ 第四个派生量(0x400000),仅供对照实验
                                       // + 卷屏 / 弹道流 / 图标(0x800000 / 0x1000000 / 0x2000000)+ 粒子系统节拍门(0x4000000,2026-09-23)
-                                      // + 过场运镜计时(0x8000000,2026-09-26)+ 单位闪烁 / 染色计时(0x10000000,2026-09-28)
+                                      // + 过场运镜计时(0x8000000,2026-09-26)
 // ⛔ 2026-09-17 P7「动画次数门」已从默认集合**移除**,理由见 kSigFrameUpdate 上方的订正。
 //    实测:开了它,录像回放**当场不同步** —— 它删的是模拟步骤,不是动画。
 // ★ 2026-09-17 动画定位会话:默认集合加入 FL_G_CLOCK(0x8000)。
@@ -778,13 +778,8 @@ static const short kSigTracerUpdate[] = {
 //       this+260  爆发间隔(sub_6BF1F0)   每次 --,到 0 发射 rand(模板+168)×this+80 颗,再装填 rand(模板+156)
 //                                                                          ⇒ **每秒发射次数是原版的 2 / 3 倍**
 //       this+268  系统寿命(sub_6B7530)   每次 --                         ⇒ 系统提前消失
-//     ⚠ 2026-09-28 订正:只有 **GPU** 粒子个体的寿命走时钟(P4 已钉,见 RE §6.9);**CPU** 粒子(默认容器,
-//       含所有 LightSource 点光粒子)的寿命是 sub_6BEB90 里的 +56「每调用减一」,各子模块(尺寸 / 颜色)也每调用走一步
-//       —— 它们同样在这条 call 后面,所以一并被本节拍门钉回 30 Hz。
-//     没门时:新粒子冒得勤(发射 3 倍)、CPU 粒子活得短(1/3)、起始延迟短(1/3)。
+//     粒子**个体**的寿命走时钟(P4 已钉,见 RE §6.9),所以不是「粒子活得短」,而是「新粒子冒得勤」——
 //     一团由随机大小 / 亮度的加色粒子叠出来的光,每冒一颗亮度就跳一下 ⇒ 肉眼就是「闪得快 3 倍」。
-//     起始延迟变短还有一个反直觉后果(集火过亮,HANDOFF §26):宿主对象寿命比延迟短、原版**永远不出现**的命中光,
-//     没门时在 90 帧下会出现(未来坦克 X-1 的 AlliedFutureTankHit_Light:延迟 35 步 = 1.17 s > 宿主 0.75 s)。
 //   补丁点 = sub_5F43A0 开头那条 call sub_6D1D30(只改 rel32,5 字节;现场字节已核,全镜像唯一):
 //       005F43A7  8B F9               mov  edi, ecx
 //       005F43A9  89 7C 24 14         mov  [esp+0x14], edi
@@ -882,53 +877,6 @@ static const short kSigCam15[] = {   // 005EB6FA  sub_5EB5E0  fild [CAF9D4]     
 // 每条特征里「要改指的操作数」的偏移,以及改指到哪:c = g_camMs(换算用固定值)/ k = g_msPerFrame(每次推进)/ f = g_fpsRender
 static const unsigned char kCamOpOff[FL_CAM_SITES] = {2,2,2,3,2,2,2,2,2,3,2, 1,2,1, 1,2};
 static const char          kCamKind[FL_CAM_SITES + 1] = "ccccccccccckkkff";
-
-// ── ★★★ 2026-09-28(用户战役实测):脚本「目标单位闪几下」在 60/90 帧下闪得飞快 —— 单位闪烁 / 染色计时,**默认关** ─────
-//   脚本动作 NAMED_FLASH / TEAM_FLASH(「flashes for N seconds」)在逻辑侧只设一个闪烁次数(Drawable+324);
-//   真正的节奏全在 Drawable 的逐**显示帧**更新 sub_53A730 里(伪代码与反汇编逐行核对过):
-//     ① 节拍:`if (闪烁次数 > 0 && 显示帧号 % dword_CDB900 == 0) { 起一个脉冲; --闪烁次数; }`
-//        dword_CDB900 = dword_CAF9D4 >> 1 = 15(静态初始化,全镜像只有这一个读者 0x0053A7FC)
-//        ⇒ 90 帧下每 15 个显示帧 = 1/6 秒闪一下(原版 0.5 秒),**总时长也缩到 1/3**(次数不变)。
-//     ② 脉冲本身是一个 TintEnvelope(Drawable+392;另有 +388 一个),由 sub_529450(包络, 颜色, 起, 落, 保持)设定,
-//        「起 / 落 / 保持」全是**帧数**,每显示帧 sub_529500 走一步 ⇒ 90 帧下每个脉冲只有原版 1/3 长。
-//        同一套包络还驱动状态染色(30/30/-2、30/30/300、30/30/9999999 这几组写死帧数,即普查表 A4)。
-//     ③ 状态解除时 sub_525FC0 直接往包络里写保持帧数 10(`mov dword [eax+34h], 0Ah`)。
-//   ⚠ 染色的「呼吸」(包络 +64/+68 的正弦)用的是**逻辑**帧号 *(dword_CD8CE4+80),本来就对,不用改。
-//   修法(全是客户端 Drawable,不碰模拟):
-//     ① 节拍除数改指 g_tintBeat = round(15 × 目标帧率 ÷ 30)(90 → 45、60 → 30)⇒ 每 0.5 秒一下,次数不变 ⇒ 总时长还原;
-//     ② 全镜像进 sub_529450 的 **6 条 call**(无函数指针引用;两条 IDA 里看似独立的调用其实共用 call 指令)
-//        全部改指 fl_wrap_tintset:把起 / 落 / 保持按 目标帧率 ÷ 30 放大后再调原函数 ⇒ 每段的**真实时长**与原版相同,
-//        而且每步更细(更平滑)。0 = 瞬时、负数与 ≥ 1000000 是「永远」哨兵值,原样保留。
-//     ③ 那个立即数 10 改写成 round(10 × 目标帧率 ÷ 30)。
-//   调用约定:sub_529450 是 __thiscall、4 个栈参数、ret 10h;6 个调用点 call 之后都不读 ecx/edx(已逐条反汇编核对),
-//     包装只做整数运算、不碰 xmm ⇒ 普通 __fastcall 包装就安全。
-//   已知小瑕疵:TintEnvelope 会进存档(sub_51FD70),90 帧下存的档在 30 帧下读回,正在进行的染色会慢 3 倍直到结束 —— 纯视觉、一次性。
-#define FL_G_TINT         0x10000000
-#define FL_TINT_CALLS     6
-static const short kSigTintBeat[] = {   // 命中 0x0053A7FC(站点 0x0053A7FC,关注字节在 +2)  sub_53A730  div [0xCDB900]  闪烁节拍:显示帧号 % 15
-    0xF7,0x35,0x00,0xB9,0xCD,0x00,0x85,0xD2,0x75,0x61
-};
-static const short kSigTintSet0[] = {   // 命中 0x0052E0D4(站点 0x0052E0D4,关注字节在 +0)  sub_52DFF0  call sub_529450  闪烁脉冲 / 自定义染色(两条分支共用这一条 call)
-    0xE8,W,W,W,W,0x66,0x81,0xA6,0x54,0x01,0x00,0x00,0xFB,0xFF
-};
-static const short kSigTintSet1[] = {   // 命中 0x0052E316(站点 0x0052E316,关注字节在 +0)  sub_52E280  call sub_529450  状态染色 30/30/300
-    0xE8,W,W,W,W,0x8B,0x86,0x88,0x01,0x00,0x00,0xF3,0x0F,0x10
-};
-static const short kSigTintSet2[] = {   // 命中 0x0052E377(站点 0x0052E377,关注字节在 +0)  sub_52E280  call sub_529450  状态染色 30/30/9999999
-    0xE8,W,W,W,W,0x8B,0x86,0x88,0x01,0x00,0x00,0x0F,0x57,0xC0,0xF3,0x0F,0x11,0x40,0x40,0xF3,0x0F,0x11,0x40,0x44,0x88
-};
-static const short kSigTintSet3[] = {   // 命中 0x0052E3F5(站点 0x0052E3F5,关注字节在 +0)  sub_52E280  call sub_529450  状态染色(参数取自 Drawable 字段)
-    0xE8,W,W,W,W,0xD9,0x86,0xA4,0x01,0x00,0x00,0x8B,0x86,0x88
-};
-static const short kSigTintSet4[] = {   // 命中 0x0052E4B6(站点 0x0052E4B6,关注字节在 +0)  sub_52E280  call sub_529450  状态染色 30/30/-2(另一条 -2 分支跳到这里)
-    0xE8,W,W,W,W,0x8B,0x86,0x88,0x01,0x00,0x00,0x0F,0x57,0xC0,0xF3,0x0F,0x11,0x40,0x40,0xF3,0x0F,0x11,0x40,0x44,0xEB
-};
-static const short kSigTintSet5[] = {   // 命中 0x0052E8CA(站点 0x0052E8CA,关注字节在 +0)  sub_52E680  call sub_529450  +388 包络 decay 4 / sustain 1
-    0xE8,W,W,W,W,0x5E,0x5B,0x5F,0x83,0xC4,0x18,0xC2,0x04,0x00,0xCC
-};
-static const short kSigTintHold10[] = {   // 命中 0x00525FE4(站点 0x00525FE4,关注字节在 +3)  sub_525FC0  mov dword [eax+34h], 10  状态解除后的保持帧数
-    0xC7,0x40,0x34,0x0A,0x00,0x00,0x00,0x8B,0x89,0x88
-};
 static const short kSigIconPingPong[] = {
     0x8B,0xD0,                            // mov  edx, eax                 (显示帧号)
     0xA1,W,W,W,W,                         // mov  eax,[dword_CAD5F4]
@@ -1227,13 +1175,6 @@ static volatile long  g_psFwd    = 0;       // 真的转发给引擎的次数(�
 static int            g_camMs    = 33;      // round(1000 ÷ 目标帧率),install() 里算
 static int            g_camSites = 0;       // 实际改指成功的处数(应为 16)
 static bool           g_camOn    = false;   // 16 处全部改指成功
-// 2026-09-28:单位闪烁 / 染色计时(见 FL_G_TINT)。
-static const uintptr_t kEngineTintSetVa  = 0x00529450;   // sub_529450 TintEnvelope 设定(__thiscall,4 栈参,ret 10h)
-static const uintptr_t kEngineTintBeatVa = 0x00CDB900;   // dword_CDB900 = 15,闪烁节拍除数(只用来核对操作数)
-static unsigned       g_tintBeat  = 15;     // round(15 × 目标帧率 ÷ 30),install() 里算
-static int            g_tintSites = 0;      // 实际改成功的处数(应为 8)
-static bool           g_tintOn    = false;  // 包装是否放大帧数
-static volatile long  g_tintCalls = 0;      // 包装放大过的次数(给状态导出看「真的在走」)
 static int   g_scrollSites = 0;           // resolve 时定位并核对通过的补丁点个数(应为 2;不是 2 就一处都不登记)
 static bool  g_scrollOn    = false;       // 两处是否真的改指了(给 FrameLabScrollStatus 用)
 // 2026-09-22:弹道流节拍门(见 FL_G_TRACER)。只需要一个「上次转发时的 30 Hz 虚拟帧号」,不需要表 ——
@@ -1671,27 +1612,6 @@ extern "C" void __fastcall fl_wrap_psys(void* mgr, void* unused) {
     }
     ++g_psFwd;
     ((FnPsysUpdate)g_psOrigFn)(mgr);
-}
-
-// ── ★★★ 2026-09-28:单位闪烁 / 染色计时的包装(见 FL_G_TINT)────────────────────────────────────────
-// 帧数按 目标帧率 ÷ 原版帧率 放大(四舍五入)。0 = 瞬时;负数与 ≥ 1000000 是引擎的「永远」哨兵值(-2、9999999),原样保留。
-// 只做 32 位整数运算:帧数 < 1000000、帧率 ≤ 120,乘积不溢出;也不会让编译器动用 xmm(调用点对 xmm 没有跨 call 的假设,
-// 但少碰为好)。
-static int fl_tint_scale(int frames) {
-    if (frames <= 0 || frames >= 1000000) return frames;
-    const int v = (frames * g_targetFps + g_retailFps / 2) / g_retailFps;
-    return v < 1 ? 1 : v;
-}
-typedef char (__thiscall *FnTintSet)(void* env, void* color, unsigned attack, int decay, int sustain);
-extern "C" char __fastcall fl_wrap_tintset(void* env, void* unused, void* color, unsigned attack, int decay, int sustain) {
-    (void)unused;
-    if (g_tintOn) {
-        attack  = (unsigned)fl_tint_scale((int)attack);
-        decay   = fl_tint_scale(decay);
-        sustain = fl_tint_scale(sustain);
-        ++g_tintCalls;
-    }
-    return ((FnTintSet)kEngineTintSetVa)(env, color, attack, decay, sustain);
 }
 
 // ───────────────────────────── 安装 / 卸载 ─────────────────────────────
@@ -2624,63 +2544,6 @@ static int install(int targetFps, bool measureOnly) {
         }
     }
 
-    // ── ★★★ 单位闪烁 / 染色计时(默认关;2026-09-28)。8 处:节拍除数 1 + 包络设定 call 6 + 保持立即数 1,全中才装。
-    g_tintOn = false; g_tintSites = 0; g_tintCalls = 0;
-    if (ok && !measureOnly && (g_groups & FL_G_TINT)) {
-        if (targetFps <= g_retailFps) {
-            FL_INFO("  单位闪烁 / 染色计时:目标帧率不高于原版 ⇒ 不需要,不装(行为逐位不变)");
-        } else {
-            Pattern pTintBeat = {"闪烁节拍除数", kSigTintBeat, (int)(sizeof kSigTintBeat / sizeof kSigTintBeat[0]), 0x0053A7FC};
-            Pattern pTintSet0 = {"染色包络设定 call ①", kSigTintSet0, (int)(sizeof kSigTintSet0 / sizeof kSigTintSet0[0]), 0x0052E0D4};
-            Pattern pTintSet1 = {"染色包络设定 call ②", kSigTintSet1, (int)(sizeof kSigTintSet1 / sizeof kSigTintSet1[0]), 0x0052E316};
-            Pattern pTintSet2 = {"染色包络设定 call ③", kSigTintSet2, (int)(sizeof kSigTintSet2 / sizeof kSigTintSet2[0]), 0x0052E377};
-            Pattern pTintSet3 = {"染色包络设定 call ④", kSigTintSet3, (int)(sizeof kSigTintSet3 / sizeof kSigTintSet3[0]), 0x0052E3F5};
-            Pattern pTintSet4 = {"染色包络设定 call ⑤", kSigTintSet4, (int)(sizeof kSigTintSet4 / sizeof kSigTintSet4[0]), 0x0052E4B6};
-            Pattern pTintSet5 = {"染色包络设定 call ⑥", kSigTintSet5, (int)(sizeof kSigTintSet5 / sizeof kSigTintSet5[0]), 0x0052E8CA};
-            Pattern pTintHold10 = {"染色保持帧数 10", kSigTintHold10, (int)(sizeof kSigTintHold10 / sizeof kSigTintHold10[0]), 0x00525FE4};
-            unsigned char* beat = scan(pTintBeat);
-            unsigned char* hold = scan(pTintHold10);
-            unsigned char* calls[FL_TINT_CALLS] = {
-                scan(pTintSet0), scan(pTintSet1), scan(pTintSet2), scan(pTintSet3), scan(pTintSet4), scan(pTintSet5)
-            };
-            int nOk = 0;
-            const bool beatOk = beat && beat != (unsigned char*)-1 && *(unsigned*)(beat + 2) == (unsigned)kEngineTintBeatVa;
-            const bool holdOk = hold && hold != (unsigned char*)-1 && hold[3] == 10;
-            for (int i = 0; i < FL_TINT_CALLS; ++i) {
-                if (!calls[i] || calls[i] == (unsigned char*)-1) continue;
-                const uintptr_t tgt = (uintptr_t)(calls[i] + 5 + *(int*)(calls[i] + 1));
-                if (calls[i][0] == 0xE8 && tgt == kEngineTintSetVa) ++nOk;
-            }
-            if (!beatOk || !holdOk || nOk != FL_TINT_CALLS) {
-                FL_WARN("单位闪烁 / 染色计时:定位不全(节拍 %s、保持 %s、包络 call %d/%d)—— 一处都不改(不影响其它改动)。"
-                        "后果:60/90 帧下脚本闪烁与状态染色仍快 2/3 倍。",
-                        beatOk ? "OK" : "缺", holdOk ? "OK" : "缺", nOk, FL_TINT_CALLS);
-            } else {
-                g_tintBeat = (15 * targetFps + g_retailFps / 2) / g_retailFps;   // 90 → 45、60 → 30
-                g_tintOn   = true;                                              // 包装一进来就要用,必须在改字节之前就位
-                void* pBeat = (void*)&g_tintBeat;
-                ok = patch(beat + 2, &pBeat, 4, "闪烁节拍除数改指");
-                if (ok) ++g_tintSites;
-                for (int i = 0; ok && i < FL_TINT_CALLS; ++i) {
-                    unsigned char code[5];
-                    code[0] = 0xE8;
-                    const int rel = (int)((unsigned char*)&fl_wrap_tintset - (calls[i] + 5));
-                    memcpy(code + 1, &rel, 4);
-                    ok = patch(calls[i], code, 5, "染色包络设定 call 改指包装");
-                    if (ok) ++g_tintSites;
-                }
-                if (ok) {
-                    const int hold10 = fl_tint_scale(10);
-                    ok = patch(hold + 3, &hold10, 4, "染色保持帧数立即数");
-                    if (ok) ++g_tintSites;
-                }
-                if (!ok) g_tintOn = false;
-                else FL_INFO("  单位闪烁 / 染色计时已装:%d 处(节拍 15 → %d 显示帧;包络帧数 × %d/%d;保持 10 → %d)",
-                             g_tintSites, g_tintBeat, targetFps, g_retailFps, fl_tint_scale(10));
-            }
-        }
-    }
-
     // ── ★ 状态图标乒乓动画(默认关;2026-09-22)。一处 4 字节:除数 30 → 目标帧率。
     if (ok && !measureOnly && (g_groups & FL_G_ICONANIM)) {
         Pattern pIcon = {"状态图标乒乓(帧号×15÷帧率)", kSigIconPingPong,
@@ -2876,7 +2739,6 @@ static int uninstall() {
     g_trcSite = NULL; g_trcOn = false;
     g_psSite = NULL; g_psOn = false;
     g_camSites = 0; g_camOn = false;
-    g_tintSites = 0; g_tintOn = false;
     g_installed = false;
     FL_INFO("已卸载,全部字节还原");
     return FL_OK;
@@ -3072,11 +2934,6 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabSetGroups(int mask) {
             (fl::g_groups & FL_G_TRACER)
                 ? "(生成密度 / 伸展 / 移动钉回每秒 30 步 —— 开火不再像机关枪;未经实机验证)"
                 : "(默认:弹道流每秒生成条数是原版的 2/3 倍)");
-    FL_INFO("  单位闪烁 / 染色计时=%s%s",
-            (fl::g_groups & FL_G_TINT) ? "开" : "关",
-            (fl::g_groups & FL_G_TINT)
-                ? "(脚本闪烁节拍 + 染色包络帧数按真实时间走;未经实机验证)"
-                : "(默认:60/90 帧下脚本闪烁与状态染色快 2/3 倍)");
     FL_INFO("  过场运镜计时=%s%s",
             (fl::g_groups & FL_G_CAMERA) ? "开" : "关",
             (fl::g_groups & FL_G_CAMERA)
@@ -3370,14 +3227,6 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabTracerStatus() {
     const int ratio = c > 0 ? (int)((long long)f * 1000 / c) : 0;
     FL_INFO("弹道流节拍门:调用 %ld 转发 %ld ⇒ 放行比例 %d/1000(90 帧应 ≈ 333,60 帧 ≈ 500)", c, f, ratio);
     return 1000000 + ratio;
-}
-
-// FrameLabTintStatus():单位闪烁 / 染色计时的状态。-2 = 分组位开着、已安装,但 8 处没全部改成;0 = 关 / 不需要;
-//   1000 + 闪烁节拍(90 帧应为 1045,60 帧 1030)= 已生效。
-extern "C" __declspec(dllexport) int __stdcall FrameLabTintStatus() {
-    if (fl::g_tintOn && fl::g_tintSites == 8) return 1000 + (int)fl::g_tintBeat;
-    if (fl::g_installed && (fl::g_groups & FL_G_TINT) && fl::g_targetFps > fl::g_retailFps) return -2;
-    return 0;
 }
 
 // FrameLabCameraStatus():过场运镜计时的状态。-2 = 分组位开着、已安装,但 16 处没全部改指;0 = 关 / 不需要;

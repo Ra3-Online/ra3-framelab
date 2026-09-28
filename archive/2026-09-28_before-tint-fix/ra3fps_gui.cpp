@@ -142,8 +142,7 @@ static volatile LONG g_scrollFix = 0;
 // 2026-09-23:打包里再加 0x4000000 粒子系统节拍门 —— 用户实测「光仍然闪得快」,而同包的弹道流已修好
 //   ⇒ 0x400000(RadiusDecal)不是那盏光;真凶是粒子系统管理器每显示帧推进一步(见 framelab.cpp FL_G_PSYS)。
 // 2026-09-26:再加 0x8000000 过场运镜计时 —— 用户实测战役过场「镜头一下就过去、到了地方等飞机」,约快 3 倍。
-// 2026-09-28:再加 0x10000000 单位闪烁 / 染色计时 —— 用户战役实测「目标单位闪几下」闪得飞快。
-static const unsigned kFxFixBits = 0x1F400000u;
+static const unsigned kFxFixBits = 0xF400000u;
 static volatile LONG g_fxFix = 0;
 static bool g_groupsOverridden = false;
 static unsigned EnvGroups();
@@ -946,22 +945,6 @@ static bool JobPatch(DWORD& outPid, HANDLE& outProc, JobCtx& ctx) {
                     LogLine(L"[WARN] 读不到载具颠簸修复的状态（DLL 太旧？）。");
                 }
             }
-            // 2026-09-28:单位闪烁 / 染色计时同样报「到底开没开成」。
-            if ((EffectiveGroups() & 0x10000000u) != 0) {
-                void* tintStatus = RemoteExport(pid, localBase, "FrameLabTintStatus");
-                DWORD ts2 = 0;
-                if (tintStatus && RemoteCall(proc, tintStatus, NULL, &ts2, 60000)) {
-                    const int v = (int)ts2;
-                    if (v >= 1000)
-                        LogF(L"[OK]   单位闪烁 / 染色计时已生效（闪烁节拍 %d 显示帧；90 帧应为 45、60 帧应为 30）。", v - 1000);
-                    else if (v == -2)
-                        LogLine(L"[!!]   单位闪烁 / 染色计时【没装上】（8 处特征没全部命中？）—— 脚本闪烁仍会过快。");
-                    else
-                        LogLine(L"[..]   单位闪烁 / 染色计时未生效（目标帧率不高于原版？）。");
-                } else {
-                    LogLine(L"[WARN] 读不到单位闪烁 / 染色计时的状态（DLL 太旧？）。");
-                }
-            }
             // 2026-09-26:过场运镜计时同样报「到底开没开成」。
             if ((EffectiveGroups() & 0x8000000u) != 0) {
                 void* camStatus = RemoteExport(pid, localBase, "FrameLabCameraStatus");
@@ -1272,7 +1255,7 @@ static bool RunJob(JobCtx ctx) {
              : L"随帧率变快（现状：60 帧约 2 倍、90 帧约 3 倍）");
     if (!g_groupsOverridden)
         LogF(L"过快视觉效果修复 = %s", g_fxFix
-             ? L"开（弹道流密度 + 粒子发射 + 光效 / 淡出 / 图标 + 战役过场运镜钉回原版；分组多出 0x1F400000）"
+             ? L"开（弹道流密度 + 粒子发射 + 光效 / 淡出 / 图标 + 战役过场运镜钉回原版；分组多出 0xF400000）"
              : L"关（现状：弹道流、贴花淡出、拖尾滚动等在 60/90 帧下快 2/3 倍）");
 
     // Warn about a mismatch between the requested rate and the panel BEFORE launching, so the
