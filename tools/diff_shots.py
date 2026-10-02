@@ -1,6 +1,6 @@
 # diff_shots.py -- quantify how much each config's frame differs from the baseline at the SAME logic frame.
 #
-# 2026-09-16 / session 68ee9b9d (Claude)
+# 2026-09-16 / developer probe
 # At a given absolute logic frame the simulation state is identical across configs (same replay,
 # lockstep). So any pixel difference comes from rendering: interpolation phase, or an animation
 # that is being advanced at the wrong rate. A small difference is expected (a 90 fps config lands
@@ -10,10 +10,20 @@
 import os
 import re
 import sys
+from pathlib import Path
 
 from PIL import Image, ImageChops
 
-ROOT = sys.argv[1] if len(sys.argv) > 1 else r"G:\Ra3 FrameLab\build\bisect"
+def default_bisect_directory():
+    repo = Path(__file__).resolve().parents[1]
+    build = Path(os.environ.get("FLAB_BUILD_DIR") or repo / "build")
+    root = (build if build.is_absolute() else repo / build) / "bisect"
+    # New runs get their own directory. Existing direct-layout captures still work.
+    runs = [p for p in root.iterdir() if p.is_dir() and (p / "baseline-30").is_dir()] if root.is_dir() else []
+    return str(max(runs, key=lambda p: p.name) if runs else root)
+
+
+ROOT = sys.argv[1] if len(sys.argv) > 1 else default_bisect_directory()
 BASE = "baseline-30"
 
 

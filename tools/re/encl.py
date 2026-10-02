@@ -9,8 +9,9 @@
 # 2026-09-17 12:40 追加 --fn:本会话要反复读整段函数体,每次手工找行范围太慢。
 # 实现上直接复用 scan() 拿到的 (起始行, 地址, 名字) 列表,函数体 = 起始行..下一个起始行-1。
 import io, re, sys
+from local_config import ida_dump_path, take_input_options
 
-PATH = r"G:\IDA\RA3_1.12.game.c"
+PATH = None
 DEF = re.compile(r"^//----- \(00([0-9A-F]+)\) (.*?) -----")
 
 
@@ -25,7 +26,9 @@ def scan():
 
 
 def main():
-    args = sys.argv[1:]
+    global PATH
+    args, options = take_input_options(sys.argv[1:])
+    PATH = ida_dump_path(options.get("--ida-dump"), required=True)
     funcs = scan()
     if not args:
         print("funcs=%d" % len(funcs))
@@ -86,4 +89,5 @@ def main():
         print("%8d -> 0x%08X %s (def line %d)" % (n, addr, name, line))
 
 
-main()
+if __name__ == "__main__":
+    main()

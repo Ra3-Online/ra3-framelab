@@ -1,0 +1,73 @@
+Ra3 FrameLab Non-Commercial Source License, Version 1.0
+Ra3 FrameLab 非商业源码许可，版本 1.0
+
+Copyright (c) 2026 Ra3 FrameLab contributors.
+版权所有 (c) 2026 Ra3 FrameLab 贡献者。
+
+本许可适用于本项目贡献者拥有权利、且未单独标注其他许可的源码、
+文档及由其生成的二进制（下称“本软件”）。
+This license applies to project-owned source, documentation and resulting
+binaries, except materials carrying a separate license.
+
+1. 非商业授权 / Non-commercial grant
+在遵守本许可的前提下，权利人允许你为非商业目的使用、复制、研究、
+修改本软件，并免费分发原始或修改版本的源码和二进制。
+Subject to these terms, the rights holders permit use, copying, study,
+modification and free distribution of original or modified source and
+binaries solely for non-commercial purposes.
+
+2. 禁止商用 / Commercial use prohibited
+未经相关权利人事先书面授权，不得为商业目的使用本软件。
+商业目的包括：销售、收费分发、出租、付费服务、付费集成或支持；
+将本软件用于商业产品、服务或商业经营活动；以及以直接或间接营收、
+商业利益或金钱报酬为目的使用本软件。免费提供本软件不能使原本的
+商业用途变成非商业用途。就第三方权利而言，本许可不代替其授权。
+Without prior written permission from the relevant rights holders, commercial
+use is prohibited. This includes sales, paid distribution, rental, paid
+services, paid integration or support; use in commercial products, services
+or business operations; and use intended to obtain direct or indirect
+revenue, commercial advantage or monetary compensation. Offering the
+software for free does not convert a commercial purpose into a permitted
+non-commercial purpose. Separate third-party permissions remain necessary.
+
+3. 再分发条件 / Redistribution conditions
+分发本软件时必须完整保留本许可、NOTICE、适用版权和来源说明；
+修改版本必须显著说明已作修改，并记录修改者和日期。原始或修改版本
+只能在本许可条件下授予接收者相同的非商业权利，不得授予商用权利，
+不得移除本许可或虚假表示获得权利人认可。不得对本软件收取费用。
+Redistributions must retain this license, NOTICE and applicable copyright
+and attribution notices. Modified versions must prominently identify the
+changes, modifier and date. Original and modified versions must be provided
+under these same non-commercial terms; recipients must not be granted
+commercial rights. Do not remove these terms or falsely claim endorsement.
+No fee may be charged for the software.
+
+4. 权利保留 / Rights reserved
+本许可不授予商标、游戏主程序、游戏数据、第三方代码或其他第三方
+材料的权利。未明确授予的权利由各自权利人保留。
+No rights in trademarks, game executables, game assets or separately owned
+third-party materials are granted. All rights not expressly granted are
+reserved by their respective owners.
+
+5. 终止 / Termination
+违反本许可时，本许可授权立即终止；停止使用和分发不影响已产生的
+责任。需要恢复授权的，须取得相关权利人书面同意。
+Permission terminates upon breach. Ceasing use or distribution does not
+eliminate liability already incurred. Restoration requires written consent
+from the relevant rights holders.
+
+6. 无保证与责任限制 / Disclaimer
+在适用法律允许的最大范围内，本软件按“现状”提供，不作适销性、
+特定用途适用性、无侵权、兼容性或稳定性等明示或默示保证。
+权利人及贡献者不对使用、修改或分发造成的损失承担责任。
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE SOFTWARE IS PROVIDED
+"AS IS", WITHOUT EXPRESS OR IMPLIED WARRANTIES, INCLUDING MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT, COMPATIBILITY OR
+STABILITY. THE RIGHTS HOLDERS AND CONTRIBUTORS SHALL NOT BE LIABLE FOR
+LOSS ARISING FROM USE, MODIFICATION OR DISTRIBUTION.
+
+中文和英文表达冲突时，以中文条款为准。本许可为自定义非商业源码
+许可，不是 GNU GPL，也不宣称符合 OSI 开源定义。
+The Chinese terms govern in case of conflict. This is a custom
+non-commercial source-available license, not the GNU GPL and not a claim
+of conformity with the OSI Open Source Definition.

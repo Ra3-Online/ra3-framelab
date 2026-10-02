@@ -29,19 +29,28 @@ param(
     [int]$StartupWait = 45,      # seconds to let the game boot before attaching (see HANDOFF)
     [int]$Small = 20,            # logic frames for the quick calls
     [int]$Big = 150,             # logic frames for the full-length call
-    [string]$Out = "G:\Ra3 FrameLab\build\logs\_probe.txt",
-    [switch]$KeepOpen
+    [string]$Out = "",
+    [switch]$KeepOpen,
+    [string]$GameRoot = "",
+    [string]$Image = "",
+    [string]$SkuDef = "",
+    [string]$ReplayDir = "",
+    [string]$Replay = ""
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "common.ps1")
+$Out = Get-FlabOutputPath $Out "build\logs\_probe.txt"
+
 $lab      = Split-Path $PSScriptRoot -Parent
-$build    = Join-Path $lab "build"
+$build = Get-FlabBuildDirectory
 $flctl    = Join-Path $build "flctl.exe"
-$gameRoot = "C:\Users\Mithlan\Documents\Tencent Files\873194676\Red Alert 3\Red Alert 3"
-$gameExe  = Join-Path $gameRoot "Data\RA3_1.12.game"
-$skudef   = Join-Path $gameRoot "RA3_chinese_t_1.12.SkuDef"
-$replayDir = Join-Path $env:USERPROFILE "Documents\Red Alert 3\Replays"
-$playPath  = Join-Path $replayDir "_flab_play.RA3Replay"
+$flConfig = Get-FlabLaunchConfig -GameRoot $GameRoot -Image $Image -SkuDef $SkuDef -ReplayDir $ReplayDir
+$gameRoot = $flConfig.GameRoot
+$gameExe = $flConfig.Image
+$skudef = $flConfig.SkuDef
+$replayDir = $flConfig.ReplayDir
+$playPath = Join-Path $replayDir (New-FlabReplayName "flctl_probe")
 
 $lines = New-Object System.Collections.Generic.List[string]
 function Log([string]$s) { $lines.Add($s) | Out-Null; Write-Host $s }
@@ -54,12 +63,9 @@ if (Get-Process -Name "ra3_1.12.game" -ErrorAction SilentlyContinue) {
     Flush; exit 2
 }
 
-# ---- replay: largest plain replay -> pure-ASCII copy, SHA1 verified ----
-$src = Get-ChildItem $replayDir -Filter "*.RA3Replay" |
-       Where-Object { $_.Name -notlike "_*" -and $_.Name -notlike "*ra3battle.net*" } |
-       Sort-Object Length -Descending | Select-Object -First 1
-if (-not $src) { Log "no usable replay found"; Flush; exit 2 }
-Copy-Item $src.FullName $playPath -Force
+# Explicit -Replay selects the test basis; no personal replay is chosen implicitly.
+$src = Get-FlabReplay -Replay $Replay -ReplayDir $replayDir
+Copy-FlabReplay -Source $src.FullName -Destination $playPath
 if ((Get-FileHash $src.FullName -Algorithm SHA1).Hash -ne (Get-FileHash $playPath -Algorithm SHA1).Hash) {
     Log "REFUSE: replay copy differs from source"; Flush; exit 2
 }

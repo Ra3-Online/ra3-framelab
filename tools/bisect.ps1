@@ -1,6 +1,6 @@
 # bisect.ps1 -- run one replay under several patch-group masks and capture matched screenshots.
 #
-# 2026-09-16 / session 68ee9b9d (Claude)
+# 2026-09-16 / developer probe
 # NOTE: keep this file ASCII-only (PowerShell 5.1 misreads BOM-less UTF-8 Chinese).
 #
 # Why this exists: the user saw broken animations (barracks build-up, bear movement) at 90 fps
@@ -17,22 +17,32 @@ param(
     [int]$Fps = 90,
     [string]$Masks = "0x101,0x103,0x183,0x1FF",
     [string]$ShotFrames = "200,300,400,500,600",   # comma list; -File passes args as strings
-    [int]$WaitMinutes = 30
+    [int]$WaitMinutes = 30,
+    [string]$GameRoot = "",
+    [string]$Image = "",
+    [string]$SkuDef = "",
+    [string]$ReplayDir = "",
+    [string]$Replay = "",
+    [string]$OutDir = ""
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "common.ps1")
+$OutDir = Get-FlabRunDirectory $OutDir "build\bisect"
+
 $lab       = Split-Path $PSScriptRoot -Parent
-$build     = Join-Path $lab "build"
+$build = Get-FlabBuildDirectory
 $flctl     = Join-Path $build "flctl.exe"
-$gameRoot  = "C:\Users\Mithlan\Documents\Tencent Files\873194676\Red Alert 3\Red Alert 3"
-$gameExe   = Join-Path $gameRoot "Data\RA3_1.12.game"
-$skudef    = Join-Path $gameRoot "RA3_chinese_t_1.12.SkuDef"
-$replayDir = Join-Path $env:USERPROFILE "Documents\Red Alert 3\Replays"
-$playName  = "_flab_play.RA3Replay"
+$flConfig = Get-FlabLaunchConfig -GameRoot $GameRoot -Image $Image -SkuDef $SkuDef -ReplayDir $ReplayDir
+$gameRoot = $flConfig.GameRoot
+$gameExe = $flConfig.Image
+$skudef = $flConfig.SkuDef
+$replayDir = $flConfig.ReplayDir
+$playName = New-FlabReplayName "bisect"
 # absolute path: passing the bare file name made the engine fail with "replay read error"
 # intermittently (worked once, failed twice). The known-good launcher passes the full path.
 $playPath  = Join-Path $replayDir $playName
-$outRoot   = Join-Path $build "bisect"
+$outRoot = $OutDir
 
 Add-Type -AssemblyName System.Drawing
 Add-Type @"
@@ -164,16 +174,13 @@ function Run-Config([string]$label, [int]$mask, [bool]$patched) {
 }
 
 # ---- replay basis ----
-$src = Get-ChildItem $replayDir -Filter "*.RA3Replay" |
-       Where-Object { $_.Name -notlike "_*" -and $_.Name -notlike "*ra3battle.net*" } |
-       Sort-Object Length -Descending | Select-Object -First 1
-if (-not $src) { throw "no usable replay" }
-Copy-Item $src.FullName $playPath -Force
+$src = Get-FlabReplay -Replay $Replay -ReplayDir $replayDir
+Copy-FlabReplay -Source $src.FullName -Destination $playPath
 $srcHash = (Get-FileHash $src.FullName -Algorithm SHA1).Hash
 $cpyHash = (Get-FileHash $playPath -Algorithm SHA1).Hash
 if ($srcHash -ne $cpyHash) { throw "replay copy differs from source - refusing to run on a bad basis" }
 Write-Host ("replay basis: {0} {1} bytes sha1 {2} (copy verified identical)" -f $src.Name, $src.Length, $cpyHash)
-if (Test-Path $outRoot) { Remove-Item $outRoot -Recurse -Force }
+# This run has its own output directory; prior captures cannot taint its comparison.
 
 $shotList = @($ShotFrames -split "," | ForEach-Object { [int]$_.Trim() })
 $results = @()

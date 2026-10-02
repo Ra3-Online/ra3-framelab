@@ -2,6 +2,8 @@
 //  ra3fps_gui.cpp -- Ra3FpsTest.exe
 //
 //  2026-09-17 / portable-GUI session (Claude)
+//  Historical RE filenames and section numbers below are archived research labels.
+//  The current implementation/reporting summary is in docs/TECHNICAL.md.
 //
 //  WHAT THIS IS
 //    A single self-contained Windows GUI tool that raises Red Alert 3's RENDER frame rate
@@ -10,16 +12,15 @@
 //    disappears the moment the game process exits.
 //
 //  WHY IT EXISTS
-//    The dev machine is 60 Hz, so it cannot show 90 fps. Deciding whether the 90 fps path
-//    is finished therefore has to happen on another machine, and that machine has nothing
-//    installed -- only the game itself. So this tool must be:
+//    Players need to measure the 90 fps path on their own hardware with only the game
+//    installed. So this tool must be:
 //      * ONE file.     The patcher DLL is embedded as an RCDATA resource and extracted to
 //                      %TEMP% at run time. There is no side file to lose or mis-place.
 //      * ZERO runtime dependencies. Built /MT (static CRT) and it imports only system DLLs
 //                      (kernel32/user32/gdi32/shell32/ole32/comctl32/advapi32), all of which
 //                      ship with Windows. Verified after every build with tools/re/check_deps.py.
 //      * NO baked-in paths. The game folder is picked by the user; our own scratch files go
-//                      to %TEMP%\Ra3FrameLab. Nothing knows about the machine it was built on.
+//                      to FLAB_RUNTIME_DIR, or %TEMP%\Ra3FrameLab when unset.
 //      * x86.          RA3 is a 32-bit process, and a 64-bit process cannot LoadLibrary into
 //                      it. A 32-bit exe runs fine on 64-bit Windows.
 //
@@ -30,10 +31,9 @@
 //    The box underneath is output only (a log you can screenshot), not a control.
 //
 //  WHY 30/60/90 AND NOT ANY NUMBER
-//    The engine's frame scheduler has exactly 6 interpolation stages per logic frame, and
-//    logic runs at 15 Hz. So the ratio r = render / logic must be a whole number in 1..6,
-//    i.e. the render rate must be a multiple of 15. 30/60/90 are r = 2/4/6. 120 would be
-//    r = 8 and the DLL rejects it with error 23 on purpose.
+//    The current FrameLab scheduler uses six existing interpolation stages per 15 Hz
+//    logic frame. Its supported ratio r = render / logic is a whole number in 1..6.
+//    30/60/90 are r = 2/4/6; 120 would be r = 8 and the DLL rejects it with error 23.
 //
 //  WHAT THE TOOL DOES AFTER PATCHING
 //    It keeps measuring the running game every ~10 s and prints render fps, logic fps, the
@@ -76,7 +76,7 @@
 
 // The proven-good change-group mask (see src/framelab.cpp FL_G_*).
 //   0xC1FF  = 0x1FF (patch set) | 0x4000 (animation ruler) | 0x8000 (clock fix)
-//             -- every measurement in RE-动画推进点-2026-09-17.md was taken with this.
+//             -- the archived animation study (2026-09-17) used this mask.
 //   0x2C1FF = the same plus FL_G_ANIMSTEP (0x20000, the P6b animation-time-step fix).
 //   0x2CFFF = the same plus FL_G_DERIVED2 (0xE00) -- SHIPPED since 2026-09-17 batch 7.
 //
@@ -229,7 +229,7 @@ static std::wstring g_selfTestDir;
 #define kSelfTestTimer 1
 static HANDLE    g_hLogFile   = INVALID_HANDLE_VALUE;
 
-static std::wstring g_tempDir;       // %TEMP%\Ra3FrameLab
+static std::wstring g_tempDir;       // FLAB_RUNTIME_DIR, or %TEMP%\Ra3FrameLab
 static std::wstring g_dllPath;       // where we extracted the embedded DLL this run
 static std::wstring g_dllModule;     // file name of g_dllPath = the module name to look up
 static int          g_dllSeq  = 0;
@@ -355,6 +355,39 @@ static std::wstring Join(const std::wstring& a, const wchar_t* b) {
     r += L"\\";
     r += b;
     return r;
+}
+
+// An optional wide-character override keeps portable runs and logs on a chosen drive.
+// Resolve relative paths against the working directory and create missing parents.
+static bool InitRuntimeDir() {
+    if (!g_tempDir.empty()) return DirExistsW(g_tempDir);
+    std::wstring path;
+    DWORD n = GetEnvironmentVariableW(L"FLAB_RUNTIME_DIR", NULL, 0);
+    if (n) {
+        std::vector<wchar_t> value(n);
+        const DWORD read = GetEnvironmentVariableW(L"FLAB_RUNTIME_DIR", &value[0], n);
+        if (!read || read >= n) return false;
+        path.assign(&value[0], read);
+    } else {
+        n = GetTempPathW(0, NULL);
+        if (!n) return false;
+        std::vector<wchar_t> value(n + 1);
+        const DWORD read = GetTempPathW((DWORD)value.size(), &value[0]);
+        if (!read || read >= value.size()) return false;
+        path = Join(std::wstring(&value[0], read), L"Ra3FrameLab");
+    }
+    n = GetFullPathNameW(path.c_str(), 0, NULL, NULL);
+    if (!n) return false;
+    std::vector<wchar_t> full(n + 1);
+    const DWORD read = GetFullPathNameW(path.c_str(), (DWORD)full.size(), &full[0], NULL);
+    if (!read || read >= full.size()) return false;
+    path = TrimSlash(std::wstring(&full[0], read));
+    const int rc = SHCreateDirectoryExW(NULL, path.c_str(), NULL);
+    if (rc != ERROR_SUCCESS && rc != ERROR_ALREADY_EXISTS && rc != ERROR_FILE_EXISTS)
+        return false;
+    if (!DirExistsW(path)) return false;
+    g_tempDir = path;
+    return true;
 }
 
 static std::wstring Quote(const std::wstring& s) {
@@ -506,8 +539,7 @@ static void ListProcesses(std::vector<ProcEntry>& out) {
 }
 
 // "A game is running" = a process whose name ends in .game (ra3_1.12.game), or the launcher.
-// We check BEFORE launching so we never inject into a session somebody else started -- on the
-// dev box several agents share this game, and that rule is written down in HANDOFF.md.
+// Check before launching so an existing game session is never selected for injection.
 static bool GameRunning(std::wstring& which) {
     std::vector<ProcEntry> ps;
     ListProcesses(ps);
@@ -650,12 +682,7 @@ static bool ExtractDll(std::wstring& err) {
     const void* data = hg ? LockResource(hg) : NULL;
     if (!size || !data) { err = L"内嵌 DLL 资源读取失败"; return false; }
 
-    wchar_t tmp[MAX_PATH];
-    DWORD n = GetTempPathW(MAX_PATH, tmp);
-    if (!n || n >= MAX_PATH) { err = L"取不到临时目录"; return false; }
-    g_tempDir = TrimSlash(tmp);
-    g_tempDir += L"\\Ra3FrameLab";
-    CreateDirectoryW(g_tempDir.c_str(), NULL);
+    if (!InitRuntimeDir()) { err = L"无法创建运行目录（FLAB_RUNTIME_DIR 或临时目录）"; return false; }
     SweepStaleTempDlls();   // keep the folder from growing one 144 KB DLL per run
 
     wchar_t name[64];
@@ -763,7 +790,7 @@ static void BringGameToFront(DWORD pid, DWORD timeoutMs) {
 // ACTUAL render rate (logic = render / r), so choosing a target the panel cannot show makes
 // the entire game -- simulation and animation together -- run in slow motion instead of just
 // dropping frames. Knowing the panel's rate up front turns a confusing result into an obvious
-// one. See HANDOFF.md section 12.
+// one. This was recorded in archived HANDOFF section 12; current context: docs/TECHNICAL.md.
 static DWORD DisplayHz() {
     DEVMODEW dm;
     ZeroMemory(&dm, sizeof dm);
@@ -1677,12 +1704,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 // ───────────────────────────── entry point ─────────────────────────────
 
 static void OpenLogFile() {
-    wchar_t tmp[MAX_PATH];
-    DWORD n = GetTempPathW(MAX_PATH, tmp);
-    if (!n || n >= MAX_PATH) return;
-    g_tempDir = TrimSlash(tmp);
-    g_tempDir += L"\\Ra3FrameLab";
-    CreateDirectoryW(g_tempDir.c_str(), NULL);
+    if (!InitRuntimeDir()) return;
 
     SYSTEMTIME st;
     GetLocalTime(&st);

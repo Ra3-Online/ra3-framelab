@@ -3,7 +3,7 @@
 # 2026-09-17 动画定位会话新增。为什么要它:
 #   Hex-Rays 对 __thiscall 会**丢掉 ECX**(把 this 隐式化),于是转储里出现
 #   `sub_99BE00(0)` 这种"看不见 this"的调用。要判断"哪个对象被读了",
-#   只能回汇编看 ECX 是从哪儿来的。capstone 在本机隔离 venv 里已有(5.0.7)。
+#   只能回汇编看 ECX 是从哪儿来的。需要安装 capstone(Python 3: python -m pip install capstone)。
 #
 # 用法:
 #   disasm.py <hexVA> [nbytes]          反汇编一段(默认 200 字节)
@@ -19,11 +19,11 @@
 #
 # 注意:capstone 的 32 位模式不吃 "imagebase 0x400000 即 VA" 这套,我们直接把 VA 当
 # 地址喂给它,和 IDA 的显示保持一致 —— 因为转储里所有地址就是 VA(见交接文档)。
-import io, os, re, struct, sys
+import hashlib, io, os, re, struct, sys
+from local_config import build_directory, image_path, ida_dump_path, take_input_options
 
-IMAGE = r"G:\IDA\RA3_1.12.game"
-DUMP  = r"G:\IDA\RA3_1.12.game.c"
-CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_symcache.txt")
+IMAGE = None
+DUMP = None
 
 DEF = re.compile(r"^//----- \(00([0-9A-F]+)\) (.*?) -----")
 # 转储里的全局名: dword_CAF9D4 / byte_CE2F5B / flt_XXXX / off_XXXX / unk_XXXX / word_XXXX
@@ -33,11 +33,19 @@ GLOB = re.compile(r"\b(dword|byte|word|flt|dbl|off|unk|qword|stru)_([0-9A-F]{5,8
 # ---------- 符号表 ----------
 def load_symbols():
     """返回 (funcs, globs)。funcs: {va: name};globs: {va: name}。带磁盘缓存。"""
-    if os.path.exists(CACHE):
+    if DUMP is None:
+        return {}, {}
+    stat = DUMP.stat()
+    key = hashlib.sha256((str(DUMP) + str(stat.st_size) + str(stat.st_mtime_ns)).encode("utf-8")).hexdigest()[:16]
+    cache_dir = build_directory() / "re"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache = cache_dir / ("symbols-" + key + ".txt")
+    if cache.exists():
         funcs, globs = {}, {}
-        for line in io.open(CACHE, "r", encoding="utf-8"):
-            kind, va, name = line.rstrip("\n").split("\t")
-            (funcs if kind == "f" else globs)[int(va, 16)] = name
+        with io.open(cache, "r", encoding="utf-8") as cached:
+            for line in cached:
+                kind, va, name = line.rstrip("\n").split("\t")
+                (funcs if kind == "f" else globs)[int(va, 16)] = name
         return funcs, globs
     funcs, globs = {}, {}
     with io.open(DUMP, "r", encoding="utf-8", errors="replace") as f:
@@ -49,7 +57,7 @@ def load_symbols():
                 va = int(hexs, 16)
                 if va >= 0x400000:
                     globs.setdefault(va, "%s_%s" % (kind, hexs))
-    with io.open(CACHE, "w", encoding="utf-8") as f:
+    with io.open(cache, "w", encoding="utf-8") as f:
         for va, n in funcs.items():
             f.write("f\t%08X\t%s\n" % (va, n))
         for va, n in globs.items():
@@ -139,10 +147,13 @@ def disasm(va, nbytes, img, funcs, globs, stop_at_ret=False):
 
 
 def main():
-    args = sys.argv[1:]
+    global IMAGE, DUMP
+    args, options = take_input_options(sys.argv[1:])
     if not args:
-        print(__doc__ or "usage: disasm.py <hexVA> [nbytes] [--to-ret|--fn]")
+        print("usage: disasm.py <hexVA> [nbytes] [--to-ret|--fn] [--image PATH] [--ida-dump PATH]")
         return
+    IMAGE = image_path(options.get("--image"))
+    DUMP = ida_dump_path(options.get("--ida-dump"), required="--fn" in args)
     va = int(args[0], 16)
     mode = "n"
     nbytes = 200
@@ -169,4 +180,5 @@ def main():
     disasm(va, nbytes, img, funcs, globs, stop_at_ret=(mode == "ret"))
 
 
-main()
+if __name__ == "__main__":
+    main()

@@ -1,7 +1,7 @@
 # re/pefind.py -- 在原始 .game 二进制里找「谁引用了某个 VA」
 # 2026-09-17 会话:动画问题定位。反编译转储里看不到 vtable 引用,只能回二进制扫指针。
 # 用法: pefind.py <image> <hexVA> [maxhits]
-#   例: pefind.py "G:\IDA\RA3_1.12.game" 0x005B81A0
+#   例: pefind.py "path/to/ra3_1.12.game" 0x005B81A0
 import struct, sys
 
 def sections(data):

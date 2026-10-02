@@ -1,6 +1,6 @@
 # desync_capture.ps1 -- when the sim "stalls", LOOK at the screen instead of guessing.
 #
-# 2026-09-18 (batch 10) / session 68ee9b9d (Claude)
+# 2026-09-18 / developer probe
 # NOTE: keep this file ASCII-only (PowerShell 5.1 misreads BOM-less UTF-8 Chinese).
 #
 # WHY THIS EXISTS (the ruler is suspect -- suspect it first):
@@ -29,10 +29,18 @@ param(
     [int]$Groups = 0x2CFFF,
     [int]$StallAfter = 2,        # consecutive stalled reads before we call it and shoot
     [int]$EarlyFrame = 900,      # also take one reference shot once the sim passes this frame
-    [int]$WaitMinutes = 30
+    [int]$WaitMinutes = 30,
+    [string]$GameRoot = "",
+    [string]$Image = "",
+    [string]$SkuDef = "",
+    [string]$ReplayDir = "",
+    [string]$Replay = "",
+    [string]$OutDir = ""
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "common.ps1")
+$OutDir = Get-FlabRunDirectory $OutDir "build\desync_capture"
 
 # ------ sandbox compatibility: restore PATHEXT (same reason as determinism.ps1) ------
 # The sandbox narrows PATHEXT to ".CPL", which makes PowerShell treat every .exe as a
@@ -43,15 +51,16 @@ if ($env:PATHEXT -notmatch '\.EXE') {
 }
 
 $lab       = Split-Path $PSScriptRoot -Parent
-$build     = Join-Path $lab "build"
+$build = Get-FlabBuildDirectory
 $flctl     = Join-Path $build "flctl.exe"
-$gameRoot  = "C:\Users\Mithlan\Documents\Tencent Files\873194676\Red Alert 3\Red Alert 3"
-$gameExe   = Join-Path $gameRoot "Data\RA3_1.12.game"
-$skudef    = Join-Path $gameRoot "RA3_chinese_t_1.12.SkuDef"
-$replayDir = Join-Path $env:USERPROFILE "Documents\Red Alert 3\Replays"
+$flConfig = Get-FlabLaunchConfig -GameRoot $GameRoot -Image $Image -SkuDef $SkuDef -ReplayDir $ReplayDir
+$gameRoot = $flConfig.GameRoot
+$gameExe = $flConfig.Image
+$skudef = $flConfig.SkuDef
+$replayDir = $flConfig.ReplayDir
 # distinct name: other sessions use _simre_play / _racol_play, bisect uses _flab_play
-$playPath  = Join-Path $replayDir "_flabcap_play.RA3Replay"
-$outRoot   = Join-Path $build "desync_capture"
+$playPath = Join-Path $replayDir (New-FlabReplayName "desync_capture")
+$outRoot = $OutDir
 
 Add-Type -AssemblyName System.Drawing
 Add-Type @"
@@ -127,11 +136,9 @@ function Wait-GameFree([int]$minutes) {
     return $false
 }
 
-# ---- replay basis: the largest non-underscore replay, same rule as determinism.ps1 ----
-$src = Get-ChildItem $replayDir -Filter "*.RA3Replay" |
-       Where-Object { $_.Name -notlike "_*" -and $_.Name -notlike "*ra3battle.net*" } |
-       Sort-Object Length -Descending | Select-Object -First 1
-Copy-Item $src.FullName $playPath -Force
+# Explicit -Replay selects the test basis; no personal replay is chosen implicitly.
+$src = Get-FlabReplay -Replay $Replay -ReplayDir $replayDir
+Copy-FlabReplay -Source $src.FullName -Destination $playPath
 if ((Get-FileHash $src.FullName -Algorithm SHA1).Hash -ne (Get-FileHash $playPath -Algorithm SHA1).Hash) {
     throw "replay copy differs from source"
 }

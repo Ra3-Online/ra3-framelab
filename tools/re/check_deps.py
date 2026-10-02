@@ -22,7 +22,7 @@ WHY THIS EXISTS
 
       3. An absolute path from the build machine leaked in.  The most common source is the
          linker's PDB reference, which bakes in something like
-         "G:\\Ra3 FrameLab\\build\\Ra3FpsTest.pdb". Harmless functionally, but the user's
+         an absolute build-directory path ending in "Ra3FpsTest.pdb". Harmless functionally, but the user's
          requirement was explicit: the tool must not carry this machine's paths.
 
     So all three are checked here, and any of them FAILS the build.
@@ -37,6 +37,7 @@ EXIT
 import os
 import struct
 import sys
+from pathlib import Path
 
 # Everything here ships with Windows itself. Anything else means a dependency.
 SYSTEM_DLLS = {
@@ -147,9 +148,9 @@ def main():
     # --- 4. no path from the build machine ----------------------------------------------
     # Two tiers, because a hard FAIL has to be something that is unambiguously wrong:
     #
-    #   FAIL needles -- strings that can only come from THIS machine: the build root, a user
-    #     profile, the account name, or a linker debug reference.
-    #   WARN -- a generic "X:\..." scan. It is a warning and not a failure on purpose: the
+    #   FAIL needles -- the current checkout path or a linker debug reference.
+    #     User-profile paths are also rejected regardless of drive letter/account name.
+    #   WARN -- a generic drive-letter path scan. It is a warning and not a failure on purpose: the
     #     embedded DLL is a blob of machine code, and machine code can accidentally contain
     #     the byte pattern of a drive letter. Reporting the offsets lets a human judge.
     #
@@ -157,13 +158,18 @@ def main():
     # in the version resource (which Windows stores as UTF-16) and is supposed to be there --
     # an earlier version of this check flagged it and that was a false positive.
     failures_local = []
-    needles = [b"G:\\Ra3", b"C:\\Users", b"Mithlan", b".pdb"]
+    needles = [str(Path(__file__).resolve().parents[2]), str(Path(__file__).resolve().parents[2]).replace("\\", "/"), ".pdb"]
     for n in needles:
-        if n in exe:
-            failures_local.append(n.decode("latin1"))
-        wide = n.decode("latin1").encode("utf-16-le")
+        if n.encode("utf-8") in exe:
+            failures_local.append(n)
+        wide = n.encode("utf-16-le")
         if wide in exe:
-            failures_local.append(n.decode("latin1") + " (utf-16)")
+            failures_local.append(n + " (utf-16)")
+    import re
+    if re.search(rb"[A-Za-z]:[\\/]Users[\\/]", exe, re.I):
+        failures_local.append("user-profile path (ascii)")
+    if re.search(r"[A-Za-z]:[\\/]Users[\\/]", exe.decode("utf-16-le", errors="ignore"), re.I):
+        failures_local.append("user-profile path (utf-16)")
     if failures_local:
         print("FAIL build-machine path leaked into the exe: %s" % ", ".join(sorted(set(failures_local))))
         print("     fix: link without /DEBUG (no PDB reference), or link with /Brepro")

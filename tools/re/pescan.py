@@ -7,7 +7,7 @@
 #   - `--fn` 只列函数名去重,`--all` 列全部命中。
 #
 # 用法:
-#   pescan.py "G:\IDA\RA3_1.12.game" "D99?B0000000"          # fst/fstp dword [reg+0xB0]
+#   pescan.py "path/to/ra3_1.12.game" "D99?B0000000"          # fst/fstp dword [reg+0xB0]
 #   pescan.py <image> "F30F11??B0000000" --fn               # movss [reg+0xB0],xmm
 #
 # 例(本会话用到的):找"谁写动画对象 +0xB0(当前帧)"。

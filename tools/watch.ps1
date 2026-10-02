@@ -1,6 +1,6 @@
 # watch.ps1 -- launch the replay with the patch on and LEAVE IT RUNNING for a human to watch.
 #
-# 2026-09-17 / session 68ee9b9d (Claude)
+# 2026-09-17 / developer probe
 # NOTE: keep this file ASCII-only (PowerShell 5.1 misreads BOM-less UTF-8 Chinese).
 #
 # Why this is separate from bisect.ps1: that one measures and then kills the game. This one hands
@@ -13,29 +13,34 @@ param(
     [int]$Fps = 90,
     [int]$Width = 1024,
     [int]$Height = 576,
-    [int]$Groups = 0        # 0 = the default set (everything except the three derived globals)
+    [int]$Groups = 0, # 0 = the default set (everything except the three derived globals)
+    [string]$GameRoot = "",
+    [string]$Image = "",
+    [string]$SkuDef = "",
+    [string]$ReplayDir = "",
+    [string]$Replay = ""
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "common.ps1")
+
 $lab       = Split-Path $PSScriptRoot -Parent
-$build     = Join-Path $lab "build"
+$build = Get-FlabBuildDirectory
 $flctl     = Join-Path $build "flctl.exe"
-$gameRoot  = "C:\Users\Mithlan\Documents\Tencent Files\873194676\Red Alert 3\Red Alert 3"
-$gameExe   = Join-Path $gameRoot "Data\RA3_1.12.game"
-$skudef    = Join-Path $gameRoot "RA3_chinese_t_1.12.SkuDef"
-$replayDir = Join-Path $env:USERPROFILE "Documents\Red Alert 3\Replays"
-$playName  = "_flab_play.RA3Replay"
+$flConfig = Get-FlabLaunchConfig -GameRoot $GameRoot -Image $Image -SkuDef $SkuDef -ReplayDir $ReplayDir
+$gameRoot = $flConfig.GameRoot
+$gameExe = $flConfig.Image
+$skudef = $flConfig.SkuDef
+$replayDir = $flConfig.ReplayDir
+$playName = New-FlabReplayName "watch"
 $playPath  = Join-Path $replayDir $playName
 
 if (Get-Process -Name "ra3_1.12.game" -ErrorAction SilentlyContinue) {
     throw "a game instance is already running - not ours, refusing to start a second one (RA3 is single-instance)"
 }
 
-$src = Get-ChildItem $replayDir -Filter "*.RA3Replay" |
-       Where-Object { $_.Name -notlike "_*" -and $_.Name -notlike "*ra3battle.net*" } |
-       Sort-Object Length -Descending | Select-Object -First 1
-if (-not $src) { throw "no usable replay found" }
-Copy-Item $src.FullName $playPath -Force
+$src = Get-FlabReplay -Replay $Replay -ReplayDir $replayDir
+Copy-FlabReplay -Source $src.FullName -Destination $playPath
 if ((Get-FileHash $src.FullName -Algorithm SHA1).Hash -ne (Get-FileHash $playPath -Algorithm SHA1).Hash) {
     throw "replay copy differs from source - refusing to run on a bad basis"
 }

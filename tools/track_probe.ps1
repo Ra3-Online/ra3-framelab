@@ -73,29 +73,37 @@ param(
     #   switched on and dumped almost immediately -- the report had only 3 rows and
     #   ring_analyze.py refused it (it needs at least 8 rows).
     [int]$RecordSeconds = 20,
-    # * -Replay <path-or-name>: use this replay instead of auto-picking the largest one.
-    #   The user recorded a dedicated test replay ("90 FPS Test.RA3Replay", 47 KB) that
-    #   contains three vehicles they specifically identified as jittering -- auto-picking
-    #   "largest" would grab the old 1.9 MB match replay instead and never see them.
+    # * -Replay <path-or-name>: explicitly select the test replay.
+    #   Use a replay containing the vehicles or effects you intend to measure.
     #   Accepts a full path or just a file name (resolved against the replay directory).
     [string]$Replay = "",
-    [string]$OutDir = "G:\Ra3 FrameLab\build\logs"
+    [string]$OutDir = "",
+    [string]$GameRoot = "",
+    [string]$Image = "",
+    [string]$SkuDef = "",
+    [string]$ReplayDir = "",
+    [string]$Python = ""
 )
+
+$ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "common.ps1")
+$OutDir = Get-FlabOutputPath $OutDir "build\logs" -Directory
 
 $env:PATHEXT = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.CPL"
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
-$lab       = "G:\Ra3 FrameLab"
-$build     = Join-Path $lab "build"
+$lab = Get-FlabRoot
+$build = Get-FlabBuildDirectory
 $flctl     = Join-Path $build "flctl.exe"
 $analyzer  = Join-Path $lab "tools\re\ring_analyze.py"
-$python    = "C:\Users\Mithlan\.workbuddy-ai\binaries\python\envs\default\Scripts\python.exe"
-$gameRoot  = "C:\Users\Mithlan\Documents\Tencent Files\873194676\Red Alert 3\Red Alert 3"
-$gameExe   = Join-Path $gameRoot "Data\RA3_1.12.game"
-$skudef    = Join-Path $gameRoot "RA3_chinese_t_1.12.SkuDef"
-$replayDir = Join-Path $env:USERPROFILE "Documents\Red Alert 3\Replays"
-$playPath  = Join-Path $replayDir "_flabtrk_play.RA3Replay"
+$pythonRuntime = Get-FlabPython $Python
+$flConfig = Get-FlabLaunchConfig -GameRoot $GameRoot -Image $Image -SkuDef $SkuDef -ReplayDir $ReplayDir
+$gameRoot = $flConfig.GameRoot
+$gameExe = $flConfig.Image
+$skudef = $flConfig.SkuDef
+$replayDir = $flConfig.ReplayDir
+$playPath = Join-Path $replayDir (New-FlabReplayName "track_probe")
 
 if (-not (Test-Path $flctl)) { Write-Host "missing $flctl -- build first"; exit 2 }
 
@@ -105,22 +113,8 @@ if (Get-Process -Name "ra3_1.12.game" -ErrorAction SilentlyContinue) {
     exit 3
 }
 
-if ($Replay -ne "") {
-    # -Replay given: resolve it (full path, or a bare name inside the replay directory).
-    if (Test-Path $Replay) { $src = Get-Item $Replay }
-    else {
-        $src = Get-ChildItem $replayDir -Filter "*.RA3Replay" |
-               Where-Object { $_.Name -eq $Replay -or $_.BaseName -eq $Replay } |
-               Select-Object -First 1
-    }
-    if (-not $src) { Write-Host ("replay not found: {0}" -f $Replay); exit 2 }
-} else {
-    $src = Get-ChildItem $replayDir -Filter "*.RA3Replay" |
-           Where-Object { $_.Name -notlike "_*" -and $_.Name -notlike "*ra3battle.net*" } |
-           Sort-Object Length -Descending | Select-Object -First 1
-}
-if (-not $src) { Write-Host "no usable replay found in $replayDir"; exit 2 }
-Copy-Item $src.FullName $playPath -Force
+$src = Get-FlabReplay -Replay $Replay -ReplayDir $replayDir
+Copy-FlabReplay -Source $src.FullName -Destination $playPath
 Write-Host ("replay: {0}  ({1:N0} bytes)" -f $src.Name, $src.Length)
 
 function Invoke-FlctlRaw([string]$cmd, [string]$arg, [int]$targetPid) {
@@ -459,7 +453,7 @@ try {
 
     $stamp = Get-Date -Format "HHmmss"
     $txt = Join-Path $OutDir ("_track_{0}_{1}.txt" -f $best, $stamp)
-    & $python $analyzer $report --out $txt 2>&1 | Out-String | Write-Host
+    Invoke-FlabPython $pythonRuntime $analyzer $report --out $txt 2>&1 | Out-String | Write-Host
     Write-Host ("analysis -> {0}" -f $txt)
 }
 finally {

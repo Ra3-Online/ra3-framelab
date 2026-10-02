@@ -1,6 +1,6 @@
 # compare_shots.py -- assemble the bisect screenshots into one strip per logic frame.
 #
-# 2026-09-16 / session 68ee9b9d (Claude)
+# 2026-09-16 / developer probe
 # Why: the bisect captures every config at the SAME absolute logic frames. Looking at 25 separate
 # PNGs is both expensive and bad for judging -- differences only pop when the same moment from
 # every config sits side by side. One strip per logic frame, configs left to right in run order.
@@ -9,10 +9,20 @@
 import os
 import re
 import sys
+from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-ROOT = sys.argv[1] if len(sys.argv) > 1 else r"G:\Ra3 FrameLab\build\bisect"
+def default_bisect_directory():
+    repo = Path(__file__).resolve().parents[1]
+    build = Path(os.environ.get("FLAB_BUILD_DIR") or repo / "build")
+    root = (build if build.is_absolute() else repo / build) / "bisect"
+    # New runs get their own directory. Existing direct-layout captures still work.
+    runs = [p for p in root.iterdir() if p.is_dir() and (p / "baseline-30").is_dir()] if root.is_dir() else []
+    return str(max(runs, key=lambda p: p.name) if runs else root)
+
+
+ROOT = sys.argv[1] if len(sys.argv) > 1 else default_bisect_directory()
 OUT = sys.argv[2] if len(sys.argv) > 2 else os.path.join(ROOT, "_compare")
 
 ORDER = ["baseline-30", "g101", "g103", "g183", "g1FF"]

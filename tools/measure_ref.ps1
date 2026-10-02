@@ -1,6 +1,6 @@
 # measure_ref.ps1 -- measure the ACTUAL render rate of a reference (already-patched) game binary.
 #
-# 2026-09-16 / session 68ee9b9d (Claude)
+# 2026-09-16 / developer probe
 # NOTE: keep this file ASCII-only (PowerShell 5.1 misreads BOM-less UTF-8 Chinese).
 #
 # Why: the community "60 FPS patch" claims 60 fps in its README. Nobody here has measured it.
@@ -16,28 +16,32 @@
 #     advance) purely to count frames, and its fraction result is bit-identical to retail
 #   - never touches a game instance it did not start itself
 param(
-    [string]$Exe = "G:\参考源码\红警3平台增强\red-alert-3-60fps-mod-main\Data\60FPS\ra3_1.12.game",
+    [string]$Exe = "",
     [int]$SampleSeconds = 10,
-    [int]$WaitMinutes = 15
+    [int]$WaitMinutes = 15,
+    [string]$GameRoot = "",
+    [string]$Image = "",
+    [string]$SkuDef = "",
+    [string]$ReplayDir = "",
+    [string]$Replay = ""
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "common.ps1")
+
 $lab       = Split-Path $PSScriptRoot -Parent
-$build     = Join-Path $lab "build"
+$build = Get-FlabBuildDirectory
 $flctl     = Join-Path $build "flctl.exe"
-$gameRoot  = "C:\Users\Mithlan\Documents\Tencent Files\873194676\Red Alert 3\Red Alert 3"
-$skudef    = Join-Path $gameRoot "RA3_chinese_t_1.12.SkuDef"
-$replayDir = Join-Path $env:USERPROFILE "Documents\Red Alert 3\Replays"
-$playName  = "_flab_play.RA3Replay"
+$flConfig = Get-FlabLaunchConfig -GameRoot $GameRoot -Image $Image -SkuDef $SkuDef -ReplayDir $ReplayDir
+$gameRoot = $flConfig.GameRoot
+$skudef = $flConfig.SkuDef
+$replayDir = $flConfig.ReplayDir
+$playName = New-FlabReplayName "measure_ref"
 $playPath  = Join-Path $replayDir $playName
 
-if (-not (Test-Path $Exe)) { throw "missing reference binary: $Exe" }
-if (-not (Test-Path $playPath)) {
-    $src = Get-ChildItem $replayDir -Filter "*.RA3Replay" |
-           Where-Object { $_.Name -notlike "_*" -and $_.Name -notlike "*ra3battle.net*" } |
-           Sort-Object Length -Descending | Select-Object -First 1
-    Copy-Item $src.FullName $playPath -Force
-}
+$Exe = Get-FlabExistingFile $Exe "Reference executable (-Exe)"
+$src = Get-FlabReplay -Replay $Replay -ReplayDir $replayDir
+Copy-FlabReplay -Source $src.FullName -Destination $playPath
 
 function Invoke-Flctl([string]$cmd, [string]$arg, [int]$targetPid) {
     if ($arg -eq "" -or $null -eq $arg) { $arg = "0" }
@@ -52,6 +56,8 @@ while ((Get-Date) -lt $deadline -and (Get-Process -Name "ra3_1.12.game" -ErrorAc
     Write-Host "waiting for the game to be free (an instance we did not start is running)"
     Start-Sleep -Seconds 10
 }
+
+if (Get-Process -Name "ra3_1.12.game" -ErrorAction SilentlyContinue) { throw "Game still running after -WaitMinutes; refusing to launch." }
 
 Write-Host ("reference binary: {0}" -f $Exe)
 Write-Host ("  sha1 {0}  {1} bytes" -f (Get-FileHash $Exe -Algorithm SHA1).Hash, (Get-Item $Exe).Length)

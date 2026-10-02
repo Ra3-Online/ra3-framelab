@@ -26,12 +26,20 @@ param(
     [int]$Settle = 30,
     [int]$Width = 1024,
     [int]$Height = 576,
-    # * -Replay: use this replay instead of auto-picking the largest one.
+    # * -Replay: explicitly select the test replay path or name.
     #   Needed to sample animation scores from the user's dedicated test replay
-    #   ("90 FPS Test.RA3Replay") while vehicles are actually driving.
+    #   ("test.RA3Replay") while vehicles are actually driving.
     [string]$Replay = "",
-    [string]$OutDir = "G:\Ra3 FrameLab\build\logs"
+    [string]$OutDir = "",
+    [string]$GameRoot = "",
+    [string]$Image = "",
+    [string]$SkuDef = "",
+    [string]$ReplayDir = ""
 )
+
+$ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "common.ps1")
+$OutDir = Get-FlabOutputPath $OutDir "build\logs" -Directory
 
 # The sandbox narrows PATHEXT to ".CPL", which makes every .exe look like a document and
 # refuses to run it inside a pipeline. Restore it before calling anything.
@@ -44,16 +52,17 @@ $env:PATHEXT = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.CPL"
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
-$lab       = "G:\Ra3 FrameLab"
-$build     = Join-Path $lab "build"
+$lab = Get-FlabRoot
+$build = Get-FlabBuildDirectory
 $flctl     = Join-Path $build "flctl.exe"
-$gameRoot  = "C:\Users\Mithlan\Documents\Tencent Files\873194676\Red Alert 3\Red Alert 3"
-$gameExe   = Join-Path $gameRoot "Data\RA3_1.12.game"
-$skudef    = Join-Path $gameRoot "RA3_chinese_t_1.12.SkuDef"
-$replayDir = Join-Path $env:USERPROFILE "Documents\Red Alert 3\Replays"
+$flConfig = Get-FlabLaunchConfig -GameRoot $GameRoot -Image $Image -SkuDef $SkuDef -ReplayDir $ReplayDir
+$gameRoot = $flConfig.GameRoot
+$gameExe = $flConfig.Image
+$skudef = $flConfig.SkuDef
+$replayDir = $flConfig.ReplayDir
 # Our own copy name -- other sessions use _flab_play / _flabre_play / _raco_play / _simre_play
 # / _flabjit_play, and clobbering theirs would corrupt their runs.
-$playPath  = Join-Path $replayDir "_flabanim_play.RA3Replay"
+$playPath = Join-Path $replayDir (New-FlabReplayName "animslots_probe")
 
 if (-not (Test-Path $flctl)) { Write-Host "missing $flctl -- build first"; exit 2 }
 
@@ -65,21 +74,8 @@ if (Get-Process -Name "ra3_1.12.game" -ErrorAction SilentlyContinue) {
     exit 3
 }
 
-if ($Replay -ne "") {
-    if (Test-Path $Replay) { $src = Get-Item $Replay }
-    else {
-        $src = Get-ChildItem $replayDir -Filter "*.RA3Replay" |
-               Where-Object { $_.Name -eq $Replay -or $_.BaseName -eq $Replay } |
-               Select-Object -First 1
-    }
-    if (-not $src) { Write-Host ("replay not found: {0}" -f $Replay); exit 2 }
-} else {
-    $src = Get-ChildItem $replayDir -Filter "*.RA3Replay" |
-           Where-Object { $_.Name -notlike "_*" -and $_.Name -notlike "*ra3battle.net*" } |
-           Sort-Object Length -Descending | Select-Object -First 1
-}
-if (-not $src) { Write-Host "no usable replay found in $replayDir"; exit 2 }
-Copy-Item $src.FullName $playPath -Force
+$src = Get-FlabReplay -Replay $Replay -ReplayDir $replayDir
+Copy-FlabReplay -Source $src.FullName -Destination $playPath
 Write-Host ("replay: {0}  ({1:N0} bytes)" -f $src.Name, $src.Length)
 
 # Raw call: we need the FULL stdout (the slot table), not just the RESULT= line.

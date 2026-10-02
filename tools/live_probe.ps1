@@ -19,12 +19,15 @@ param(
     [Parameter(Mandatory=$true)][int]$GamePid,
     [int]$Window = 10,           # seconds for the render-frame window
     [int]$ClockFrames = 60,      # logic frames for the clock criterion
-    [string]$Out = "G:\Ra3 FrameLab\build\logs\_live.txt"
+    [string]$Out = ""
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "common.ps1")
+$Out = Get-FlabOutputPath $Out "build\logs\_live.txt"
+
 $lab    = Split-Path $PSScriptRoot -Parent
-$build  = Join-Path $lab "build"
+$build = Get-FlabBuildDirectory
 $flctl  = Join-Path $build "flctl.exe"
 $logDir = Join-Path $build "logs"
 
@@ -34,7 +37,7 @@ function Flush() { $lines | Out-File -Encoding utf8 $Out }
 
 Log ("=== live_probe  pid={0} window={1}s clockFrames={2} === " -f $GamePid, $Window, $ClockFrames)
 
-$game = Get-Process -Id $GamePid -ErrorAction SilentlyContinue
+$game = Assert-FlabGameProcess $GamePid
 if (-not $game) { Log "no process with that id"; Flush; exit 2 }
 Log ("process: {0}" -f $game.ProcessName)
 

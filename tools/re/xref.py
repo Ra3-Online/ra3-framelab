@@ -4,7 +4,7 @@
 # 2026-09-17 动画定位会话新增。起因是一次**真错**:
 #   我扫 `A3 88 13 CE 00`(`mov [0x00CE1388],eax`)找时钟的写入点,得到 2 处,
 #   但用 `| head -10` 截断输出只看见第一行,于是写下「时钟只有一个写入点」,
-#   并据此只改了一条分支 —— 留下约 5.6% 的偏快(量化见 RE-动画推进点 §11.1)。
+#   并据此只改了一条分支 —— 留下约 5.6% 的偏快(量化记录原件已另行归档；机制摘要见 docs/TECHNICAL.md)。
 #   pescan.py 只能按**你猜的那种编码形式**扫;猜漏一种形式(比如
 #   `mov edx,[addr]` 是 `8B 15` 而不是 `A1`)就永远找不到。
 #
@@ -23,7 +23,7 @@
 #
 # 用法:
 #   xref.py <image> <hexVA> [hexVA...]
-#   xref.py "G:/IDA/RA3_1.12.game" 0x00CE1388 0x00CE176C
+#   xref.py "path/to/ra3_1.12.game" 0x00CE1388 0x00CE176C
 
 import struct
 import sys
@@ -31,7 +31,7 @@ import sys
 try:
     from capstone import Cs, CS_ARCH_X86, CS_MODE_32
 except ImportError:
-    sys.exit("需要 capstone(用 venv: binaries/python/envs/default/Scripts/python.exe)")
+    sys.exit("需要 capstone: python -m pip install capstone")
 
 
 def load(path):

@@ -1,9 +1,9 @@
 // framelab.cpp — Ra3FrameLab:红警3 客户端帧率改造(运行时内存补丁,可开可关,带完整日志)
 //
-// 日期  :2026-09-16   会话:平台联机会话 68ee9b9d(Claude)   目录:G:\Ra3 FrameLab(与其它成果隔离)
+// 初始实现:2026-09-16。受支持构建与验证边界见 docs/TECHNICAL.md。
 // 为什么:社区 60 帧补丁只认它自带的 2012 构建主程序,且改法有缺陷(插值系数被引擎后续代码覆盖 ⇒ 顿挫)。
 //         我们自己做一份:认我们这份 2009 构建、特征码定位、失败整体回滚、可运行时开关、**出事能靠日志定位**。
-// 不做什么:不改游戏文件、不劫持同名 DLL、不自动安装、默认不进联机。见 HANDOFF.md 第 0 节。
+// 使用方式与已知运行时关闭 / 联机风险见 README.md；本段保留初始设计说明，实际补丁以 install() 为准。
 //
 // 改哪几处(全部运行时改内存,卸载时逐字节还原):
 //   P1 客户端帧率全局 30 → 目标帧率,并同步引擎由它派生的三个浮点量(帧数/毫秒、毫秒/帧、帧率浮点值)
@@ -26,7 +26,7 @@
 //      g_msPerFrame(= 1000 ÷ 目标帧率),并把 dword_CE176C 的两个写入者也隔离到
 //      我们自己的变量里(它另有 14 处读者,必须冻结)。
 //      ⚠ 反编译只显示其中一条分支;漏掉另一条会残留约 5.6% 偏快 —— 见 kSigClockAdvance2。
-//      见 FL_G_CLOCK 处的完整证据链与 RE-动画推进点-2026-09-17.md §11。
+//      见 FL_G_CLOCK 处的证据链；机制摘要见 docs/TECHNICAL.md 第 3、4 节。
 // 参考补丁还改了 sub_6027D0 里算系数的那段(我们叫 P3b),我们**故意不改**:那一处的结果在同一帧内会被 P3 覆盖。
 //   若 LIVE 观察到阶段步进过程中仍有顿挫,再补 P3b —— 改动越少风险越小。
 #define WIN32_LEAN_AND_MEAN
@@ -37,13 +37,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 
 #include "schedule.h"
 #include "sim_gate.h"      // 2026-09-28:相位边界门 / 迷雾可见性相位的纯逻辑(与 test_schedule 共用)
 #include "chassis_gate.h"   // 2026-09-21:车身外观 30 Hz 节拍门的纯逻辑(与离线自检共用)
 
 // ───────────────────────────── 版本与状态码 ─────────────────────────────
-#define FL_VERSION "0.2.0"
+#define FL_VERSION "0.2.1"
 
 enum FlStatus {
     FL_OK = 0,
@@ -66,7 +67,27 @@ enum FlStatus {
 namespace log {
 static CRITICAL_SECTION g_lock;
 static bool g_ready = false;
-static char g_path[MAX_PATH * 2] = {0};
+// Paths exposed by the diagnostic API are UTF-8; filesystem calls use UTF-16.
+static char g_path[MAX_PATH * 6] = {0};
+
+static bool wide_path(const char* path, wchar_t* out, int capacity) {
+    return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, out, capacity) > 0;
+}
+static HANDLE open_append(const char* path) {
+    wchar_t wide[MAX_PATH * 2];
+    if (!wide_path(path, wide, (int)(sizeof wide / sizeof *wide))) return INVALID_HANDLE_VALUE;
+    return CreateFileW(wide, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                       OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+}
+static void make_directory(const char* path) {
+    wchar_t wide[MAX_PATH * 2];
+    if (wide_path(path, wide, (int)(sizeof wide / sizeof *wide))) CreateDirectoryW(wide, NULL);
+}
+static bool file_exists(const char* path) {
+    wchar_t wide[MAX_PATH * 2];
+    return wide_path(path, wide, (int)(sizeof wide / sizeof *wide)) &&
+           GetFileAttributesW(wide) != INVALID_FILE_ATTRIBUTES;
+}
 
 static void timestamp(char* out, size_t n) {
     SYSTEMTIME st;
@@ -75,8 +96,7 @@ static void timestamp(char* out, size_t n) {
 }
 
 static void write_raw(const char* text) {
-    HANDLE h = CreateFileA(g_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE h = open_append(g_path);
     if (h != INVALID_HANDLE_VALUE) {
         DWORD written = 0;
         // ★新建文件先写 UTF-8 BOM:日志里有中文,没有 BOM 时记事本 / 部分工具会按 GBK 解码成乱码 ——
@@ -128,22 +148,24 @@ static void hex(const void* p, size_t n, char* out, size_t outN) {
 
 static void init(HMODULE self) {
     InitializeCriticalSection(&g_lock);
-    char dir[MAX_PATH] = {0};
-    GetModuleFileNameA(self, dir, MAX_PATH);
-    char* slash = strrchr(dir, '\\');
+    wchar_t dir[MAX_PATH * 2] = {0};
+    const DWORD dirLen = GetModuleFileNameW(self, dir, (DWORD)(sizeof dir / sizeof *dir));
+    if (!dirLen || dirLen >= sizeof dir / sizeof *dir) return;
+    wchar_t* slash = wcsrchr(dir, L'\\');
     if (slash) *slash = 0;
-    char envPath[MAX_PATH * 2] = {0};
-    if (GetEnvironmentVariableA("RA3FL_LOG", envPath, sizeof envPath) > 0) {
-        _snprintf_s(g_path, sizeof g_path, _TRUNCATE, "%s", envPath);
-    } else {
-        char logdir[MAX_PATH * 2];
-        _snprintf_s(logdir, sizeof logdir, _TRUNCATE, "%s\\logs", dir);
-        CreateDirectoryA(logdir, NULL);
+    wchar_t fullPath[MAX_PATH * 2] = {0};
+    const DWORD envLen = GetEnvironmentVariableW(L"RA3FL_LOG", fullPath, (DWORD)(sizeof fullPath / sizeof *fullPath));
+    if (envLen >= sizeof fullPath / sizeof *fullPath) return;
+    if (envLen == 0) {
+        wchar_t logdir[MAX_PATH * 2];
+        _snwprintf_s(logdir, sizeof logdir / sizeof *logdir, _TRUNCATE, L"%ls\\logs", dir);
+        CreateDirectoryW(logdir, NULL);
         SYSTEMTIME st;
         GetLocalTime(&st);
-        _snprintf_s(g_path, sizeof g_path, _TRUNCATE, "%s\\framelab-%04u%02u%02u-%lu.log",
-                    logdir, st.wYear, st.wMonth, st.wDay, GetCurrentProcessId());
+        _snwprintf_s(fullPath, sizeof fullPath / sizeof *fullPath, _TRUNCATE, L"%ls\\framelab-%04u%02u%02u-%lu.log",
+                     logdir, st.wYear, st.wMonth, st.wDay, GetCurrentProcessId());
     }
+    if (!WideCharToMultiByte(CP_UTF8, 0, fullPath, -1, g_path, sizeof g_path, NULL, NULL)) return;
     g_ready = true;
 }
 
@@ -380,7 +402,7 @@ static const short kSigMsPerFrameSetter[] = {
     0xF3,0x0F,0x2C,0x44,0x24,0x04, 0xA3,W,W,W,W, 0xC2,0x04,0x00
 };
 
-// ── 2026-09-16 会话 68ee9b9d:改动分组开关 ────────────────────────────────────────
+// ── 2026-09-16 初始实现:改动分组开关 ────────────────────────────────────────
 // 用户在 90 帧实机看到「兵营建造、熊的移动」等动画出错 ⇒ 必须能**逐组开关**来二分定位,
 // 而不是靠猜。每一组都可以单独关掉;默认全开。
 #define FL_G_RATIO     0x001   // R1 五处「算 r」
@@ -460,14 +482,14 @@ static const short kSigMsPerFrameSetter[] = {
 #define FL_G_ALL       (0x1FF | FL_G_CLOCK | FL_G_ANIMSTEP | FL_G_DERIVED2)   // 默认 = 0x28FFF
 
 // ── 2026-09-17 动画定位会话:P8 客户端帧率全局写入(实验组,默认**关**) ──────────────
-// 为什么要做这个实验(完整推理见 RE-动画推进点-2026-09-17.md):
+// 为什么要做这个实验(以下保留历史推理，当前边界见 docs/TECHNICAL.md):
 //   引擎里有一大批「秒 → 帧」换算写成 `(double)客户端帧率 * 秒`,还有一批「每帧步长」写成
 //   `1.0 / X / (double)客户端帧率`。它们算出来的是**帧数 / 每帧步长**,而消费它们的东西
 //   (逐帧推进的动画、过渡、计时器)是按**渲染帧**走的。
 //   本补丁的设计是「那个全局一个字节都不动,只重定向读者」—— 于是这些读者仍按 30 算,
 //   而实际渲染已经是 90 帧/秒 ⇒ 帧数只够原版的 1/3、每帧步长却是 3 倍 ⇒ **一切按渲染帧
 //   推进的东西都快 3 倍**。
-//   ⛔ 2026-09-17 订正:上面这段**推理本身是错的**(见 RE-动画推进点-2026-09-17.md 第 12 节),
+//   ⛔ 2026-09-17 订正:上面这段**推理本身是错的**(当前边界见 docs/TECHNICAL.md 第 4 节),
 //     但它的结论「快 3 倍」碰巧对了 —— 真因是游戏时钟(见下面的 FL_G_CLOCK),不是这些换算。
 //     这里保留原文只为记录当时的思路,不要照它推理。
 //   ⛔ 另一处错:我原先写「`dword_CE176C` 已经被 R3 重定向到新帧率了」。**没有。**
@@ -646,7 +668,7 @@ static const short kSigMsPerFrameSetter[] = {
 //         → sub_532CA0 (calcPhysicsXform:按**显示帧号**去重 loco+0xBC,再按 locomotor 外观分派)
 //           → 外观 1/7 sub_526BD0(轮式带悬挂)| 2/3/4 sub_51E800 | 8 sub_5262D0
 //   与 EA 公开的 Generals `Drawable.cpp`(calcPhysicsXformWheels 等)近乎逐行对应。这一族函数是
-//   **每显示帧递推一次、不含 dt** 的迭代(逐条见 RE-车身悬挂-2026-09-21.md):
+//   **每显示帧递推一次、不含 dt** 的迭代(机制摘要见 docs/TECHNICAL.md):
 //     · 俯仰/侧倾弹簧阻尼      rate += −k·(角 − 地面角) − c·rate;  角 += rate·u
 //     · 随机颠簸 sub_5269C0    速度 > 10% 最大速度、且角速度已衰减到阈值以下才再踢一次
 //     · 加速点头/侧倾的第二套弹簧、sub_51A220 摆动相位累加、sub_51A2D0 偏航衰减、
@@ -703,7 +725,7 @@ static const short kSigMsPerFrameSetter[] = {
 //   渲染到 60/90 帧而它仍是 1/30 ⇒ 这些效果快 2/3 倍。单位一致性的论证与 FL_G_DERIVED2 完全相同。
 //   为什么**默认关**(不进 FL_G_ALL,GUI 的默认集合也不含):2026-09-21 才发现,实机一次都没跑过;
 //   而且此刻正在验收车身颠簸修复,变量不要混。对照掩码:0x28FFF | 0x400000 = 0x428FFF。
-//   完整普查见 RE-按显示帧递推普查-2026-09-21.md。
+//   当前机制与验证边界见 docs/TECHNICAL.md；详细旧普查原件另行保存。
 #define FL_G_DER_SPF      0x400000
 
 // ── ★ 2026-09-21(用户点名「卷屏做成可自选的」):卷屏速度按帧率归一,**默认关、可自选** ─────────────
@@ -720,7 +742,7 @@ static const short kSigMsPerFrameSetter[] = {
 //   为什么不去缩放卷屏系数本身:flt_CB0338 / flt_CB033C 各有 3 个写入点(设置 / 选项菜单),运行中会变,
 //   我们的副本会过期;而 100.0 是常量。两处必须**一起**改(只改一处,加速段与稳态段速度会接不上)。
 //   ⚠ 不含右键拖拽卷屏(sub_ABFF40):它是「每调用一次走 系数 ×(鼠标 − 锚点)」,没有帧号差;
-//     它的调用节拍(每帧 / 每次鼠标消息)静态没定下来,先不碰,见 RE-按显示帧递推普查-2026-09-21.md。
+//     它的调用节拍(每帧 / 每次鼠标消息)静态没定下来,先不碰,见 docs/TECHNICAL.md。
 //   状态:2026-09-21 静态定位 + 离线构建;**实机一次都没跑过**。
 #define FL_G_SCROLL       0x800000
 
@@ -785,7 +807,7 @@ static const short kSigTracerUpdate[] = {
 //       —— 它们同样在这条 call 后面,所以一并被本节拍门钉回 30 Hz。
 //     没门时:新粒子冒得勤(发射 3 倍)、CPU 粒子活得短(1/3)、起始延迟短(1/3)。
 //     一团由随机大小 / 亮度的加色粒子叠出来的光,每冒一颗亮度就跳一下 ⇒ 肉眼就是「闪得快 3 倍」。
-//     起始延迟变短还有一个反直觉后果(集火过亮,HANDOFF §26):宿主对象寿命比延迟短、原版**永远不出现**的命中光,
+//     起始延迟变短还有一个反直觉后果(集火过亮,旧研究 §26（原件另行保存）):宿主对象寿命比延迟短、原版**永远不出现**的命中光,
 //     没门时在 90 帧下会出现(未来坦克 X-1 的 AlliedFutureTankHit_Light:延迟 35 步 = 1.17 s > 宿主 0.75 s)。
 //   补丁点 = sub_5F43A0 开头那条 call sub_6D1D30(只改 rel32,5 字节;现场字节已核,全镜像唯一):
 //       005F43A7  8B F9               mov  edi, ecx
@@ -830,7 +852,7 @@ static const short kSigPsysUpdate[] = {                  // sub_5F43A0 开头,�
 //     2 条读 dword_CAF9D4 → g_fpsRender(= 目标帧率)⇒ 镜头动画每显示帧走 30 ÷ 目标帧率 帧 —— 正是公式本意。
 //   目标帧率 ≤ 原版时不装(那时两套值与原版逐位相同)。16 处全部命中才装,否则一处都不改(只 WARN)。
 //   ⚠ 若战役脚本在逻辑侧等待「镜头动作完成」,这一修正会把等待时长恢复成原版 —— 这正是要的;
-//     但它确实影响逻辑时序,联机合作战役里双方配置不同必然更早不同步(本来就不同步,见 HANDOFF §22)。
+//     但它确实影响逻辑时序,联机合作战役里双方配置不同必然更早不同步(本来就不同步,见 旧研究 §22（原件另行保存）)。
 #define FL_G_CAMERA       0x8000000
 #define FL_CAM_SITES      16
 static const short kSigCam00[] = {   // 005B9615  sub_5B95F0  idiv [CE176C]  镜头移动(+1048)帧数 = 毫秒 ÷ 每帧毫秒  (操作数在 +2)
@@ -932,7 +954,7 @@ static const short kSigTintHold10[] = {   // 命中 0x00525FE4(站点 0x00525FE4
     0xC7,0x40,0x34,0x0A,0x00,0x00,0x00,0x8B,0x89,0x88
 };
 
-// ── ★★★ 2026-09-28:联机安全修正 + 敌方单位偶尔「隐身」(HANDOFF §27 / §28;审计材料 audit-2026-09-28/)──────────
+// ── ★★★ 2026-09-28:联机安全修正 + 敌方单位偶尔「隐身」(旧研究 §27 / §28;当前摘要见 docs/TECHNICAL.md)──────────
 //   原版每个逻辑帧固定 2 个客户端帧,6 个阶段分两批 [1,2,3] [4,5,6]。引擎在**每个客户端帧开头**(sub_6027D0 → vt+148 =
 //   sub_626620)做几件会改模拟状态的延迟工作,原版里它们永远落在「阶段 3 之后 / 阶段 6 之后」。r 提到 4 / 6 后,
 //   客户端帧边界变成 {2,3,5,6} / {1..6} ⇒ 这些工作挪到了别的阶段之间(纯静态审计结论,对抗复核见审计材料):
@@ -1050,7 +1072,7 @@ static const short kSigFrameUpdate[] = {
     0x8B,0x16, 0x50, 0x8B,0x82,0x90,0x00,0x00,0x00, 0x8B,0xCE, 0xFF,0xD0
 };
 
-// ── 2026-09-16 会话 68ee9b9d:「重定向读者」用到的特征 ──────────────────────────
+// ── 2026-09-16 初始实现:「重定向读者」用到的特征 ──────────────────────────
 // 为什么改成重定向:参考成品(HAOJUN0823 的 2009 版)不改共享的客户端帧率全局,只把**需要新值的
 // 那几处读者**改指向另一个变量。客户端帧率全局在本构建里有 119 处读者,直接把它写成 60 等于
 // 「默认全都变,除非我记得逐个冻结」;重定向则是「默认全都不变,除非我明确改」—— 漏掉一处时,
@@ -1152,7 +1174,7 @@ static int g_retailFps = 30;
 static int g_targetFps = 60;
 static int g_ratio = 4;            // r = 客户端帧率 ÷ 逻辑帧率
 
-// 2026-09-16 会话 68ee9b9d:容量从 16 提到 48。改成「重定向读者」的设计后改动点有 18 处,
+// 2026-09-16 初始实现:容量从 16 提到 48。改成「重定向读者」的设计后改动点有 18 处,
 // 原来满了之后 remember() 是**静默返回**,会留下一份残缺的撤销表 —— 回滚时还不回去,比不装还糟。
 // 现在满了/超长一律返回 false,让 patch() 当场失败并整体回滚。
 // 2026-09-28 复核订正:48 不够了 —— GUI 勾上「修复过快的特效与过场运镜」时 60/90 帧要改 54 处(运镜 16 + 染色 8 …),
@@ -1211,7 +1233,7 @@ static int   g_msPerFrameQuarantine = 0;
 // 分组掩码:哪些改动要真写。默认全开;二分定位时用 FrameLabSetGroups 关掉某几组。
 static int   g_groups = FL_G_ALL;
 
-// ── 自动化验证用的仪表(2026-09-16 会话 68ee9b9d)────────────────────────────────
+// ── 自动化验证用的仪表(2026-09-16 初始实现)────────────────────────────────
 static volatile long g_frameCount = 0;
 static bool  g_animGate = true;            // P7 是否启用「次数门」
 // 2026-09-17 动画采样:引擎自己的脚本 API `CurDrawablePrevAnimFraction` 注册的是 sub_555D80,
@@ -1349,7 +1371,7 @@ static bool patch(void* address, const void* data, int size, const char* what) {
     return true;
 }
 
-// 2026-09-16 会话 68ee9b9d(线索来自 RA3 Sim 逆向会话的复核):
+// 2026-09-16 初始实现(线索来自 RA3 Sim 逆向会话的复核):
 // ★旧判据是「mem::write 返回 true」—— 那只说明 VirtualProtect/memcpy/FlushInstructionCache
 //   三个 API 没失败,也就是**动作做了**;而我要的结论是**字节真的回到原样**。
 //   判据必须就是结论本身,否则"还原成功"这四个字是空的。
@@ -1386,7 +1408,7 @@ static int rollback() {
 
 // 在 .text 里找唯一匹配;返回命中地址,0 = 没找到,(void*)-1 = 多处命中
 // 找出**所有**匹配,并只保留「第 opIndex 个字节起的 4 字节操作数 == wantOperand」的那些。
-// 2026-09-16 会话 68ee9b9d:重定向设计需要它 —— 算 r 的指令序列在本构建里有 5 处,
+// 2026-09-16 初始实现:重定向设计需要它 —— 算 r 的指令序列在本构建里有 5 处,
 // 五处都得改;光用「唯一命中」的扫描器会把它们当成歧义而整体放弃。
 // 判据不靠数量写死:凡是**读我们认定的那个帧率全局**的,才算数;数量只用来打日志对账。
 static int scan_all(const Pattern& p, int opIndex, const void* wantOperand,
@@ -1455,7 +1477,7 @@ extern "C" int __stdcall fl_hook_batch(int phase, int ratio) {
 
 // P3:算这一帧该显示的插值系数(= 本逻辑帧内已过的客户端帧数 ÷ r)。返回值走 x87 ST(0),
 //     补丁片段再把它搬进 xmm0 —— 因为引擎函数尾部会把 xmm0 存进 [ebp+0x60]。
-// 2026-09-16 会话 68ee9b9d:这个钩子每渲染一帧走一次,所以它同时兼任「渲染帧计数器」。
+// 2026-09-16 初始实现:这个钩子每渲染一帧走一次,所以它同时兼任「渲染帧计数器」。
 // ★g_measureOnly:只装这一个钩子、返回**与原版逐位相同**的系数(阶段×1/6),帧率一点不改。
 // 这样基线组和实验组用的是**同一把尺子**,量出来的帧率才能直接比 —— 不然基线没有计数器,
 // 就只能拿「我记得原版是 30」当分母,那是我自己都不该接受的判据。
@@ -1828,7 +1850,7 @@ static bool resolve_module() {
 }
 
 // 把错误码表原样打进日志。用户上传日志时不用再问我们「错误码 20 是什么意思」,日志自己说清楚。
-// 日期:2026-09-16  会话:平台联机会话 68ee9b9d(Claude)
+// 日期:2026-09-16  初始研究实现
 static void log_error_legend() {
     FL_INFO("错误码对照: 0=成功 1=本来就没装 2=已经装过 10=拿不到主模块 11=不是32位主程序");
     FL_INFO("            20=特征没找到(主程序不是我们支持的那份构建,或已被别的补丁改过)");
@@ -1839,7 +1861,7 @@ static void log_error_legend() {
 }
 
 // 六个补丁点在内存里的位置。
-// 日期:2026-09-16  会话:平台联机会话 68ee9b9d(Claude)
+// 日期:2026-09-16  初始研究实现
 // 为什么单独拆出来:干扫(只查不改)和正式安装必须走**同一套判据**,否则用户日志里的
 // 「干扫通过」和「安装失败」会自相矛盾,排障就没法只看日志了。
 struct Sites {
@@ -1964,7 +1986,7 @@ static int resolve_and_verify(int targetFps, Sites& s) {
     }
 
     // ── 收集「要改指向我们 g_fpsRender」的操作数。全程只读,干扫也走这里。 ──────────────
-    // 2026-09-16 会话 68ee9b9d
+    // 2026-09-16 初始实现
     s.redirectCount = 0;
     s.derivedCount = 0;
     s.spfTarget = NULL;
@@ -2038,7 +2060,7 @@ static int resolve_and_verify(int targetFps, Sites& s) {
         const int nCache = scan_all(pCache, 1, g_fpsClient, hits, 16);
         // ⛔ 2026-09-28:R4 **不再改指**。审计查明 +0x1DC 唯一的读者是 sub_532AC0 的隐身 / 淡入计数器(+476):
         //   计数器每显示帧减一,淡入系数 = (v3 − 计数器) ÷ v3(v3 = dword_CE9808+76)。构造函数把它初始化成 90 时,
-        //   头 (90 − v3) 帧系数为负 ⇒ 模型完全透明。保留原版的 30 = 原版行为(见 HANDOFF §28)。
+        //   头 (90 − v3) 帧系数为负 ⇒ 模型完全透明。保留原版的 30 = 原版行为(见 旧研究 §28（当前摘要见 docs/TECHNICAL.md）)。
         FL_INFO("  R4 缓存字段 %d 处:保持原版值(不改指;它是隐身淡入计数器初值,改成目标帧率会让单位短暂透明)", nCache);
 
         Pattern pMovEsi = {"mov esi + 64000", kSigMovEsiFps, (int)(sizeof kSigMovEsiFps / sizeof(short)), 0};
@@ -3098,7 +3120,7 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabEnable(int targetFps) {
     return rc;
 }
 
-// ── 自动化验证接口(2026-09-16 会话 68ee9b9d)────────────────────────────────────
+// ── 自动化验证接口(2026-09-16 初始实现)────────────────────────────────────
 // 只量不改:装上帧计数器但**不动帧率**。基线组用它,实验组用 FrameLabEnable —— 同一把尺子。
 // 分组开关:二分定位用。传 0 或负数 = 全开。改动分组的位定义见源码顶部 FL_G_*。
 // 典型用法(定位动画问题):先 FrameLabSetGroups(0x1FF & ~0x002) 关掉派生量那组,再 FrameLabEnable(90)。
@@ -4366,7 +4388,7 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabAnimRate(int logicFrames)
 //     正确的 90 帧(r=6,每帧 11 毫秒):每逻辑帧 = 6 × 11.11 = 66.67 毫秒  ⇒ 一样
 //     坏掉的 90 帧(r=6,每帧仍 33 毫秒):每逻辑帧 = 6 × 33.33 = 200 毫秒 ⇒ **3 倍**
 //   它不依赖任何对象被采样到、不依赖录像播到哪一段,所以不会被场景差异污染
-//   (动画帧探针在两次运行里采到的是不同对象,已被证明会误导,见 RE-动画推进点 第 12 节)。
+//   (动画帧探针在两次运行里采到的是不同对象,已被证明会误导,见 已归档的动画推进点研究第 12 节)。
 //
 // 返回:毫秒 × 1000(整数,免浮点);取不到读数返回 -1。
 extern "C" __declspec(dllexport) int __stdcall FrameLabClockPerLogicFrame(int logicFrames) {
@@ -4752,7 +4774,7 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabDesyncRestore() {
 }
 
 // 干扫:排障第一步。不改游戏任何字节,只把「能不能装、卡在哪一步」写进日志。
-// 日期:2026-09-16  会话:平台联机会话 68ee9b9d(Claude)
+// 日期:2026-09-16  初始研究实现
 extern "C" __declspec(dllexport) int __stdcall FrameLabDryRun(int targetFps) {
     FL_INFO("收到干扫请求,目标帧率 %d", targetFps);
     const int rc = fl::dry_run(targetFps);
@@ -4918,8 +4940,8 @@ static int           g_codeCount[kMaxCodes] = {0};   // 每个码已经记了几
 static PVOID         g_vehHandle = NULL;
 static bool          g_on        = false;
 static bool          g_inHandler = false; // 防递归:处理过程中再抛异常就直接放过
-static char          g_dir[MAX_PATH * 2] = {0};      // 与主日志同目录
-static char          g_last[MAX_PATH * 2] = {0};     // 最近一次报告路径(给上层读)
+static char          g_dir[MAX_PATH * 6] = {0};      // UTF-8, 与主日志同目录
+static char          g_last[MAX_PATH * 6] = {0};     // UTF-8, 最近一次报告路径
 
 // ★高分辨率时间源(2026-09-18 第十一批)。见 Rec 上方的订正:GetTickCount 的 15.625 毫秒
 //   量化会在「帧间隔」上造出比真现象还大的假抖动,必须换成 QPC。
@@ -4943,8 +4965,7 @@ static unsigned long long now_us() {
 //   在磁盘满 / 目录不可写 / 路径解析失败时会给出**假 PASS**。假 PASS 比没有自检更坏:
 //   它让人相信黑匣子在守着,而出事那一刻才发现什么都没有。
 static bool raw_write(const char* path, const char* text, int len) {
-    HANDLE h = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE h = log::open_append(path);
     if (h == INVALID_HANDLE_VALUE) {
         // ★ 2026-09-18(第十一批·续)加这条诊断:实测自检**偶发**返回 FL_ERR_WRITE,
         //   而 g_vehSaved 却增加了 —— 说明 write_report 被调用、但 raw_write 失败。
@@ -5122,7 +5143,7 @@ static void write_report(EXCEPTION_POINTERS* ep, const char* tag, bool isCrash) 
     //   (说明 write_report 被调用了),并且 `raw_write` 的两条失败分支都加了 FL_ERR
     //   却一条都没打出来 ⇒ 卡的就是下面这句 `if (!g_dir[0]) return;`。
     //   可 `bb::init` 当时**明确打印了正确的目录**(日志里能看到) ⇒ `g_dir` 是在那之后
-    //   被清空的。HANDOFF §19.8.24 推测是「Rec 结构变大后某个写入点越界」,但始终没定论;
+    //   被清空的。已归档的研究 §19.8.24 推测是「Rec 结构变大后某个写入点越界」,但始终没定论;
     //   而 2026-09-20 又把 Rec.anim 从 4 扩到 12(Rec 更大),风险只会上升。
     //   ⇒ 与其继续追根因,这里加一条**自愈**:g_dir 为空时从 log::path() 重新推导一次。
     //   崩溃报告/飞行记录仪是这个项目**唯一的现场证据** —— 不能因为一个偶发的内存问题
@@ -5138,7 +5159,7 @@ static void write_report(EXCEPTION_POINTERS* ep, const char* tag, bool isCrash) 
     }
     if (!g_dir[0]) return;
     SYSTEMTIME st; GetLocalTime(&st);
-    char path[MAX_PATH * 2];
+    char path[MAX_PATH * 6];
     _snprintf_s(path, sizeof path, _TRUNCATE, "%s\\%s-%lu-%04u%02u%02u-%02u%02u%02u.log",
                 g_dir, isCrash ? "crash" : "snapshot", GetCurrentProcessId(),
                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
@@ -5278,7 +5299,7 @@ static void init(HMODULE self) {
     _snprintf_s(g_dir, sizeof g_dir, _TRUNCATE, "%s", lp);
     char* slash = strrchr(g_dir, '\\');
     if (slash) *slash = 0;
-    CreateDirectoryA(g_dir, NULL);
+    log::make_directory(g_dir);
     // ★在 DllMain 里就注册:这样**补丁还没安装**时崩溃也能留下现场。
     //   第一个参数 1 = 插在链首(我们最先看到);第二个是处理函数。
     g_vehHandle = AddVectoredExceptionHandler(1, veh_handler);
@@ -5534,7 +5555,7 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabBlackBoxSelfTest(int mode
     //   ⚠ 这个偶发失败会浪费下一个会话的时间(看起来像「补丁坏了」),所以必须修。
     bool onDisk = false;
     for (int attempt = 0; attempt < 3 && !onDisk; ++attempt) {
-        if (named && GetFileAttributesA(bb::g_last) != INVALID_FILE_ATTRIBUTES) onDisk = true;
+        if (named && log::file_exists(bb::g_last)) onDisk = true;
         else if (attempt < 2) Sleep(50);
     }
     FL_INFO("黑匣子自检:VEH 命中 %ld → %ld,报告 = %s,在磁盘上 = %d",

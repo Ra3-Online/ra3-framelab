@@ -54,10 +54,18 @@ param(
     [int]$Settle = 60,            # seconds to let the replay reach steady state before dumping
     [int]$Width = 1024,
     [int]$Height = 576,
-    [string]$OutDir = "G:\Ra3 FrameLab\build\logs"
+    [string]$OutDir = "",
+    [string]$GameRoot = "",
+    [string]$Image = "",
+    [string]$SkuDef = "",
+    [string]$ReplayDir = "",
+    [string]$Replay = "",
+    [string]$Python = ""
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "common.ps1")
+$OutDir = Get-FlabOutputPath $OutDir "build\logs" -Directory
 
 # ---------------------------------------------------------------------------------------------
 # Sandbox compatibility: restore PATHEXT. The sandbox narrows PATHEXT to ".CPL" only, and
@@ -70,17 +78,18 @@ if ($env:PATHEXT -notmatch '\.EXE') {
 }
 
 $lab      = Split-Path $PSScriptRoot -Parent
-$build    = Join-Path $lab "build"
+$build = Get-FlabBuildDirectory
 $flctl    = Join-Path $build "flctl.exe"
 $analyzer = Join-Path $lab "tools\re\ring_analyze.py"
-$python   = "C:\Users\Mithlan\.workbuddy-ai\binaries\python\envs\default\Scripts\python.exe"
-$gameRoot = "C:\Users\Mithlan\Documents\Tencent Files\873194676\Red Alert 3\Red Alert 3"
-$gameExe  = Join-Path $gameRoot "Data\RA3_1.12.game"
-$skudef   = Join-Path $gameRoot "RA3_chinese_t_1.12.SkuDef"
-$replayDir = Join-Path $env:USERPROFILE "Documents\Red Alert 3\Replays"
+$pythonRuntime = Get-FlabPython $Python
+$flConfig = Get-FlabLaunchConfig -GameRoot $GameRoot -Image $Image -SkuDef $SkuDef -ReplayDir $ReplayDir
+$gameRoot = $flConfig.GameRoot
+$gameExe = $flConfig.Image
+$skudef = $flConfig.SkuDef
+$replayDir = $flConfig.ReplayDir
 # A replay copy name of our own: other sessions use _flab_play / _flabre_play / _raco_play /
 # _simre_play. Sharing one would let two sessions clobber each other mid-run.
-$playPath  = Join-Path $replayDir "_flabjit_play.RA3Replay"
+$playPath = Join-Path $replayDir (New-FlabReplayName "jitter_probe")
 
 function Invoke-Flctl([string]$cmd, [string]$arg, [int]$targetPid) {
     if ($arg -eq "" -or $null -eq $arg) { $arg = "0" }
@@ -101,11 +110,8 @@ if (Get-Process -Name "ra3_1.12.game" -ErrorAction SilentlyContinue) {
     exit 3
 }
 
-$src = Get-ChildItem $replayDir -Filter "*.RA3Replay" |
-       Where-Object { $_.Name -notlike "_*" -and $_.Name -notlike "*ra3battle.net*" } |
-       Sort-Object Length -Descending | Select-Object -First 1
-if (-not $src) { Write-Host "no usable replay found in $replayDir"; exit 2 }
-Copy-Item $src.FullName $playPath -Force
+$src = Get-FlabReplay -Replay $Replay -ReplayDir $replayDir
+Copy-FlabReplay -Source $src.FullName -Destination $playPath
 Write-Host ("replay: {0}  ({1:N0} bytes)" -f $src.Name, $src.Length)
 
 function Run-Arm([string]$label, [string]$mode, [int]$fps, [int]$mask) {
@@ -179,7 +185,7 @@ function Run-Arm([string]$label, [string]$mode, [int]$fps, [int]$mask) {
             $stamp = Get-Date -Format "HHmmss"
             $txt = Join-Path $OutDir ("_jitter_{0}_{1}.txt" -f $label, $stamp)
         }
-        & $python $analyzer $report --out $txt 2>&1 | Out-String | Write-Host
+        Invoke-FlabPython $pythonRuntime $analyzer $report --out $txt 2>&1 | Out-String | Write-Host
         Write-Host ("analysis -> {0}" -f $txt)
         return [pscustomobject]@{ Arm = $label; Mode = $mode; Fps = $fps; Report = $report; Analysis = $txt }
     } finally {

@@ -2,6 +2,12 @@
 
 # 构建产物 + bisect 截图(10MB)。截图没有被任何 .md 引用,重跑 bisect 可再生。
 build/
+dist/
+out/
+.env
+.env.*
+*.local.json
+logs/
 
 # disasm.py / pescan.py 自建的符号缓存(1.3MB),首次运行自动重建。
 tools/re/_symcache.txt

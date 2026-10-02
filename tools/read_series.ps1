@@ -1,4 +1,4 @@
-# read_series.ps1 -- sample a list of game globals repeatedly and log (wall ms, value).
+﻿# read_series.ps1 -- sample a list of game globals repeatedly and log (wall ms, value).
 #
 # 2026-09-17 / animation-locating session (Claude)
 # ASCII only: PowerShell 5.1 misreads BOM-less UTF-8 Chinese source.
@@ -8,7 +8,7 @@
 # TIME SERIES. This samples them together with a wall clock so the pattern (period, reset value,
 # monotonic vs sawtooth) becomes visible.
 #
-# The globals of interest, all from sub_5FE9D0 (see RE-动画推进点):
+# The globals of interest, all from sub_5FE9D0 (historical notes archived separately; summary in docs/TECHNICAL.md):
 #   0x00CAFF64  dword_CAFF64  -- countdown; while > 1 the tick returns early (skips the 29 ms
 #                                spin-wait and sub_5FD350). Reloaded from vtbl160(0x00CDB7B4).
 #   0x00CE1AF0  dword_CE1AF0  -- spin-wait baseline; the loop waits until timeGetTime()-this >= 29
@@ -26,11 +26,14 @@ param(
     [Parameter(Mandatory=$true)][int]$GamePid,
     [int]$Count = 40,
     [int]$IntervalMs = 90,
-    [string]$Out = "G:\Ra3 FrameLab\build\logs\_series.txt"
+    [string]$Out = ""
 )
 
 $ErrorActionPreference = "Stop"
-$flctl = Join-Path (Split-Path $PSScriptRoot -Parent) "build\flctl.exe"
+. (Join-Path $PSScriptRoot "common.ps1")
+$Out = Get-FlabOutputPath $Out "build\logs\_series.txt"
+
+$flctl = Join-Path (Get-FlabBuildDirectory) "flctl.exe"
 
 $watch = @(
     @{ n = "CAFF64"; a = "0xCAFF64" },
@@ -47,7 +50,7 @@ $lines = New-Object System.Collections.Generic.List[string]
 function Log([string]$s) { $lines.Add($s) | Out-Null; Write-Host $s }
 function Flush() { $lines | Out-File -Encoding utf8 $Out }
 
-$game = Get-Process -Id $GamePid -ErrorAction SilentlyContinue
+$game = Assert-FlabGameProcess $GamePid
 if (-not $game) { Log "no process with that id"; Flush; exit 2 }
 
 function Read-One([string]$addr) {

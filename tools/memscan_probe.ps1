@@ -24,21 +24,31 @@ param(
     [int]$Rounds = 3,
     [int]$Width = 1024,
     [int]$Height = 576,
-    [string]$OutDir = "G:\Ra3 FrameLab\build\logs"
+    [string]$OutDir = "",
+    [string]$GameRoot = "",
+    [string]$Image = "",
+    [string]$SkuDef = "",
+    [string]$ReplayDir = "",
+    [string]$Replay = ""
 )
+
+$ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "common.ps1")
+$OutDir = Get-FlabOutputPath $OutDir "build\logs" -Directory
 
 $env:PATHEXT = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.CPL"
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
-$lab       = "G:\Ra3 FrameLab"
-$build     = Join-Path $lab "build"
+$lab = Get-FlabRoot
+$build = Get-FlabBuildDirectory
 $flctl     = Join-Path $build "flctl.exe"
-$gameRoot  = "C:\Users\Mithlan\Documents\Tencent Files\873194676\Red Alert 3\Red Alert 3"
-$gameExe   = Join-Path $gameRoot "Data\RA3_1.12.game"
-$skudef    = Join-Path $gameRoot "RA3_chinese_t_1.12.SkuDef"
-$replayDir = Join-Path $env:USERPROFILE "Documents\Red Alert 3\Replays"
-$playPath  = Join-Path $replayDir "_flabscan_play.RA3Replay"
+$flConfig = Get-FlabLaunchConfig -GameRoot $GameRoot -Image $Image -SkuDef $SkuDef -ReplayDir $ReplayDir
+$gameRoot = $flConfig.GameRoot
+$gameExe = $flConfig.Image
+$skudef = $flConfig.SkuDef
+$replayDir = $flConfig.ReplayDir
+$playPath = Join-Path $replayDir (New-FlabReplayName "memscan_probe")
 
 if (-not (Test-Path $flctl)) { Write-Host "missing $flctl -- build first"; exit 2 }
 
@@ -48,11 +58,8 @@ if (Get-Process -Name "ra3_1.12.game" -ErrorAction SilentlyContinue) {
     exit 3
 }
 
-$src = Get-ChildItem $replayDir -Filter "*.RA3Replay" |
-       Where-Object { $_.Name -notlike "_*" -and $_.Name -notlike "*ra3battle.net*" } |
-       Sort-Object Length -Descending | Select-Object -First 1
-if (-not $src) { Write-Host "no usable replay found in $replayDir"; exit 2 }
-Copy-Item $src.FullName $playPath -Force
+$src = Get-FlabReplay -Replay $Replay -ReplayDir $replayDir
+Copy-FlabReplay -Source $src.FullName -Destination $playPath
 Write-Host ("replay: {0}  ({1:N0} bytes)" -f $src.Name, $src.Length)
 
 function Invoke-FlctlRaw([string]$cmd, [string]$arg, [int]$targetPid) {

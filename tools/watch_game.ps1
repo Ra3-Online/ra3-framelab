@@ -22,18 +22,20 @@
 #   sessions share this machine and a game may belong to the user. Read-only by construction.
 #
 # Usage:
-#   powershell -ExecutionPolicy Bypass -File tools\watch_game.ps1                 # newest instance
+#   powershell -ExecutionPolicy Bypass -File tools\watch_game.ps1                 -Pid <game-pid> # explicit target
 #   powershell -ExecutionPolicy Bypass -File tools\watch_game.ps1 -Pid 12345
 #   powershell -ExecutionPolicy Bypass -File tools\watch_game.ps1 -Minutes 30 -DumpEvery 120
 param(
-    [int]$Pid = 0,
+    [Alias("Pid")][int]$TargetPid = 0,
     [int]$Minutes = 20,            # give up watching after this long
     [int]$PollSeconds = 5,
     [int]$DumpEvery = 0,           # >0: every N seconds ask the black box for a scene snapshot
-    [string]$Out = "G:\Ra3 FrameLab\build\logs\_watch.txt"
+    [string]$Out = ""
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "common.ps1")
+$Out = Get-FlabOutputPath $Out "build\logs\_watch.txt"
 
 # Sandbox: PATHEXT is narrowed to ".CPL", so PowerShell treats every .exe as a document and
 # refuses to run it from a pipeline. Restore the standard list (idempotent on a normal machine).
@@ -42,7 +44,7 @@ if ($env:PATHEXT -notmatch '\.EXE') {
 }
 
 $lab   = Split-Path $PSScriptRoot -Parent
-$build = Join-Path $lab "build"
+$build = Get-FlabBuildDirectory
 $flctl = Join-Path $build "flctl.exe"
 $logDir = Join-Path $build "logs"
 
@@ -61,26 +63,19 @@ function Invoke-Flctl([string]$cmd, [string]$arg, [int]$targetPid) {
 }
 
 # ---- pick the target ------------------------------------------------------------------------
-if ($Pid -le 0) {
-    $p = Get-Process -Name "ra3_1.12.game" -ErrorAction SilentlyContinue |
-         Sort-Object StartTime -Descending | Select-Object -First 1
-    if (-not $p) { Write-Host "no ra3_1.12.game process found"; exit 2 }
-    $Pid = $p.Id
-}
-$proc = Get-Process -Id $Pid -ErrorAction SilentlyContinue
-if (-not $proc) { Write-Host "pid $Pid is not running"; exit 2 }
+$proc = Assert-FlabGameProcess $TargetPid
 
 $startedAt = $proc.StartTime
-Log ("=== watch_game  pid={0}  started {1:yyyy-MM-dd HH:mm:ss} ===" -f $Pid, $startedAt)
+Log ("=== watch_game  pid={0}  started {1:yyyy-MM-dd HH:mm:ss} ===" -f $TargetPid, $startedAt)
 Log ("polling every {0}s, giving up after {1} min" -f $PollSeconds, $Minutes)
 
 # Snapshot the crash reports that already exist for this pid, so we only ever report NEW ones.
-$seenCrash = @(Get-ChildItem $logDir -Filter ("crash-" + $Pid + "-*.log") -ErrorAction SilentlyContinue |
+$seenCrash = @(Get-ChildItem $logDir -Filter ("crash-" + $TargetPid + "-*.log") -ErrorAction SilentlyContinue |
                ForEach-Object { $_.FullName })
 Log ("existing crash reports for this pid: {0}" -f $seenCrash.Count)
 
 # Ask the black box what it thinks its state is, so the log records whether it was even armed.
-$bbState = Invoke-Flctl "blackboxtest" "" $Pid
+$bbState = Invoke-Flctl "blackboxtest" "" $TargetPid
 Log ("black box self-test rc = {0}  (0 = VEH live and writing)" -f $bbState)
 
 $deadline = (Get-Date).AddMinutes($Minutes)
@@ -101,9 +96,9 @@ try {
         if ($DumpEvery -gt 0 -and ((Get-Date) - $lastDump).TotalSeconds -ge $DumpEvery) {
             # Periodic scene snapshots: if the process dies in a way that leaves no report, the
             # most recent snapshot is still a scene from just before the event.
-            $frame = Invoke-Flctl "logicframe" "" $Pid
+            $frame = Invoke-Flctl "logicframe" "" $TargetPid
             Log ("  [{0:HH:mm:ss}] alive, logic frame {1}, snapshot requested" -f (Get-Date), $frame)
-            [void](Invoke-Flctl "blackboxdump" "" $Pid)
+            [void](Invoke-Flctl "blackboxdump" "" $TargetPid)
             $lastDump = Get-Date
         }
     }
@@ -135,7 +130,7 @@ if ($null -eq $exitCode) {
     }
     Log ""
     Log "new crash reports for this pid:"
-    $new = @(Get-ChildItem $logDir -Filter ("crash-" + $Pid + "-*.log") -ErrorAction SilentlyContinue |
+    $new = @(Get-ChildItem $logDir -Filter ("crash-" + $TargetPid + "-*.log") -ErrorAction SilentlyContinue |
              Where-Object { $seenCrash -notcontains $_.FullName })
     if ($new.Count -eq 0) {
         Log "  (none) -- either no first-chance exception was raised, or the black box was not armed."

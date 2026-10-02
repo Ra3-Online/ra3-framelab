@@ -1,6 +1,6 @@
 # verify.ps1 -- automated A/B verification for Ra3FrameLab.
 #
-# 2026-09-16 / session 68ee9b9d (Claude)
+# 2026-09-16 / developer probe
 # NOTE: keep this file ASCII-only (PowerShell 5.1 misreads BOM-less UTF-8 Chinese).
 #
 # What it does, twice (baseline then patched), with the SAME instrument in both arms:
@@ -27,36 +27,41 @@ param(
     [string]$Replay = "",
     [int]$Groups = 0,          # 0 = all groups; see FL_G_* in framelab.cpp
     [switch]$BaselineOnly,
-    [switch]$SkipDesync
+    [switch]$SkipDesync,
+    [string]$GameRoot = "",
+    [string]$Image = "",
+    [string]$SkuDef = "",
+    [string]$ReplayDir = "",
+    [string]$OutDir = ""
 )
 
 $ErrorActionPreference = "Stop"
-$lab      = Split-Path $PSScriptRoot -Parent
-$build    = Join-Path $lab "build"
-$flctl    = Join-Path $build "flctl.exe"
-$gameRoot = "C:\Users\Mithlan\Documents\Tencent Files\873194676\Red Alert 3\Red Alert 3"
-$gameExe  = Join-Path $gameRoot "Data\RA3_1.12.game"
-$skudef   = Join-Path $gameRoot "RA3_chinese_t_1.12.SkuDef"
-$dataDir  = Join-Path $gameRoot "Data"
-$replayDir= Join-Path $env:USERPROFILE "Documents\Red Alert 3\Replays"
-$playName = "_flab_play.RA3Replay"
-$outRoot  = Join-Path $build "verify"
+. (Join-Path $PSScriptRoot "common.ps1")
+$OutDir = Get-FlabRunDirectory $OutDir "build\verify"
 
-foreach ($p in @($flctl, $gameExe, $skudef, $replayDir)) {
+$lab      = Split-Path $PSScriptRoot -Parent
+$build = Get-FlabBuildDirectory
+$flctl    = Join-Path $build "flctl.exe"
+$flConfig = Get-FlabLaunchConfig -GameRoot $GameRoot -Image $Image -SkuDef $SkuDef -ReplayDir $ReplayDir
+$gameRoot = $flConfig.GameRoot
+$gameExe = $flConfig.Image
+$skudef = $flConfig.SkuDef
+$dataDir  = Join-Path $gameRoot "Data"
+$replayDir = $flConfig.ReplayDir
+$playName = New-FlabReplayName "verify"
+$playPath = Join-Path $replayDir $playName
+$outRoot = $OutDir
+
+foreach ($p in @($flctl, $gameExe, $skudef)) {
     if (-not (Test-Path $p)) { throw "missing: $p" }
+}
+if (Get-Process -Name "ra3_1.12.game" -ErrorAction SilentlyContinue) {
+    throw 'A game instance is already running; refusing to launch a second instance.'
 }
 
 # ---- replay: copy to an ASCII name in the standard Replays dir (engine ignores other dirs) ----
-if ($Replay -eq "") {
-    $src = Get-ChildItem $replayDir -Filter "*.RA3Replay" |
-           Where-Object { $_.Name -notlike "_*" -and $_.Name -notlike "*ra3battle.net*" } |
-           Sort-Object Length -Descending | Select-Object -First 1
-    if (-not $src) { throw "no usable replay found in $replayDir" }
-} else {
-    $src = Get-Item (Join-Path $replayDir $Replay)
-}
-$playPath = Join-Path $replayDir $playName
-Copy-Item $src.FullName $playPath -Force
+$src = Get-FlabReplay -Replay $Replay -ReplayDir $replayDir
+Copy-FlabReplay -Source $src.FullName -Destination $playPath
 $replaySha = (Get-FileHash $playPath -Algorithm SHA1).Hash
 Write-Host ("replay basis: {0}  {1} bytes  sha1 {2}" -f $src.Name, $src.Length, $replaySha)
 
@@ -160,7 +165,7 @@ function Run-Arm([string]$arm, [bool]$patched) {
     return [pscustomobject]@{ Arm = $arm; RenderFps = $renderFps; LogicFps = $logicFps; DumpDir = $dumpDir }
 }
 
-if (Test-Path $outRoot) { Remove-Item $outRoot -Recurse -Force }
+# This run has its own output directory; prior dumps cannot taint its comparison.
 $a = Run-Arm "baseline" $false
 if ($BaselineOnly) { Write-Host "baseline only, done"; exit 0 }
 $armName = "patched-" + $Fps

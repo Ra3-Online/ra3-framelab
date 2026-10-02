@@ -1,4 +1,4 @@
-# animrate_ab.ps1 -- launch a replay, inject the patch, MEASURE the animation rate, then quit.
+﻿# animrate_ab.ps1 -- launch a replay, inject the patch, MEASURE the animation rate, then quit.
 #
 # 2026-09-17 / animation-locating session (Claude)
 # NOTE: keep this file ASCII-only (PowerShell 5.1 misreads BOM-less UTF-8 Chinese).
@@ -23,7 +23,7 @@
 #         Kept as a cross-check only. It IS confounded: different runs record different
 #         objects at different replay positions, so its "fastest object" statistic is not
 #         comparable across runs (measured 187 stock vs 41 broken -- the wrong direction).
-#         See RE-动画推进点-2026-09-17.md section 12.
+#         Historical animation notes are archived separately; see docs/TECHNICAL.md for current boundaries.
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File tools\animrate_ab.ps1 -Groups 0x41FF -Out ...\_A.txt
@@ -35,26 +35,36 @@ param(
     [int]$Groups = 0xC1FF,
     [int]$AnimFrames = 150,      # logic frames to watch while measuring (150 = 10 sim seconds)
     [int]$StartupWait = 45,      # seconds to let the game boot before attaching (see HANDOFF)
-    [string]$Out = "G:\Ra3 FrameLab\build\logs\_ab.txt",
+    [string]$Out = "",
     [switch]$Stock,              # 2026-09-17: probe only, no patch group -- the stock baseline.
                                  # This is the reference the whole A/B test is judged against:
                                  # stock (30 fps, r=2) is by definition the "correct" animation rate.
-    [switch]$KeepOpen            # do NOT kill the game at the end (leaves it for a human)
+    [switch]$KeepOpen, # do NOT kill the game at the end (leaves it for a human)
+    [string]$GameRoot = "",
+    [string]$Image = "",
+    [string]$SkuDef = "",
+    [string]$ReplayDir = "",
+    [string]$Replay = ""
 )
+
+$ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "common.ps1")
+$Out = Get-FlabOutputPath $Out "build\logs\_ab.txt"
+
 # Group mask cheat-sheet for this script (see src/framelab.cpp for the bit definitions):
 #   0x4000 = animation probe only            -> stock baseline (nothing else is patched)
 #   0x41FF = old default set + probe         -> the BROKEN 90 fps config (no clock fix)
 #   0xC1FF = 0x41FF | FL_G_CLOCK(0x8000)     -> the FIXED 90 fps config (default now)
 
-$ErrorActionPreference = "Stop"
 $lab      = Split-Path $PSScriptRoot -Parent
-$build    = Join-Path $lab "build"
+$build = Get-FlabBuildDirectory
 $flctl    = Join-Path $build "flctl.exe"
-$gameRoot = "C:\Users\Mithlan\Documents\Tencent Files\873194676\Red Alert 3\Red Alert 3"
-$gameExe  = Join-Path $gameRoot "Data\RA3_1.12.game"
-$skudef   = Join-Path $gameRoot "RA3_chinese_t_1.12.SkuDef"
-$replayDir = Join-Path $env:USERPROFILE "Documents\Red Alert 3\Replays"
-$playName  = "_flab_play.RA3Replay"
+$flConfig = Get-FlabLaunchConfig -GameRoot $GameRoot -Image $Image -SkuDef $SkuDef -ReplayDir $ReplayDir
+$gameRoot = $flConfig.GameRoot
+$gameExe = $flConfig.Image
+$skudef = $flConfig.SkuDef
+$replayDir = $flConfig.ReplayDir
+$playName = New-FlabReplayName "animrate_ab"
 $playPath  = Join-Path $replayDir $playName
 
 $lines = New-Object System.Collections.Generic.List[string]
@@ -68,12 +78,9 @@ if (Get-Process -Name "ra3_1.12.game" -ErrorAction SilentlyContinue) {
     exit 2
 }
 
-# ---- replay: pick the largest plain replay, copy to a pure-ASCII name, verify SHA1 ----
-$src = Get-ChildItem $replayDir -Filter "*.RA3Replay" |
-       Where-Object { $_.Name -notlike "_*" -and $_.Name -notlike "*ra3battle.net*" } |
-       Sort-Object Length -Descending | Select-Object -First 1
-if (-not $src) { Log "no usable replay found"; $lines | Out-File -Encoding utf8 $Out; exit 2 }
-Copy-Item $src.FullName $playPath -Force
+# Explicit -Replay selects the test basis; no personal replay is chosen implicitly.
+$src = Get-FlabReplay -Replay $Replay -ReplayDir $replayDir
+Copy-FlabReplay -Source $src.FullName -Destination $playPath
 if ((Get-FileHash $src.FullName -Algorithm SHA1).Hash -ne (Get-FileHash $playPath -Algorithm SHA1).Hash) {
     Log "REFUSE: replay copy differs from source"; $lines | Out-File -Encoding utf8 $Out; exit 2
 }
@@ -238,7 +245,7 @@ try {
     $clock1 = Read-Dword 0x00CE1388 $proc.Id
 
     # ---- ★ 主判据:每逻辑帧推进多少毫秒游戏时钟 ----------------------------------------
-    # 2026-09-17 加了它之后,animrate 退居辅助。理由(见 RE-动画推进点 第 12 节):
+    # 2026-09-17 加了它之后,animrate 退居辅助。理由(见 已归档的动画研究第 12 节):
     #   动画帧探针在两次运行里采到的是**不同对象**(对象地址都不一样),而录像播放位置也不同,
     #   所以「最快对象」这个统计量会被场景差异污染 —— 实测 stock 187 / broken 41,
     #   方向甚至是反的,完全不能当判据。

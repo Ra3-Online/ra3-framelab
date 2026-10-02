@@ -3,7 +3,7 @@
 # Why: the chassis pose comes from a client-side chain that advances ONE STEP PER DISPLAY
 # FRAME with no dt (sub_535DD0 -> sub_532CA0 -> sub_526BD0 ...). At 60/90 fps it therefore
 # runs 2x/3x fast: the body bounces violently while the animation axis and the position
-# axis both look perfectly clean. See RE-chassis doc (RE-*-2026-09-21.md) and HANDOFF 20.
+# axis both look perfectly clean. Historical chassis notes are archived separately; see docs/TECHNICAL.md.
 #
 # One run = one ARM. Run the arms one after another (RA3 is single-instance):
 #   baseline : -Mode measure                                  expect chassisrate ~ 2000
@@ -36,8 +36,8 @@ param(
     [int]$RateFrames = 150,
     [int]$Width = 1024,
     [int]$Height = 576,
-    [string]$Replay = "90 FPS Test.RA3Replay",
-    [string]$GameRoot = "C:\Users\Mithlan\Documents\Tencent Files\873194676\Red Alert 3\Red Alert 3",
+    [string]$Replay = "",
+    [string]$GameRoot = "",
     [string]$Python = "",
     [string]$OutDir = "",
     # * -Fullscreen: do not pass -win/-xres/-yres. Measured 2026-09-21: with a remote-desktop session
@@ -49,33 +49,37 @@ param(
     #   15.00 Hz logic -- but the chassis wrapper was called ZERO times, i.e. the device was lost
     #   and the engine was spinning without drawing the scene. A frame COUNTER reaching 60 is not
     #   a picture reaching 60. Use this switch only at the physical console of the machine.
-    [switch]$Fullscreen
+    [switch]$Fullscreen,
+    [string]$Image = "",
+    [string]$SkuDef = "",
+    [string]$ReplayDir = ""
 )
+
+$ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "common.ps1")
+$OutDir = Get-FlabOutputPath $OutDir "build\logs" -Directory
 
 $env:PATHEXT = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.CPL"
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 $lab      = Split-Path -Parent $PSScriptRoot
-$build    = Join-Path $lab "build"
+$build = Get-FlabBuildDirectory
 $flctl    = Join-Path $build "flctl.exe"
 $analyzer = Join-Path $lab "tools\re\ring_analyze.py"
+$logDir = Join-Path $build "logs"
 if ($OutDir -eq "") { $OutDir = Join-Path $build "logs" }
 if ($Label -eq "") { $Label = ("{0}{1}_g{2:X}" -f $Mode, $Fps, $Groups) }
 
-if ($Python -eq "") {
-    $cand = "C:\Users\Mithlan\.workbuddy-ai\binaries\python\envs\default\Scripts\python.exe"
-    if (Test-Path $cand) { $Python = $cand }
-    else {
-        $cmd = Get-Command python -ErrorAction SilentlyContinue
-        if ($cmd) { $Python = $cmd.Source }
-    }
-}
+$pythonRuntime = $null
+try { $pythonRuntime = Get-FlabPython $Python } catch { Write-Host $_.Exception.Message }
 
-$gameExe = Join-Path $GameRoot "Data\ra3_1.12.game"
-$skudef  = Get-ChildItem $GameRoot -Filter "*1.12.SkuDef" -ErrorAction SilentlyContinue | Select-Object -First 1
-$replayDir = Join-Path $env:USERPROFILE "Documents\Red Alert 3\Replays"
-$playPath  = Join-Path $replayDir "_flabchs_play.RA3Replay"
+$flConfig = Get-FlabLaunchConfig -GameRoot $GameRoot -Image $Image -SkuDef $SkuDef -ReplayDir $ReplayDir
+$gameRoot = $flConfig.GameRoot
+$gameExe = $flConfig.Image
+$skudef = $flConfig.SkuDef
+$replayDir = $flConfig.ReplayDir
+$playPath = Join-Path $replayDir (New-FlabReplayName "chassis_probe")
 
 if (-not (Test-Path $flctl))   { Write-Host "missing $flctl -- build first"; exit 2 }
 if (-not (Test-Path $gameExe)) { Write-Host "missing $gameExe -- pass -GameRoot"; exit 2 }
@@ -87,19 +91,8 @@ if (Get-Process -Name "ra3_1.12.game" -ErrorAction SilentlyContinue) {
     exit 3
 }
 
-if (Test-Path $Replay) { $src = Get-Item $Replay }
-else {
-    $src = Get-ChildItem $replayDir -Filter "*.RA3Replay" -ErrorAction SilentlyContinue |
-           Where-Object { $_.Name -eq $Replay -or $_.BaseName -eq $Replay } | Select-Object -First 1
-}
-if (-not $src) {
-    $src = Get-ChildItem $replayDir -Filter "*.RA3Replay" -ErrorAction SilentlyContinue |
-           Where-Object { $_.Name -notlike "_*" -and $_.Name -notlike "*ra3battle.net*" } |
-           Sort-Object Length -Descending | Select-Object -First 1
-    if ($src) { Write-Host ("replay '{0}' not found -- falling back to the largest one" -f $Replay) }
-}
-if (-not $src) { Write-Host "no usable replay found in $replayDir"; exit 2 }
-Copy-Item $src.FullName $playPath -Force
+$src = Get-FlabReplay -Replay $Replay -ReplayDir $replayDir
+Copy-FlabReplay -Source $src.FullName -Destination $playPath
 Write-Host ("replay: {0}  ({1:N0} bytes)" -f $src.Name, $src.Length)
 
 function Invoke-Flctl([string]$cmd, [string]$arg, [int]$targetPid) {
@@ -122,9 +115,9 @@ try {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $gameExe
     if ($Fullscreen) {
-        $psi.Arguments = ('-replayGame "{0}" -config "{1}"' -f $playPath, $skudef.FullName)
+        $psi.Arguments = ('-replayGame "{0}" -config "{1}"' -f $playPath, $skudef)
     } else {
-        $psi.Arguments = ('-win -xres {0} -yres {1} -replayGame "{2}" -config "{3}"' -f $Width, $Height, $playPath, $skudef.FullName)
+        $psi.Arguments = ('-win -xres {0} -yres {1} -replayGame "{2}" -config "{3}"' -f $Width, $Height, $playPath, $skudef)
     }
     $psi.WorkingDirectory = $GameRoot
     $psi.UseShellExecute = $false
@@ -193,11 +186,11 @@ try {
     $top = ($slots -split "`r?`n") | Where-Object { $_ -match 'drawable=' } | Select-Object -First 6
     foreach ($l in $top) { Write-Host $l }
 
-    $snap = Get-ChildItem $OutDir -Filter ("snapshot-{0}-*.log" -f $proc.Id) -ErrorAction SilentlyContinue |
+    $snap = Get-ChildItem $logDir -Filter ("snapshot-{0}-*.log" -f $proc.Id) -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if ($snap -and $Python -ne "" -and (Test-Path $analyzer)) {
+    if ($snap -and $null -ne $pythonRuntime -and (Test-Path $analyzer)) {
         $env:PYTHONIOENCODING = "utf-8"
-        $ana = (& $Python $analyzer $snap.FullName 2>&1 | Out-String)
+        $ana = (Invoke-FlabPython $pythonRuntime $analyzer $snap.FullName 2>&1 | Out-String)
         $lines.Add("---- ring_analyze ($($snap.Name)) ----")
         $keep = $false
         foreach ($l in ($ana -split "`r?`n")) {
@@ -210,7 +203,7 @@ try {
     } else {
         Say ("SNAPSHOT={0}   (no python found -- run tools\re\ring_analyze.py on it by hand)" -f $snap.FullName)
     }
-    $crash = Get-ChildItem $OutDir -Filter ("crash-{0}-*.log" -f $proc.Id) -ErrorAction SilentlyContinue
+    $crash = Get-ChildItem $logDir -Filter ("crash-{0}-*.log" -f $proc.Id) -ErrorAction SilentlyContinue
     Say ("CRASH_REPORTS={0}" -f @($crash).Count)
     $script:exitCode = 0
 }

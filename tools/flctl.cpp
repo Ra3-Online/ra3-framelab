@@ -1,6 +1,6 @@
 // flctl.cpp — Ra3FrameLab 控制台工具:把 DLL 注入正在运行的红警3,并调用它的开关 / 诊断接口。
 //
-// 日期:2026-09-16  会话:平台联机会话 68ee9b9d(Claude)
+// 日期:2026-09-16  初始研究实现
 // 用法:
 //   flctl dryrun [帧率]     只检查不改任何字节,把「能不能装 / 卡在哪」写进日志(排障第一步)
 //   flctl enable [帧率]     注入并启用(默认 60)
@@ -51,6 +51,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <cwchar>
 
 namespace {
 
@@ -97,13 +98,16 @@ bool call_remote(HANDLE proc, void* addr, void* arg, DWORD* result) {
     return true;
 }
 
-bool inject(HANDLE proc, const char* dllPath) {
-    const size_t bytes = strlen(dllPath) + 1;
+bool inject(HANDLE proc, const wchar_t* dllPath) {
+    const size_t bytes = (wcslen(dllPath) + 1) * sizeof(wchar_t);
     void* remote = VirtualAllocEx(proc, NULL, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!remote) return false;
     SIZE_T written = 0;
-    if (!WriteProcessMemory(proc, remote, dllPath, bytes, &written) || written != bytes) return false;
-    void* loadLib = (void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "LoadLibraryA");
+    if (!WriteProcessMemory(proc, remote, dllPath, bytes, &written) || written != bytes) {
+        VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
+        return false;
+    }
+    void* loadLib = (void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "LoadLibraryW");
     DWORD result = 0;
     const bool ok = call_remote(proc, loadLib, remote, &result) && result != 0;
     VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
@@ -121,13 +125,14 @@ int main(int argc, char** argv) {
     const char* gameName = "ra3_1.12";      // 进程名前缀
     const char* dllName = "Ra3FrameLab.dll";
 
-    char dllPath[MAX_PATH];
-    GetModuleFileNameA(NULL, dllPath, MAX_PATH);
-    char* slash = strrchr(dllPath, '\\');
+    wchar_t dllPath[MAX_PATH];
+    const DWORD pathLen = GetModuleFileNameW(NULL, dllPath, MAX_PATH);
+    if (!pathLen || pathLen >= MAX_PATH) { std::printf("Executable path is too long.\n"); return 2; }
+    wchar_t* slash = wcsrchr(dllPath, L'\\');
     if (slash) *(slash + 1) = 0;
-    strcat_s(dllPath, MAX_PATH, dllName);
-    if (GetFileAttributesA(dllPath) == INVALID_FILE_ATTRIBUTES) {
-        std::printf("找不到 %s(应与 flctl.exe 同目录)\n", dllPath);
+    if (wcscat_s(dllPath, MAX_PATH, L"Ra3FrameLab.dll") != 0) return 2;
+    if (GetFileAttributesW(dllPath) == INVALID_FILE_ATTRIBUTES) {
+        std::printf("找不到 %ls(应与 flctl.exe 同目录)\n", dllPath);
         return 2;
     }
 
@@ -159,7 +164,7 @@ int main(int argc, char** argv) {
     }
 
     if (!remote_module(pid, dllName)) {
-        std::printf("注入 %s ...\n", dllPath);
+        std::printf("注入 %ls ...\n", dllPath);
         if (!inject(proc, dllPath)) {
             std::printf("注入失败(错误 %lu)\n", GetLastError());
             CloseHandle(proc);
@@ -167,7 +172,7 @@ int main(int argc, char** argv) {
         }
     }
     HMODULE remoteBase = remote_module(pid, dllName);
-    HMODULE localBase = LoadLibraryA(dllPath);   // 本地加载一份只为算导出偏移
+    HMODULE localBase = LoadLibraryW(dllPath);   // 本地加载一份只为算导出偏移
     if (!remoteBase || !localBase) {
         std::printf("拿不到模块基址(远端 %p 本地 %p)\n", (void*)remoteBase, (void*)localBase);
         CloseHandle(proc);
@@ -191,7 +196,7 @@ int main(int argc, char** argv) {
     //   原来走的是上面那个 `fps = atoi(argv[2])` —— atoi("0x2CFFE") = 0,而 FrameLabSetGroups(0)
     //   的含义是「取默认集合」⇒ **静默回落到 0x28FFF,不报错**。tools\mask_fps_probe.ps1 传的正是
     //   十六进制字符串,所以它那一轮五条臂实际全是默认掩码(DLL 日志里每一臂都记着 0x28FFF),
-    //   HANDOFF §18.6b「五条臂全部真的跑在 60 帧」那张表因此无效。与下面 `read` / `track` 同一个坑。
+    //   已归档的研究 §18.6b「五条臂全部真的跑在 60 帧」那张表因此无效。与下面 `read` / `track` 同一个坑。
     else if (_stricmp(cmd, "groups") == 0) {
         exportName = "FrameLabSetGroups";
         arg = (void*)(uintptr_t)strtoul(argc > 2 ? argv[2] : "0", NULL, 0);
