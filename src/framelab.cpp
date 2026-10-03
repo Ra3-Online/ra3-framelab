@@ -965,6 +965,7 @@ static const short kSigTintHold10[] = {   // 命中 0x00525FE4(站点 0x00525FE4
 //   FL_G_SIMPIN:运动器切换的高度斜坡长度 = 本机 flt_CDBC50 × 0.5(sub_73ABC0 写、sub_715ED0 / sub_778AA0 按逻辑帧消费),
 //     而 FL_G_DERIVED2 把 flt_CDBC50 改成了目标帧率 ⇒ 不同帧率的机器同一逻辑帧算出的单位高度不同。把这三条 movss 的
 //     操作数改指补丁自己的常量 30.0f ⇒ 与原版逐位相同。
+//     高 FPS 改共享 DER_FPS 时这三处自动必需;SIMPIN 位保留给不改 DER_FPS 的显式实验请求。
 //   随 FL_G_RATIO 一起装(不占新位):sub_542DF0(GameClient::update)里决定「本帧刷不刷迷雾可见性 / 模型状态快照 / 残影」
 //     的那条 call sub_5FFAD0(phase == 6/r,R1 站点)—— 60 帧下它**永远不成立**(帧边界 {2,3,5,6} 里没有 1),
 //     90 帧下在阶段 1 之后成立(原版是阶段 3 之后)。它刷的是 Drawable+316 bit3「被迷雾遮住」,为真时模型走隐藏绘制 ——
@@ -1879,6 +1880,9 @@ struct Sites {
     int redirectCount;
     unsigned char* perFrame;   // P3b 逐帧推进块
     unsigned char* frameUpdate; // P7 逐帧绘制更新调用点
+    unsigned char* simPin[3];  // 高度斜坡读者:干扫与安装共用核验结果
+    bool simPinNeeded;
+    bool simPinRequired;       // 高 FPS 改共享 DER_FPS 时自动必需,不依赖请求 mask 的 SIMPIN 位
 
     // 引擎在启动时算好的三个派生量(浮点帧率 / 每帧毫秒 / 每毫秒帧数):
     // 我们注入时它们早算完了,得按同样公式按新帧率写回去;顺便把算它们的那条 fild 也改指向。
@@ -1888,6 +1892,66 @@ struct Sites {
     // 2026-09-21:第四个派生量 0x00CDBD34(每显示帧秒数)的存量值。NULL = 没定位到 / 核对没过(只 WARN,不拒装)。
     float* spfTarget;
 };
+
+static const Pattern kSimPinPatterns[] = {
+    {"高度斜坡 初值(sub_73ABC0)", kSigSimPin0, (int)(sizeof kSigSimPin0 / sizeof kSigSimPin0[0]), 0x0073AC7C},
+    {"高度斜坡 消费(sub_715ED0)", kSigSimPin1, (int)(sizeof kSigSimPin1 / sizeof kSigSimPin1[0]), 0x00715FD9},
+    {"高度斜坡 消费(sub_778AA0)", kSigSimPin2, (int)(sizeof kSigSimPin2 / sizeof kSigSimPin2[0]), 0x00778B4B}
+};
+
+// 只读核对完整签名(操作数单独核对),同一判据用于干扫、冻结后预检查和写后复读。
+static bool verify_sim_pins(const Sites& s, unsigned wantOperand) {
+    unsigned floatBits = 0;
+    unsigned char floatBytes[sizeof floatBits];
+    const volatile unsigned char* constant = (const volatile unsigned char*)&g_simFps30;
+    for (size_t i = 0; i < sizeof floatBytes; ++i) floatBytes[i] = constant[i];
+    memcpy(&floatBits, floatBytes, sizeof floatBits);  // volatile 复读,不让 const 常量折叠替代现场值
+    if (floatBits != 0x41F00000u) {
+        FL_ERR("高度斜坡常量不是逐位 30.0 —— 拒绝安装");
+        return false;
+    }
+    for (int i = 0; i < 3; ++i) {
+        const Pattern& p = kSimPinPatterns[i];
+        const unsigned char* site = s.simPin[i];
+        if (!site || site == (unsigned char*)-1 || !mem::read_ok(site, (size_t)p.length)) {
+            FL_ERR("高度斜坡第 %d 处不可读 —— 拒绝安装", i + 1);
+            return false;
+        }
+        for (int j = 0; j < p.length; ++j) {
+            if (j >= 4 && j < 8) continue;
+            if (site[j] != (unsigned char)p.bytes[j]) {
+                FL_ERR("高度斜坡第 %d 处完整签名不符 @ %08X+%d —— 拒绝安装",
+                       i + 1, (unsigned)(uintptr_t)site, j);
+                return false;
+            }
+        }
+        unsigned operand = 0;
+        memcpy(&operand, site + 4, sizeof operand);
+        if (operand != wantOperand) {
+            FL_ERR("高度斜坡第 %d 处操作数 %08X != %08X —— 拒绝安装", i + 1, operand, wantOperand);
+            return false;
+        }
+    }
+    return true;
+}
+
+static int resolve_sim_pins(int targetFps, Sites& s) {
+    memset(s.simPin, 0, sizeof s.simPin);
+    s.simPinRequired = targetFps > g_retailFps && (g_groups & FL_G_DER_FPS) != 0;
+    s.simPinNeeded = s.simPinRequired || (targetFps > g_retailFps && (g_groups & FL_G_SIMPIN) != 0);
+    if (!s.simPinNeeded) return FL_OK;
+    FL_INFO("高度斜坡三处钉回 30.0:请求 mask=0x%08X,自动必需=%s,显式 SIMPIN=%s(候选,未认证跨 FPS 同步)",
+            (unsigned)g_groups, s.simPinRequired ? "是(高 FPS 将改共享 DER_FPS)" : "否",
+            (g_groups & FL_G_SIMPIN) ? "开" : "关");
+    for (int i = 0; i < 3; ++i) {
+        s.simPin[i] = scan(kSimPinPatterns[i]);
+        if (!s.simPin[i]) return FL_ERR_SIG_MISS;
+        if (s.simPin[i] == (unsigned char*)-1) return FL_ERR_SIG_AMBIGUOUS;
+    }
+    if (!verify_sim_pins(s, (unsigned)kEngineFpsFloatVa)) return FL_ERR_SIG_MISMATCH;
+    FL_INFO("高度斜坡三处原签名与 CDBC50 操作数已全部核验(只读)");
+    return FL_OK;
+}
 
 static bool add_redirect(Sites& s, void** operand, const char* name, int group, void* newTarget = NULL) {
     if (s.redirectCount >= (int)(sizeof s.redirect / sizeof s.redirect[0])) {
@@ -1954,6 +2018,9 @@ static int resolve_and_verify(int targetFps, Sites& s) {
     }
     FL_INFO("目标:客户端 %d 帧,逻辑 %d 帧,r = %d(每 %d 个客户端帧跑满 6 个阶段)",
             targetFps, logicFps, g_ratio, g_ratio);
+
+    const int rcSimPin = resolve_sim_pins(targetFps, s);
+    if (rcSimPin != FL_OK) return rcSimPin;
 
     // ★改之前先核对这三处操作数现在指向什么:地址对不上或数值不对,说明我们认错了地方,宁可不装。
     {
@@ -2315,6 +2382,9 @@ static int dry_run(int targetFps) {
 // ★为什么要拆出来:要拿同一把尺子去量**别人已经打过补丁的二进制**(比如社区的 60 帧成品),
 // 而那份二进制的粒子常量等数值已经被他改过,走完整校对会被拒装 ⇒ 就量不成了。
 static int resolve_perframe_only(Sites& s) {
+    memset(s.simPin, 0, sizeof s.simPin);
+    s.simPinNeeded = false;
+    s.simPinRequired = false;  // measure 维持零售帧率,不改 DER_FPS,无需高度读者重定向
     if (!resolve_module()) { FL_ERR("拿不到主模块或不是 32 位 PE"); return FL_ERR_BAD_PE; }
     log_environment();
     Pattern pPerFrame = {"逐帧推进块", kSigPerFrame, (int)(sizeof kSigPerFrame / sizeof(short)), 0x00602851};
@@ -2362,6 +2432,10 @@ static int install(int targetFps, bool measureOnly) {
     g_scrollOn  = false;
 
     mem::ThreadFreezer freeze;   // 改代码期间别让别的线程跑到这些字节上
+    if (s.simPinNeeded && !verify_sim_pins(s, (unsigned)kEngineFpsFloatVa)) {
+        FL_ERR("高度斜坡安装前复核失败 —— 尚未写任何游戏补丁");
+        return FL_ERR_SIG_MISMATCH;
+    }
     FL_INFO("已挂起其它线程 %d 个,开始写补丁", freeze.count);
 
     bool ok = true;
@@ -2847,26 +2921,18 @@ static int install(int targetFps, bool measureOnly) {
         }
     }
 
-    // ── ★★★ FL_G_SIMPIN(默认关;2026-09-28):运动器高度斜坡的三处 flt_CDBC50 读者钉回 30.0 ─────────────
+    // 高 FPS 改共享 DER_FPS 时自动必需;显式 SIMPIN 仍保留,三处必须整套核验与安装。
     g_simPinSites = 0;
-    if (ok && !measureOnly && (g_groups & FL_G_SIMPIN) && targetFps > g_retailFps) {
-        Pattern pSimPin0 = {"高度斜坡 初值(sub_73ABC0)", kSigSimPin0, (int)(sizeof kSigSimPin0 / sizeof kSigSimPin0[0]), 0x0073AC7C};
-        Pattern pSimPin1 = {"高度斜坡 消费(sub_715ED0)", kSigSimPin1, (int)(sizeof kSigSimPin1 / sizeof kSigSimPin1[0]), 0x00715FD9};
-        Pattern pSimPin2 = {"高度斜坡 消费(sub_778AA0)", kSigSimPin2, (int)(sizeof kSigSimPin2 / sizeof kSigSimPin2[0]), 0x00778B4B};
-        unsigned char* pins[3] = { scan(pSimPin0), scan(pSimPin1), scan(pSimPin2) };
-        int nOk = 0;
-        for (int i = 0; i < 3; ++i)
-            if (pins[i] && pins[i] != (unsigned char*)-1 && *(unsigned*)(pins[i] + 4) == (unsigned)kEngineFpsFloatVa) ++nOk;
-        if (nOk != 3) {
-            FL_WARN("模拟侧常量钉住:3 处只核对上 %d 处 —— 一处都不改。", nOk);
-        } else {
-            const void* p = (const void*)&g_simFps30;
-            for (int i = 0; ok && i < 3; ++i) {
-                ok = patch(pins[i] + 4, &p, 4, "高度斜坡 flt_CDBC50 → 常量 30");
-                if (ok) ++g_simPinSites;
-            }
-            if (ok) FL_INFO("  模拟侧常量钉住已装:高度斜坡 3 处改读常量 30.0(与原版逐位相同)");
+    if (ok && !measureOnly && s.simPinNeeded) {
+        const void* p = (const void*)&g_simFps30;
+        for (int i = 0; ok && i < 3; ++i) {
+            ok = patch(s.simPin[i] + 4, &p, 4, "高度斜坡 flt_CDBC50 → 常量 30");
+            if (ok) ++g_simPinSites;
         }
+        if (ok) ok = g_simPinSites == 3 && verify_sim_pins(s, (unsigned)(uintptr_t)p);
+        if (ok) FL_INFO("  高度斜坡 3 处改读常量 30.0 并逐位复读:自动必需=%s,请求 SIMPIN=%s(跨 FPS 同步待实测)",
+                        s.simPinRequired ? "是" : "否", (g_groups & FL_G_SIMPIN) ? "开" : "关");
+        else FL_ERR("高度斜坡三处写后核验失败 —— 将整体回滚");
     }
 
     // ── ★★★ FL_G_SIMGATE(默认关;2026-09-28):客户端帧开头的三件模拟工作按原版相位边界放行 ───────────────
@@ -3012,9 +3078,13 @@ static int install(int targetFps, bool measureOnly) {
         }
     }
 
+    if (ok && !measureOnly && s.simPinNeeded)
+        ok = g_simPinSites == 3 && verify_sim_pins(s, (unsigned)(uintptr_t)&g_simFps30);
+
     if (!ok) {
         FL_ERR("安装失败,正在整体回滚(不留半套补丁)");
         rollback();
+        g_simPinSites = 0;
         return FL_ERR_WRITE;
     }
     g_installed = true;
@@ -3300,9 +3370,10 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabSetGroups(int mask) {
             (fl::g_groups & FL_G_TRACER)
                 ? "(生成密度 / 伸展 / 移动钉回每秒 30 步 —— 开火不再像机关枪;未经实机验证)"
                 : "(默认:弹道流每秒生成条数是原版的 2/3 倍)");
-    FL_INFO("  模拟侧常量钉住(高度斜坡)=%s%s",
+    FL_INFO("  显式 SIMPIN(高度斜坡)请求=%s%s",
             (fl::g_groups & FL_G_SIMPIN) ? "开" : "关",
-            (fl::g_groups & FL_G_SIMPIN) ? "(联机安全修正 R-1;未经实机验证)" : "(默认:高度斜坡长度随本机帧率,联机会分歧)");
+            (fl::g_groups & FL_G_SIMPIN) ? "(高于零售帧率时要求三处核验并钉回 30.0;同步待实测)"
+                                      : "(高 FPS 改共享 DER_FPS 时仍自动要求三处钉回 30.0;无需设置此位)");
     FL_INFO("  相位边界门=%s%s",
             (fl::g_groups & FL_G_SIMGATE) ? "开" : "关",
             (fl::g_groups & FL_G_SIMGATE) ? "(联机安全修正 R-2/R-3/R-6a;只在 60 / 90 帧生效;未经实机验证)"
