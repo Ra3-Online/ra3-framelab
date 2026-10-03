@@ -1,6 +1,6 @@
 # Ra3 FrameLab / FpsTest
 
-> 本研究分支包含尚未发布的跨帧率联机候选修复。公开 `v0.2.1` 下载仍是已发布基线；候选未完成动作、完整状态和实际呈现率验收。研究范围与有限测试结果见 [跨帧率研究记录](docs/CROSSFPS_RESEARCH.md)。
+> 本研究分支包含尚未发布的跨帧率联机候选修复。公开 `v0.2.1` 下载仍是已发布基线；候选获得了有限生产、移动和攻击场景证据，完整状态、实际呈现率与跨机器联机仍未验证。失败轮次与覆盖限制见 [跨帧率研究记录](docs/CROSSFPS_RESEARCH.md)。
 
 红警 3（Red Alert 3）1.12 的实验性客户端帧率工具。当前版本 **0.2.1**，图形界面提供 **30 / 60 / 90 FPS**，包含帧率、动画时钟、车身悬挂及诊断工具。DLL 通过运行时内存补丁工作。
 
@@ -31,7 +31,7 @@ e212791928aca4fc3898c6af28f9081ffa28fc3758b009b44479037429f3b1fc
 - 原版 30 FPS 玩家与 90 FPS 玩家之间曾实际出现联机不同步，敌方单位偶尔不可见也仍需继续复核。
 - 炉子等环境特效可能偏快。新增镜头与 Tint 修正、模拟相关实验组尚缺完整场景及联机验收。
 - 目标帧率与实际帧率不一致时，现有基于显示帧计数的调度和视觉时间轴仍可能变慢。
-- `SIMPIN`、`SIMGATE` 默认关闭。不要将实验组理解为已经解决联机一致性。
+- 公开 `v0.2.1` 的 `SIMPIN`、`SIMGATE` 默认关闭。本研究候选在高帧率修改共享派生 FPS 时自动固定三处逻辑高度读者的原版时间尺度，`SIMGATE` 仍默认关闭；有限测试没有证明完整联机一致性。
 
 完整机制、上游 240 FPS 对照和验收边界见 [技术报告](docs/TECHNICAL.md)。
 
@@ -79,13 +79,15 @@ python .\tools\re\dryscan.py .\src\framelab.cpp "$env:FLAB_IMAGE"
 
 CLI 必须与 `Ra3FrameLab.dll` 放在同一目录。自动化时显式提供 PID，例如 `flctl.exe status 0 <PID>`、`flctl.exe dryrun 90 <PID>`。原始 `disable` / `unload` 命令保留给研究，已知冻结风险见运行说明。
 
-生成可分发文件：
+生成当前研究分支的候选包：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version 0.2.1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version 0.2.1-research-r1 -Rebuild
 ```
 
-输出便携二进制 ZIP、对应源码 ZIP 和 SHA-256 清单。发布内容包括本许可、版权说明、README 与技术报告；不包含作者的本地归档、日志、游戏或回放。CI 在 Windows 上重建和运行离线检查，游戏镜像扫描需由拥有游戏的开发者本地完成。
+默认包名使用 `0.2.1-research-r1`，CI 使用 `0.2.1-research-<提交短 SHA>`，与公开 `v0.2.1` 基线分开标识。本研究树拒绝使用无研究后缀的 `-Version 0.2.1`；GUI / DLL 内部数字版本仍为 `0.2.1`，不代表候选已发布或通过联机验收。未来正式版本需明确更新源码、内部版本和发布说明。
+
+输出便携二进制 ZIP、对应源码 ZIP 和 SHA-256 清单。内容包括本许可、版权说明、README、技术报告与当前跨帧率研究记录；不包含作者的本地归档、日志、游戏或回放。CI 在 Windows 上重建和运行离线检查，游戏镜像扫描需由拥有游戏的开发者本地完成。
 
 ## 仓库结构
 
