@@ -1,14 +1,21 @@
-# Create a portable x86 release and a curated source archive; nothing is uploaded.
+# Package this research tree as a labeled candidate; nothing is uploaded.
 # Run tools/build.ps1 -Target all -RunTests first, or supply -Rebuild.
 [CmdletBinding()]
 param(
     [ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+(?:[-.][A-Za-z0-9.-]+)?$')]
-    [string]$Version = '0.2.1',
+    [string]$Version = '0.2.1-research-r1',
     [string]$BuildDir = $env:FLAB_BUILD_DIR,
     [string]$PackageDir,
     [switch]$Rebuild
 )
 $ErrorActionPreference = 'Stop'
+# The published 0.2.1 name is reserved for the unchanged main/tag baseline.
+# Future numeric releases remain available after their source and binary versions are updated.
+$numericVersion = [regex]::Match($Version, '^[0-9]+\.[0-9]+\.[0-9]+').Value
+if ($numericVersion -eq '0.2.1' -and $Version -notmatch '^0\.2\.1-research-[A-Za-z0-9][A-Za-z0-9.-]*$') {
+    throw 'This research tree cannot package the published 0.2.1 label. Use 0.2.1-research-r1 (or another research suffix); build the unchanged main/tag for public 0.2.1.'
+}
+
 $root = [IO.Path]::GetFullPath((Split-Path $PSScriptRoot -Parent))
 if ([string]::IsNullOrWhiteSpace($BuildDir)) { $BuildDir = Join-Path $root 'build' }
 if (-not [IO.Path]::IsPathRooted($BuildDir)) { $BuildDir = Join-Path $root $BuildDir }
@@ -21,13 +28,14 @@ if ($Rebuild) { & (Join-Path $PSScriptRoot 'build.ps1') -Target all -BuildDir $b
 
 $binaryNames = @('Ra3FpsTest.exe', 'Ra3FrameLab.dll', 'flctl.exe', 'test_schedule.exe', 'test_loader.exe')
 $documents = @('README.md', 'LICENSE', 'NOTICE.md', 'CHANGELOG.md', 'SETUP.md', 'docs\TECHNICAL.md')
+$researchDocument = 'docs\CROSSFPS_RESEARCH.md'
+if (Test-Path -LiteralPath (Join-Path $root $researchDocument) -PathType Leaf) { $documents += $researchDocument }
 foreach ($name in $binaryNames) {
     if (-not (Test-Path -LiteralPath (Join-Path $build $name) -PathType Leaf)) { throw "Missing build artifact: $name. Build -Target all first." }
 }
 foreach ($name in $documents) {
     if (-not (Test-Path -LiteralPath (Join-Path $root $name) -PathType Leaf)) { throw "Missing release document: $name" }
 }
-$numericVersion = [regex]::Match($Version, '^[0-9]+\.[0-9]+\.[0-9]+').Value
 $guiVersion = (Get-Item -LiteralPath (Join-Path $build 'Ra3FpsTest.exe')).VersionInfo.ProductVersion
 if ($guiVersion -ne ($numericVersion + '.0')) { throw "GUI product version $guiVersion does not match release $Version." }
 
