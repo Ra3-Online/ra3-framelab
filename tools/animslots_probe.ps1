@@ -42,8 +42,14 @@ $ErrorActionPreference = "Stop"
 $OutDir = Get-FlabOutputPath $OutDir "build\logs" -Directory
 
 # The sandbox narrows PATHEXT to ".CPL", which makes every .exe look like a document and
-# refuses to run it inside a pipeline. Restore it before calling anything.
-$env:PATHEXT = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.CPL"
+# refuses to run it inside a pipeline. Temporarily ensure .EXE without dropping extensions.
+$probeOriginalPathExt = [Environment]::GetEnvironmentVariable('PATHEXT', 'Process')
+try {
+if ([string]::IsNullOrWhiteSpace($probeOriginalPathExt)) {
+    $env:PATHEXT = '.COM;.EXE;.BAT;.CMD'
+} elseif (($probeOriginalPathExt -split ';' | ForEach-Object { $_.Trim() }) -notcontains '.EXE') {
+    $env:PATHEXT = $probeOriginalPathExt + ';.EXE'
+}
 
 # flctl writes its table in UTF-8. Without this, PowerShell decodes that stream using the
 # console codepage (cp936 on this machine) and the Chinese labels come out as mojibake --
@@ -152,4 +158,7 @@ finally {
     # restoring code hooks while threads may be running inside them freezes the game.
     if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
     Remove-Item $playPath -Force -ErrorAction SilentlyContinue
+}
+} finally {
+    [Environment]::SetEnvironmentVariable('PATHEXT', $probeOriginalPathExt, 'Process')
 }

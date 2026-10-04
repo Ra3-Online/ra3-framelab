@@ -936,7 +936,7 @@ static bool JobPatch(DWORD& outPid, HANDLE& outProc, JobCtx& ctx) {
             DWORD gr = 0;
             if (RemoteCall(proc, setGroups, (void*)(uintptr_t)EffectiveGroups(), &gr, 60000)) {
                 LogF(L"[OK]   改动分组 = 0x%04X（返回 %lu）%s", EffectiveGroups(), (unsigned long)gr,
-                     g_groupsOverridden ? L" ★由环境变量 RA3FL_GROUPS 覆盖，不是出厂默认 0x2CFFF" : L"");
+                     g_groupsOverridden ? L" ★由环境变量 RA3FL_GROUPS 覆盖，未采用界面选项组合" : L"");
             } else {
                 LogLine(L"[WARN] 设置改动分组失败，继续尝试启用。");
             }
@@ -973,8 +973,8 @@ static bool JobPatch(DWORD& outPid, HANDLE& outProc, JobCtx& ctx) {
                     LogLine(L"[WARN] 读不到载具颠簸修复的状态（DLL 太旧？）。");
                 }
             }
-            // 2026-09-28:迷雾可见性相位(随默认分组生效,修「敌方单位偶尔隐身」)+ 联机修正(0x20000000 / 0x40000000,
-            //   默认关,只能用 RA3FL_GROUPS 打开)—— 同样报「到底开没开成」。
+            // 高帧率修改共享 DER_FPS 时自动要求三处逻辑高度 pin；无需显式 SIMPIN 位。
+            // SIMGATE 仍是显式实验组。这里报告安装状态，不把它当作完整场景验收。
             if (ctx.fps > 30) {
                 void* simStatus = RemoteExport(pid, localBase, "FrameLabSimStatus");
                 DWORD ss3 = 0;
@@ -983,9 +983,9 @@ static bool JobPatch(DWORD& outPid, HANDLE& outProc, JobCtx& ctx) {
                     if (v == -2) {
                         LogLine(L"[!!]   联机修正【没装上】（特征未命中？）—— 请把 logs 里的日志发给开发者。");
                     } else if (v > 0) {
-                        if (v & 1) LogLine(L"[OK]   迷雾可见性相位已改回原版（每逻辑帧刷新一次，修敌方单位偶尔「隐身」）。");
+                        if (v & 1) LogLine(L"[OK]   迷雾可见性相位补丁已安装；敌方可见性仍需按实际场景核对。");
                         else       LogLine(L"[!!]   迷雾可见性相位【没改成】—— 60/90 帧下敌方单位可能偶尔「隐身」。");
-                        if (v & 2) LogLine(L"[OK]   联机修正：高度斜坡已钉回原版（0x20000000）。");
+                        if (v & 2) LogLine(L"[OK]   三处运动器高度时间尺度保持原版（高帧率默认组合自动安装）。");
                         if (v & 4) LogLine(L"[OK]   联机修正：相位边界门已生效（0x40000000）。");
                     }
                 } else {
@@ -1070,13 +1070,13 @@ static bool JobPatch(DWORD& outPid, HANDLE& outProc, JobCtx& ctx) {
             // 2026-09-22:用户实测「30 帧原版玩家 ＋ 90 帧补丁玩家」同场对战 → 不同步。
             //   锁步模型要求两端算出逐位相同的模拟状态。**原版本身允许两台机器渲染帧率不同**
             //   (慢机渲染 18 帧、快机 30 帧照样同步),所以「渲染变快」本身不应该导致不同步;
-            //   实测却不同步 ⇒ 补丁改的某个量被模拟侧读到了。是哪一个还没逐字段对账清楚,
-            //   所以这里只给保守建议,不把它说成「锁步的必然结果」(那是把未知说成已知)。
+            //   当前候选的无限岛 30/60/90 三开仍实际不同步，随包报告记录条件和首差。
+            //   历史与当前失败均保留，有限校验匹配不能作为完整联机验收。
             if (ctx.fps > 30) {
-                LogLine(L"[!!]   联机提醒：实测「30 帧原版玩家 ＋ 90 帧补丁玩家」同场对战 = 不同步。");
-                LogLine(L"       在查清原因之前，请只和【同样装了这个补丁、且目标帧率相同】的玩家联机；");
-                LogLine(L"       即便双方都装、帧率相同，也【从未测过】，不保证同步。");
-                LogLine(L"       单机 / 战役 / 遭遇战 / 自己看自己录的录像，都不受影响。");
+                LogLine(L"[研究] 当前候选仍有实际跨帧率不同步，30 / 60 / 90 联机尚未通过验收，实测条件见随包报告。");
+                LogLine(L"       使用默认配置核对报告中的组合；其它帧率、专家分组或 MOD 组合需要独立验证。");
+                LogLine(L"       请退出游戏后再切换补丁配置；运行中的卸载不是可靠的恢复流程。");
+                LogLine(L"       单机、战役和回放也请结合实际场景与日志判断。");
             }
             break;
         }
@@ -1306,8 +1306,8 @@ static void JobMeasureLoop(DWORD pid, HANDLE gameProc, int targetFps, int maxCyc
 // --auto usable from a script: an always-zero exit code would make a failing run look fine.
 static bool RunJob(JobCtx ctx) {
     LogF(L"===== 目标 %d 帧 ｜ 目录 %s =====", ctx.fps, ctx.dir.c_str());
-    LogF(L"补丁版本 %s ｜ 改动分组 0x%04X%s", L"0.2.0", EffectiveGroups(),
-         g_groupsOverridden ? L"（★环境变量 RA3FL_GROUPS 覆盖；出厂默认是 0x2CFFF）" : L"");
+    LogF(L"补丁版本 %s ｜ 改动分组 0x%04X%s", L"0.2.1 research-r2", EffectiveGroups(),
+         g_groupsOverridden ? L"（★环境变量 RA3FL_GROUPS 覆盖；未采用界面选项组合）" : L"");
     if (!g_groupsOverridden)
         LogF(L"载具颠簸修复 = %s", g_chassisFix
              ? L"开（车身悬挂递推钉回每秒 30 步 + 位姿插值；分组多出 0x380000）"
@@ -1537,9 +1537,9 @@ static void CreateUi(HWND h) {
                              WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST,
                              80, 15, 220, 220, h, (HMENU)IDC_FPS_COMBO, g_hInst, NULL);
     SendMessageW(g_hFps, CB_ADDSTRING, 0, (LPARAM)L"30 帧（原版速度基线，r = 2）");
-    SendMessageW(g_hFps, CB_ADDSTRING, 0, (LPARAM)L"60 帧（r = 4）");
-    SendMessageW(g_hFps, CB_ADDSTRING, 0, (LPARAM)L"90 帧（r = 6，需要 ≥90Hz 屏幕）");
-    SendMessageW(g_hFps, CB_SETCURSEL, 1, 0);   // default 60: correct on every machine
+    SendMessageW(g_hFps, CB_ADDSTRING, 0, (LPARAM)L"60 帧（r = 4，互联未验收）");
+    SendMessageW(g_hFps, CB_ADDSTRING, 0, (LPARAM)L"90 帧（研究候选，r = 6）");
+    SendMessageW(g_hFps, CB_SETCURSEL, 2, 0);   // research-r2 default; target and measured output remain distinct
 
     // 2026-09-21:载具颠簸修复的开关,放在帧数下拉框右边,默认勾上。取消勾选 = 与旧版逐位相同的出厂掩码(做 A/B 用)。
     g_hChassis = CreateWindowExW(0, L"BUTTON", L"修复载具上下颠簸（60/90 帧，实验）",

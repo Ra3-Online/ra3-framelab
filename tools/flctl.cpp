@@ -6,6 +6,7 @@
 //   flctl enable [帧率]     注入并启用(默认 60)
 //   flctl disable           还原所有改动(DLL 留在进程里)
 //   flctl status            查询当前状态(0 = 未启用,否则为当前目标帧率)
+//   flctl simstatus         查询模拟相位修正安装位(1=可见性,2=高度pin,4=边界门,8=原R4);不是联机安全验收
 //   flctl diag              把诊断快照写进 DLL 日志
 //   flctl unload            先还原再把 DLL 从游戏进程卸掉(换新版 DLL 时用)
 //   flctl measure           只量不改:装帧计数器但不改帧率(自动化验证的基线组)
@@ -182,6 +183,7 @@ int main(int argc, char** argv) {
     const char* exportName = "FrameLabStatus";
     void* arg = NULL;
     if (_stricmp(cmd, "enable") == 0) { exportName = "FrameLabEnable"; arg = (void*)(uintptr_t)fps; }
+    else if (_stricmp(cmd, "simstatus") == 0) exportName = "FrameLabSimStatus";
     else if (_stricmp(cmd, "dryrun") == 0) { exportName = "FrameLabDryRun"; arg = (void*)(uintptr_t)fps; }
     else if (_stricmp(cmd, "measure") == 0) exportName = "FrameLabMeasureOnly";
     // * measureex <groups>: "measure only" WITH an explicit groups mask. Needed because

@@ -31,7 +31,7 @@ param(
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "common.ps1")
 
-# ------ 2026-09-17 (batch 9) sandbox compatibility: restore PATHEXT ------------------------------------------------------------------
+# ------ 2026-09-17 (batch 9) temporary .EXE compatibility ------------------------------------------------------------------
 # Symptom: every `& $flctl ...` call threw
 #     "Cannot run a document in the middle of a pipeline: ...\build\flctl.exe"
 # even though the file existed and ran fine from bash. Root cause found by probing:
@@ -40,12 +40,15 @@ $ErrorActionPreference = "Stop"
 # every .exe is treated as a *document* and cannot be run from a pipeline. This broke
 # determinism.ps1 after it had waited 3h24m for the user's game to exit -- and, worse,
 # it aborted *after* launching the game, with no cleanup.
-# Fix: restore the standard list. Idempotent on a normal machine (we overwrite with the
-# standard value), so it is safe to keep unconditionally. ASCII-only comment on purpose:
+# Preserve caller extensions; only an empty value needs the standard fallback.
+# Restore the original process value in finally. ASCII-only comment on purpose:
 # PowerShell 5.1 misreads BOM-less UTF-8 Chinese.
-if ($env:PATHEXT -notmatch '\.EXE') {
-    $env:PATHEXT = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.CPL"
-    Write-Host ("note: PATHEXT was missing .EXE; restored to " + $env:PATHEXT)
+$probeOriginalPathExt = [Environment]::GetEnvironmentVariable('PATHEXT', 'Process')
+try {
+if ([string]::IsNullOrWhiteSpace($probeOriginalPathExt)) {
+    $env:PATHEXT = '.COM;.EXE;.BAT;.CMD'
+} elseif (($probeOriginalPathExt -split ';' | ForEach-Object { $_.Trim() }) -notcontains '.EXE') {
+    $env:PATHEXT = $probeOriginalPathExt + ';.EXE'
 }
 
 $lab       = Split-Path $PSScriptRoot -Parent
@@ -155,3 +158,6 @@ $results | Format-Table -AutoSize
 Write-Host "NOTE: surviving is NOT proof the simulation is untouched -- it is a failed attempt to"
 Write-Host "      falsify it. A desync IS proof that it is touched."
 Remove-Item $playPath -Force -ErrorAction SilentlyContinue
+} finally {
+    [Environment]::SetEnvironmentVariable('PATHEXT', $probeOriginalPathExt, 'Process')
+}

@@ -89,7 +89,14 @@ $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "common.ps1")
 $OutDir = Get-FlabOutputPath $OutDir "build\logs" -Directory
 
-$env:PATHEXT = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.CPL"
+# Preserve caller extensions and restore process environment even on early failure.
+$probeOriginalPathExt = [Environment]::GetEnvironmentVariable('PATHEXT', 'Process')
+try {
+if ([string]::IsNullOrWhiteSpace($probeOriginalPathExt)) {
+    $env:PATHEXT = '.COM;.EXE;.BAT;.CMD'
+} elseif (($probeOriginalPathExt -split ';' | ForEach-Object { $_.Trim() }) -notcontains '.EXE') {
+    $env:PATHEXT = $probeOriginalPathExt + ';.EXE'
+}
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
@@ -461,4 +468,7 @@ finally {
     if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 3
     Remove-Item $playPath -Force -ErrorAction SilentlyContinue
+}
+} finally {
+    [Environment]::SetEnvironmentVariable('PATHEXT', $probeOriginalPathExt, 'Process')
 }

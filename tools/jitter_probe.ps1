@@ -68,13 +68,16 @@ $ErrorActionPreference = "Stop"
 $OutDir = Get-FlabOutputPath $OutDir "build\logs" -Directory
 
 # ---------------------------------------------------------------------------------------------
-# Sandbox compatibility: restore PATHEXT. The sandbox narrows PATHEXT to ".CPL" only, and
+# Temporary .EXE compatibility. The sandbox narrows PATHEXT to ".CPL" only, and
 # PowerShell decides "is this an executable?" from PATHEXT -- so every .exe becomes a "document"
 # and cannot be run from a pipeline. Symptom: "Cannot run a document in the middle of a pipeline".
 # ---------------------------------------------------------------------------------------------
-if ($env:PATHEXT -notmatch '\.EXE') {
-    $env:PATHEXT = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.CPL"
-    Write-Host ("note: PATHEXT was missing .EXE; restored to " + $env:PATHEXT)
+$probeOriginalPathExt = [Environment]::GetEnvironmentVariable('PATHEXT', 'Process')
+try {
+if ([string]::IsNullOrWhiteSpace($probeOriginalPathExt)) {
+    $env:PATHEXT = '.COM;.EXE;.BAT;.CMD'
+} elseif (($probeOriginalPathExt -split ';' | ForEach-Object { $_.Trim() }) -notcontains '.EXE') {
+    $env:PATHEXT = $probeOriginalPathExt + ';.EXE'
 }
 
 $lab      = Split-Path $PSScriptRoot -Parent
@@ -229,3 +232,6 @@ $results | Format-Table -AutoSize
 Write-Host "Compare the 'residual std (ms)' line in each _jitter_*.txt. Same replay, same scene, so"
 Write-Host "the ratio between arms is the evidence -- an absolute number alone is not."
 Remove-Item $playPath -Force -ErrorAction SilentlyContinue
+} finally {
+    [Environment]::SetEnvironmentVariable('PATHEXT', $probeOriginalPathExt, 'Process')
+}

@@ -38,9 +38,13 @@ $ErrorActionPreference = "Stop"
 $Out = Get-FlabOutputPath $Out "build\logs\_watch.txt"
 
 # Sandbox: PATHEXT is narrowed to ".CPL", so PowerShell treats every .exe as a document and
-# refuses to run it from a pipeline. Restore the standard list (idempotent on a normal machine).
-if ($env:PATHEXT -notmatch '\.EXE') {
-    $env:PATHEXT = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.CPL"
+# refuses to run it from a pipeline. Temporarily ensure .EXE without dropping extensions.
+$probeOriginalPathExt = [Environment]::GetEnvironmentVariable('PATHEXT', 'Process')
+try {
+if ([string]::IsNullOrWhiteSpace($probeOriginalPathExt)) {
+    $env:PATHEXT = '.COM;.EXE;.BAT;.CMD'
+} elseif (($probeOriginalPathExt -split ';' | ForEach-Object { $_.Trim() }) -notcontains '.EXE') {
+    $env:PATHEXT = $probeOriginalPathExt + ';.EXE'
 }
 
 $lab   = Split-Path $PSScriptRoot -Parent
@@ -142,3 +146,6 @@ if ($null -eq $exitCode) {
 }
 Flush
 exit 0
+} finally {
+    [Environment]::SetEnvironmentVariable('PATHEXT', $probeOriginalPathExt, 'Process')
+}
