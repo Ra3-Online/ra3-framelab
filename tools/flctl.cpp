@@ -334,7 +334,22 @@ int main(int argc, char** argv) {
     // 而且控制台代码页会把中文输出搞乱,拿中文当判据是给自己挖坑)。
     std::printf("RESULT=%ld\n", (long)(int)result);
     if (_stricmp(cmd, "enable") == 0) {
-        if (result == 0) std::printf("已启用。日志在 DLL 旁边的 logs\\ 目录里。\n");
+        if (result == 0) {
+            if (fps == 60 || fps == 90) {
+                void* localStatus = (void*)GetProcAddress(localBase, "FrameLabSimStatus");
+                void* remoteStatus = localStatus ? (void*)((unsigned char*)remoteBase +
+                    ((unsigned char*)localStatus - (unsigned char*)localBase)) : NULL;
+                DWORD sim = 0;
+                if (!remoteStatus || !call_remote(proc, remoteStatus, NULL, &sim) || (int)sim <= 0 || !(sim & 4)) {
+                    std::printf("必需的相位边界门未确认安装。请检查 DLL 版本和日志。\n");
+                    CloseHandle(proc);
+                    return 24;
+                }
+                std::printf("SIMSTATUS=%ld\n", (long)(int)sim);
+                std::printf("60/90 必需相位边界门已安装3/3；联机验证范围见技术报告。\n");
+            }
+            std::printf("已启用。日志在 DLL 旁边的 logs\\ 目录里。\n");
+        }
         else std::printf("未启用(错误码 %lu)。把 logs\\ 里的日志发回来就能定位。\n", result);
     } else if (_stricmp(cmd, "dryrun") == 0) {
         if (result == 0) std::printf("干扫通过:可以安装,游戏一个字节都没改。\n");

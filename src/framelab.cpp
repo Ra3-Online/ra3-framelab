@@ -44,7 +44,7 @@
 #include "chassis_gate.h"   // 2026-09-21:车身外观 30 Hz 节拍门的纯逻辑(与离线自检共用)
 
 // ───────────────────────────── 版本与状态码 ─────────────────────────────
-#define FL_VERSION "0.2.1"
+#define FL_VERSION "0.2.2-dev1"
 
 enum FlStatus {
     FL_OK = 0,
@@ -57,7 +57,7 @@ enum FlStatus {
     FL_ERR_FPS_GLOBALS = 22,     // 帧率全局量的值不对(不是 15 / 30)
     FL_ERR_RATIO = 23,           // 目标帧率不是逻辑帧率的整数倍,或倍数超出支持范围
     FL_ERR_SIG_MISMATCH = 24,    // 特征命中了,但现场的值/操作数不是我们预期的那份构建
-    FL_ERR_WRITE = 30,           // 写内存失败(已回滚)
+    FL_ERR_WRITE = 30,           // 写入或还原核验失败;还原未完成时保留撤销表并拒绝新装
     FL_ERR_SUSPEND = 31,         // 挂起其它线程失败
     FL_ERR_BB_FILTER = 32,       // 黑匣子:良性异常码过滤失效(它把通知类异常也记成崩溃了)
 };
@@ -172,6 +172,13 @@ static void init(HMODULE self) {
 // 给黑匣子用:崩溃报告必须和主日志落在**同一个目录**里。让 bb 自己再算一遍路径的话,
 // 两处迟早会漂开(比如有人改了 RA3FL_LOG 只改了一边)⇒ 提供一个只读访问器。
 static const char* path() { return g_path; }
+
+// Acquire before suspending peers so a suspended logger cannot hold this lock.
+struct PatchLogLock {
+    bool held;
+    PatchLogLock() : held(g_ready) { if (held) EnterCriticalSection(&g_lock); }
+    ~PatchLogLock() { if (held) LeaveCriticalSection(&g_lock); }
+};
 }  // namespace log
 
 // 黑匣子(完整实现在文件末尾的 bb 命名空间)。这里先声明,因为逐帧钩子在文件中间就要用它,
@@ -182,6 +189,16 @@ namespace bb { void tick(void* frameObj); }
 //   (第一版直接在导出里写 bb::g_trkAddr,编译报 C2039「不是 bb 的成员」——
 //    那时 bb 里只有上面这一行前向声明)。返回 0 成功 / -1 地址被拒。
 namespace bb { int set_track_addr(unsigned addr); }
+
+// Serialize exported operations that share the patch table or preparation state.
+// This lock is acquired before any checks and before the logging/freezer locks.
+namespace api {
+static SRWLOCK g_patchLock = SRWLOCK_INIT;
+struct PatchGuard {
+    PatchGuard() { AcquireSRWLockExclusive(&g_patchLock); }
+    ~PatchGuard() { ReleaseSRWLockExclusive(&g_patchLock); }
+};
+}
 
 // ───────────────────────────── 内存工具 ─────────────────────────────
 namespace mem {
@@ -199,35 +216,43 @@ static bool read_ok(const void* addr, size_t n) {
     return true;
 }
 
+// Used only by the owned-memory self-test; never configured by the launcher.
+static int g_writeFault = 0;
 static bool write(void* addr, const void* data, size_t n) {
     DWORD oldProtect = 0;
     if (!VirtualProtect(addr, n, PAGE_EXECUTE_READWRITE, &oldProtect)) return false;
-    memcpy(addr, data, n);
-    FlushInstructionCache(GetCurrentProcess(), addr, n);
+    const int fault = g_writeFault;
+    g_writeFault = 0;
+    if (fault != 1) memcpy(addr, data, n);
+    const bool flushed = FlushInstructionCache(GetCurrentProcess(), addr, n) != FALSE;
     DWORD tmp = 0;
-    VirtualProtect(addr, n, oldProtect, &tmp);
-    return true;
+    const bool protectedAgain = fault != 4 && VirtualProtect(addr, n, oldProtect, &tmp) != FALSE;
+    return flushed && protectedAgain && fault != 2 && fault != 3;
 }
 
 // 除自己以外的线程全部挂起:改代码字节时别让别的线程正好执行到那里
 struct ThreadFreezer {
     HANDLE handles[256];
     int count;
-    ThreadFreezer() : count(0) {
+    bool ready;
+    ThreadFreezer() : count(0), ready(false) {
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if (snap == INVALID_HANDLE_VALUE) return;
         THREADENTRY32 te;
         te.dwSize = sizeof te;
         const DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+        bool complete = true;
         if (Thread32First(snap, &te)) {
             do {
                 if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
-                if (count >= 256) break;
+                if (count >= 256) { complete = false; break; }
                 HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
                 if (h && SuspendThread(h) != (DWORD)-1) handles[count++] = h;
-                else if (h) CloseHandle(h);
+                else { if (h) CloseHandle(h); complete = false; break; }
             } while (Thread32Next(snap, &te));
-        }
+            if (complete && GetLastError() != ERROR_NO_MORE_FILES) complete = false;
+        } else complete = false;
+        ready = complete;
         CloseHandle(snap);
     }
     ~ThreadFreezer() {
@@ -1099,6 +1124,8 @@ struct Undo {
     void* address;
     unsigned char before[64];
     int size;
+    struct Protection { void* address; SIZE_T size; DWORD value; } protection[2];
+    int protectionCount;
 };
 
 static HMODULE g_self = NULL;
@@ -1184,6 +1211,7 @@ static Undo g_undo[128];
 static const int kUndoMax = (int)(sizeof g_undo / sizeof g_undo[0]);
 static int g_undoCount = 0;
 static bool g_installed = false;
+static bool g_patchPoisoned = false; // Failed restore: keep the undo table and refuse another install.
 
 // 我们自己的常量:被游戏代码的操作数直接指过来(所以必须是进程内固定地址的全局)
 static float g_constRetailFramesPerMs = 0.03f;   // 30 * 0.001
@@ -1320,6 +1348,19 @@ static int            g_simPinSites  = 0;       // R-1 改指成功的处数(应
 static int            g_simGateSites = 0;       // 边界门改指成功的处数(应为 3)
 static bool           g_simGateOn    = false;
 static volatile long  g_simGateHeld  = 0;       // 边界门挡下的次数(只做记账)
+// 成功安装的需求快照；后续 SetGroups 或拒绝的 DryRun 不改这份合同。
+struct SimInstallContract {
+    int targetFps;
+    int ratio;
+    int retailFps;
+    unsigned requestedGroups;
+    bool measureOnly;
+    bool pinNeeded;
+    bool pinRequired;
+    bool gateNeeded;
+    bool gateRequired;
+};
+static SimInstallContract g_simInstalled = {};
 static int   g_scrollSites = 0;           // resolve 时定位并核对通过的补丁点个数(应为 2;不是 2 就一处都不登记)
 static bool  g_scrollOn    = false;       // 两处是否真的改指了(给 FrameLabScrollStatus 用)
 // 2026-09-22:弹道流节拍门(见 FL_G_TRACER)。只需要一个「上次转发时的 30 Hz 虚拟帧号」,不需要表 ——
@@ -1341,21 +1382,50 @@ static volatile long  g_chsNoSlot = 0;       // 表满退回直通的总次数(�
 
 static bool remember(void* address, int size) {
     if (g_undoCount >= kUndoMax) { FL_ERR("撤销表已满(%d 处)—— 拒绝继续改,否则回滚会残缺", kUndoMax); return false; }
-    if (size > 64) { FL_ERR("单次改动 %d 字节超过撤销表格子上限 64", size); return false; }
-    Undo& u = g_undo[g_undoCount++];
+    if (size <= 0 || size > 64 || !mem::read_ok(address, (size_t)size)) {
+        FL_ERR("补丁范围不可读或长度无效(%d)", size); return false;
+    }
+    Undo& u = g_undo[g_undoCount];
     u.address = address;
     u.size = size;
+    u.protectionCount = 0;
+    uintptr_t cursor = (uintptr_t)address, end = cursor + (size_t)size;
+    while (cursor < end) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (u.protectionCount == 2 || !VirtualQuery((void*)cursor, &mbi, sizeof mbi)) return false;
+        const uintptr_t regionEnd = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (regionEnd <= cursor) return false;
+        Undo::Protection& p = u.protection[u.protectionCount++];
+        p.address = (void*)cursor;
+        p.size = (SIZE_T)((regionEnd < end ? regionEnd : end) - cursor);
+        p.value = mbi.Protect;
+        cursor += p.size;
+    }
     memcpy(u.before, address, (size_t)size);
+    ++g_undoCount;
     return true;
 }
 
+static bool restore_protection(const Undo& u) {
+    bool ok = true;
+    for (int i = 0; i < u.protectionCount; ++i) {
+        const Undo::Protection& p = u.protection[i];
+        DWORD ignored = 0;
+        const bool restored = VirtualProtect(p.address, p.size, p.value, &ignored) != FALSE;
+        MEMORY_BASIC_INFORMATION mbi;
+        const bool verified = VirtualQuery(p.address, &mbi, sizeof mbi) != 0 && mbi.Protect == p.value;
+        ok = restored && verified && ok;
+    }
+    return ok;
+}
+
 static bool patch(void* address, const void* data, int size, const char* what) {
+    if (size <= 0 || size > 64 || !mem::read_ok(address, (size_t)size)) return false;
     char beforeHex[256], afterHex[256];
     log::hex(address, (size_t)(size > 24 ? 24 : size), beforeHex, sizeof beforeHex);
     if (!remember(address, size)) { FL_ERR("放弃改动 %s @ %08X", what, (unsigned)(uintptr_t)address); return false; }
     if (!mem::write(address, data, (size_t)size)) {
         FL_ERR("写入失败 %s @ %08X (%d 字节),已记录原字节,准备回滚", what, (unsigned)(uintptr_t)address, size);
-        --g_undoCount;
         return false;
     }
     log::hex(address, (size_t)(size > 24 ? 24 : size), afterHex, sizeof afterHex);
@@ -1365,10 +1435,12 @@ static bool patch(void* address, const void* data, int size, const char* what) {
     if (memcmp(address, data, (size_t)size) != 0) {
         FL_ERR("★写入未通过核验 %s @ %08X:写完之后字节仍不是我们要写的(现在 %s)—— 当作失败处理",
                what, (unsigned)(uintptr_t)address, afterHex);
-        --g_undoCount;   // 这条撤销记录作废,别让它参与回滚
         return false;
     }
     FL_INFO("已改并核验 %-24s @ %08X  %d 字节  改前 %s  改后 %s", what, (unsigned)(uintptr_t)address, size, beforeHex, afterHex);
+    if (!restore_protection(g_undo[g_undoCount - 1])) {
+        FL_ERR("补丁页面保护未恢复,保留撤销记录"); return false;
+    }
     return true;
 }
 
@@ -1385,7 +1457,8 @@ static int rollback() {
     for (int i = g_undoCount - 1; i >= 0; --i) {
         Undo& u = g_undo[i];
         const bool wrote = g_selfTestNoWrite ? true : mem::write(u.address, u.before, (size_t)u.size);
-        const bool same = wrote && mem::read_ok(u.address, (size_t)u.size) &&
+        const bool protection = restore_protection(u);
+        const bool same = wrote && protection && mem::read_ok(u.address, (size_t)u.size) &&
                           memcmp(u.address, u.before, (size_t)u.size) == 0;
         if (same) {
             ++ok;
@@ -1394,7 +1467,8 @@ static int rollback() {
             ++bad;
             char nowHex[256], wantHex[256];
             const size_t show = (size_t)(u.size > 24 ? 24 : u.size);
-            log::hex(u.address, show, nowHex, sizeof nowHex);
+            if (mem::read_ok(u.address, show)) log::hex(u.address, show, nowHex, sizeof nowHex);
+            else strcpy_s(nowHex, "<不可读>");
             log::hex(u.before, show, wantHex, sizeof wantHex);
             FL_ERR("★还原未通过核验 @ %08X:现在 %s | 应为 %s(%s)—— 进程状态可能不一致,建议重启游戏",
                    (unsigned)(uintptr_t)u.address, nowHex, wantHex,
@@ -1403,7 +1477,8 @@ static int rollback() {
     }
     if (bad == 0) FL_INFO("还原核验:%d/%d 处逐字节回到原样", ok, ok);
     else          FL_ERR("★还原核验:%d 处通过,**%d 处未通过** —— 请把本日志发回来,并重启游戏", ok, bad);
-    g_undoCount = 0;
+    g_patchPoisoned = bad != 0;
+    if (bad == 0) g_undoCount = 0;
     return bad;
 }
 
@@ -1857,7 +1932,7 @@ static void log_error_legend() {
     FL_INFO("            20=特征没找到(主程序不是我们支持的那份构建,或已被别的补丁改过)");
     FL_INFO("            21=特征命中多处(不敢下手) 22=帧率全局量异常 23=目标帧率不是逻辑帧率的整数倍");
     FL_INFO("            24=特征命中了但现场值不对(不是我们支持的那份构建)");
-    FL_INFO("            30=写内存失败(已整体回滚) 31=挂起线程失败");
+    FL_INFO("            30=写入或还原核验失败,须查看还原记录 31=挂起线程失败");
     FL_INFO("            请把本目录 logs 下的这个 .log 文件整份发回来,以上信息足以定位。");
 }
 
@@ -1883,6 +1958,10 @@ struct Sites {
     unsigned char* simPin[3];  // 高度斜坡读者:干扫与安装共用核验结果
     bool simPinNeeded;
     bool simPinRequired;       // 高 FPS 改共享 DER_FPS 时自动必需,不依赖请求 mask 的 SIMPIN 位
+    unsigned char* simGate[3];
+    unsigned char simGateOriginal[3][16]; // 完整上下文；XfFlush 窗口包含 Destroy call
+    bool simGateNeeded;
+    bool simGateRequired;
 
     // 引擎在启动时算好的三个派生量(浮点帧率 / 每帧毫秒 / 每毫秒帧数):
     // 我们注入时它们早算完了,得按同样公式按新帧率写回去;顺便把算它们的那条 fild 也改指向。
@@ -1898,6 +1977,104 @@ static const Pattern kSimPinPatterns[] = {
     {"高度斜坡 消费(sub_715ED0)", kSigSimPin1, (int)(sizeof kSigSimPin1 / sizeof kSigSimPin1[0]), 0x00715FD9},
     {"高度斜坡 消费(sub_778AA0)", kSigSimPin2, (int)(sizeof kSigSimPin2 / sizeof kSigSimPin2[0]), 0x00778B4B}
 };
+
+static const Pattern kSimGatePatterns[] = {
+    {"ModelCondition 同步调用点", kSigMcSyncCall, (int)(sizeof kSigMcSyncCall / sizeof kSigMcSyncCall[0]), 0x0062666B},
+    {"变换冲刷调用点", kSigXfFlushCall, (int)(sizeof kSigXfFlushCall / sizeof kSigXfFlushCall[0]), 0x006266F7},
+    {"销毁表调用点", kSigDestroyCall, (int)(sizeof kSigDestroyCall / sizeof kSigDestroyCall[0]), 0x006266FE}
+};
+
+static uintptr_t sim_gate_target(int index, bool installed) {
+    const uintptr_t original[3] = { kEngineMcSyncVa, kEngineXfFlushVa, kEngineDestroyVa };
+    const uintptr_t wrapper[3] = { (uintptr_t)&fl_wrap_mcsync, (uintptr_t)&fl_wrap_xfflush, (uintptr_t)&fl_wrap_destroy };
+    return installed ? wrapper[index] : original[index];
+}
+
+static void sim_gate_call_bytes(unsigned char* site, uintptr_t target, unsigned char code[5]) {
+    code[0] = 0xE8;
+    const int rel = (int)(target - ((uintptr_t)site + 5));
+    memcpy(code + 1, &rel, 4);
+}
+
+// 原窗口逐字节复核；写后在所有重叠窗口内替换计划中的 call 字节再比对。
+static bool verify_sim_gates(const Sites& s, bool installed) {
+    for (int i = 0; i < 3; ++i) {
+        const int length = kSimGatePatterns[i].length;
+        const unsigned char* site = s.simGate[i];
+        if (!site || site == (unsigned char*)-1 || length > (int)sizeof s.simGateOriginal[i] ||
+            !mem::read_ok(site, (size_t)length)) {
+            FL_ERR("相位边界门第 %d 处完整窗口不可读", i + 1);
+            return false;
+        }
+        unsigned char expected[16];
+        memcpy(expected, s.simGateOriginal[i], (size_t)length);
+        if (installed) {
+            for (int k = 0; k < 3; ++k) {
+                unsigned char code[5];
+                sim_gate_call_bytes(s.simGate[k], sim_gate_target(k, true), code);
+                for (int j = 0; j < 5; ++j) {
+                    const uintptr_t address = (uintptr_t)s.simGate[k] + j;
+                    if (address >= (uintptr_t)site && address - (uintptr_t)site < (uintptr_t)length)
+                        expected[address - (uintptr_t)site] = code[j];
+                }
+            }
+        }
+        for (int j = 0; j < length; ++j) {
+            if (((const volatile unsigned char*)site)[j] != expected[j]) {
+                FL_ERR("相位边界门第 %d 处%s完整窗口不符 @ %08X+%d", i + 1,
+                       installed ? "写后" : "安装前", (unsigned)(uintptr_t)site, j);
+                return false;
+            }
+        }
+        int rel = 0;
+        memcpy(&rel, site + 1, sizeof rel);
+        if (site[0] != 0xE8 || (uintptr_t)site + 5 + rel != sim_gate_target(i, installed)) {
+            FL_ERR("相位边界门第 %d 处 call 目标不符", i + 1);
+            return false;
+        }
+    }
+    return true;
+}
+
+static int resolve_sim_gates(int targetFps, int logicFps, Sites& s) {
+    memset(s.simGate, 0, sizeof s.simGate);
+    memset(s.simGateOriginal, 0, sizeof s.simGateOriginal);
+    const bool supported = g_retailFps == 30 && logicFps == 15 &&
+        ((targetFps == 60 && g_ratio == 4) || (targetFps == 90 && g_ratio == 6));
+    if ((targetFps == 60 || targetFps == 90) && !supported) {
+        FL_ERR("60/90要求原生客户端30/逻辑15和精确倍率,当前帧率基准已被修改;拒绝安装");
+        return FL_ERR_FPS_GLOBALS;
+    }
+    s.simGateRequired = supported;
+    const bool requested = targetFps > g_retailFps && (g_groups & FL_G_SIMGATE) != 0;
+    s.simGateNeeded = s.simGateRequired || requested;
+    if (!s.simGateNeeded) return FL_OK;
+    if (!supported) {
+        FL_ERR("相位边界门仅支持零售30/逻辑15的60或90目标；当前 %d/%d → %d(r=%d)，拒绝该请求",
+               g_retailFps, logicFps, targetFps, g_ratio);
+        return FL_ERR_RATIO;
+    }
+    FL_INFO("相位边界门:请求 mask=0x%08X，显式位=%s，60/90自动必需=%s；核验三处 call",
+            (unsigned)g_groups, requested ? "开" : "关", s.simGateRequired ? "是" : "否");
+    for (int i = 0; i < 3; ++i) {
+        const Pattern& p = kSimGatePatterns[i];
+        s.simGate[i] = scan(p);
+        if (!s.simGate[i]) return FL_ERR_SIG_MISS;
+        if (s.simGate[i] == (unsigned char*)-1) return FL_ERR_SIG_AMBIGUOUS;
+        if (p.length > (int)sizeof s.simGateOriginal[i] || !mem::read_ok(s.simGate[i], (size_t)p.length))
+            return FL_ERR_SIG_MISMATCH;
+        for (int j = 0; j < p.length; ++j)
+            if (p.bytes[j] <= 0xFF && s.simGate[i][j] != (unsigned char)p.bytes[j]) return FL_ERR_SIG_MISMATCH;
+        memcpy(s.simGateOriginal[i], s.simGate[i], (size_t)p.length);
+    }
+    if (!verify_sim_gates(s, false)) return FL_ERR_SIG_MISMATCH;
+    // XfFlush 的上下文必须确实覆盖同一 Destroy call，不能接受另一个独立命中。
+    if (s.simGate[1] + 7 != s.simGate[2]) {
+        FL_ERR("变换冲刷与销毁 call 的相邻关系不符");
+        return FL_ERR_SIG_MISMATCH;
+    }
+    return FL_OK;
+}
 
 // 只读核对完整签名(操作数单独核对),同一判据用于干扫、冻结后预检查和写后复读。
 static bool verify_sim_pins(const Sites& s, unsigned wantOperand) {
@@ -2021,6 +2198,8 @@ static int resolve_and_verify(int targetFps, Sites& s) {
 
     const int rcSimPin = resolve_sim_pins(targetFps, s);
     if (rcSimPin != FL_OK) return rcSimPin;
+    const int rcSimGate = resolve_sim_gates(targetFps, logicFps, s);
+    if (rcSimGate != FL_OK) return rcSimGate;
 
     // ★改之前先核对这三处操作数现在指向什么:地址对不上或数值不对,说明我们认错了地方,宁可不装。
     {
@@ -2361,7 +2540,12 @@ static int resolve_and_verify(int targetFps, Sites& s) {
 // 干扫:把安装前的全部检查跑一遍,一个字节都不改。用户报错时先让他跑这个,日志直接指出断在哪一步。
 static int dry_run(int targetFps) {
     FL_INFO("──── 干扫开始(只检查,不改游戏任何字节)────");
-    Sites s;
+    if (g_installed) {
+        FL_WARN("已安装时不重新解析目标或比例；先关闭再干扫");
+        return FL_ERR_ALREADY;
+    }
+    if (g_patchPoisoned || g_undoCount != 0) return FL_ERR_WRITE;
+    Sites s = {};
     const int rc = resolve_and_verify(targetFps, s);
     if (rc == FL_OK) {
         FL_INFO("干扫通过:六处补丁点全部唯一命中且数值正确,可以安装 %d 帧", targetFps);
@@ -2385,6 +2569,10 @@ static int resolve_perframe_only(Sites& s) {
     memset(s.simPin, 0, sizeof s.simPin);
     s.simPinNeeded = false;
     s.simPinRequired = false;  // measure 维持零售帧率,不改 DER_FPS,无需高度读者重定向
+    memset(s.simGate, 0, sizeof s.simGate);
+    memset(s.simGateOriginal, 0, sizeof s.simGateOriginal);
+    s.simGateNeeded = false;
+    s.simGateRequired = false;
     if (!resolve_module()) { FL_ERR("拿不到主模块或不是 32 位 PE"); return FL_ERR_BAD_PE; }
     log_environment();
     Pattern pPerFrame = {"逐帧推进块", kSigPerFrame, (int)(sizeof kSigPerFrame / sizeof(short)), 0x00602851};
@@ -2407,8 +2595,11 @@ static int resolve_perframe_only(Sites& s) {
 }
 
 static int install(int targetFps, bool measureOnly) {
+    if (g_patchPoisoned || g_undoCount != 0) {
+        FL_ERR("存在未完成的还原,拒绝再次安装;请关闭补丁重试还原或重启游戏"); return FL_ERR_WRITE;
+    }
     if (g_installed) { FL_WARN("已经安装过了,忽略"); return FL_ERR_ALREADY; }
-    Sites s;
+    Sites s = {};
     const int rcPrepare = measureOnly ? resolve_perframe_only(s) : resolve_and_verify(targetFps, s);
     if (rcPrepare != FL_OK) { log_error_legend(); return rcPrepare; }
     targetFps = g_targetFps;   // resolve_and_verify 里做过归一化(<=0 视为 60),这里要拿归一化后的值
@@ -2431,9 +2622,15 @@ static int install(int targetFps, bool measureOnly) {
     g_scroll100 = 100.0f * (float)g_retailFps / (float)(targetFps > 0 ? targetFps : g_retailFps);
     g_scrollOn  = false;
 
+    log::PatchLogLock logLock;
     mem::ThreadFreezer freeze;   // 改代码期间别让别的线程跑到这些字节上
+    if (!freeze.ready) { FL_ERR("未能挂起完整线程快照,拒绝写补丁"); return FL_ERR_SUSPEND; }
     if (s.simPinNeeded && !verify_sim_pins(s, (unsigned)kEngineFpsFloatVa)) {
         FL_ERR("高度斜坡安装前复核失败 —— 尚未写任何游戏补丁");
+        return FL_ERR_SIG_MISMATCH;
+    }
+    if (s.simGateNeeded && !verify_sim_gates(s, false)) {
+        FL_ERR("相位边界门安装前复核失败；尚未写任何游戏补丁");
         return FL_ERR_SIG_MISMATCH;
     }
     FL_INFO("已挂起其它线程 %d 个,开始写补丁", freeze.count);
@@ -2935,40 +3132,21 @@ static int install(int targetFps, bool measureOnly) {
         else FL_ERR("高度斜坡三处写后核验失败 —— 将整体回滚");
     }
 
-    // ── ★★★ FL_G_SIMGATE(默认关;2026-09-28):客户端帧开头的三件模拟工作按原版相位边界放行 ───────────────
+    // 规范60/90自动要求三处边界门，显式请求不能降级为缺少调用点仍成功。
     g_simGateSites = 0; g_simGateOn = false; g_simGateHeld = 0;
-    if (ok && !measureOnly && (g_groups & FL_G_SIMGATE) && targetFps > g_retailFps) {
-        if (!fl_sim_gate_exact(g_ratio)) {
-            FL_WARN("相位边界门:目标 %d 帧(r = %d)的客户端帧边界里没有阶段 3,做不到与原版逐位等价 —— 不装。联机请用 60 或 90 帧。",
-                    targetFps, g_ratio);
-        } else {
-            // 三处**先全部扫完再改**:XfFlushCall 的特征里含着 DestroyCall 那条 call 的原 rel32。
-            Pattern pMcSyncCall  = {"ModelCondition 同步调用点", kSigMcSyncCall, (int)(sizeof kSigMcSyncCall / sizeof kSigMcSyncCall[0]), 0x0062666B};
-            Pattern pXfFlushCall = {"变换冲刷调用点", kSigXfFlushCall, (int)(sizeof kSigXfFlushCall / sizeof kSigXfFlushCall[0]), 0x006266F7};
-            Pattern pDestroyCall = {"销毁表调用点", kSigDestroyCall, (int)(sizeof kSigDestroyCall / sizeof kSigDestroyCall[0]), 0x006266FE};
-            unsigned char* site[3] = { scan(pMcSyncCall), scan(pXfFlushCall), scan(pDestroyCall) };
-            const uintptr_t want[3] = { kEngineMcSyncVa, kEngineXfFlushVa, kEngineDestroyVa };
-            void* wrap[3] = { (void*)&fl_wrap_mcsync, (void*)&fl_wrap_xfflush, (void*)&fl_wrap_destroy };
-            int nOk = 0;
-            for (int i = 0; i < 3; ++i)
-                if (site[i] && site[i] != (unsigned char*)-1 && site[i][0] == 0xE8 &&
-                    (uintptr_t)(site[i] + 5 + *(int*)(site[i] + 1)) == want[i]) ++nOk;
-            if (nOk != 3) {
-                FL_WARN("相位边界门:3 处调用点只核对上 %d 处 —— 一处都不改。", nOk);
-            } else {
-                for (int i = 0; ok && i < 3; ++i) {
-                    unsigned char code[5];
-                    code[0] = 0xE8;
-                    const int rel = (int)((unsigned char*)wrap[i] - (site[i] + 5));
-                    memcpy(code + 1, &rel, 4);
-                    ok = patch(site[i], code, 5, "相位边界门(只改 call 目标)");
-                    if (ok) ++g_simGateSites;
-                }
-                g_simGateOn = ok && g_simGateSites == 3;
-                if (g_simGateOn)
-                    FL_INFO("  相位边界门已装:ModelCondition 同步 / 变换冲刷 只在阶段 3、6 之后,销毁表只在阶段 6 之后(r = %d)", g_ratio);
-            }
+    if (ok && !measureOnly && s.simGateNeeded) {
+        for (int i = 0; ok && i < 3; ++i) {
+            unsigned char code[5];
+            sim_gate_call_bytes(s.simGate[i], sim_gate_target(i, true), code);
+            ok = patch(s.simGate[i], code, 5, "相位边界门(只改 call 目标)");
+            if (ok) ++g_simGateSites;
         }
+        if (ok) ok = g_simGateSites == 3 && verify_sim_gates(s, true);
+        g_simGateOn = ok && g_simGateSites == 3;
+        if (g_simGateOn)
+            FL_INFO("  相位边界门三处写后已复读：自动必需=%s，阶段3/6冲刷与阶段6销毁(r=%d)；有限实测范围外仍待验证",
+                    s.simGateRequired ? "是" : "否", g_ratio);
+        else FL_ERR("相位边界门写后不完整；进入原安装失败处理");
     }
 
     // ── ★ 状态图标乒乓动画(默认关;2026-09-22)。一处 4 字节:除数 30 → 目标帧率。
@@ -3080,13 +3258,33 @@ static int install(int targetFps, bool measureOnly) {
 
     if (ok && !measureOnly && s.simPinNeeded)
         ok = g_simPinSites == 3 && verify_sim_pins(s, (unsigned)(uintptr_t)&g_simFps30);
+    if (ok && !measureOnly && s.simGateNeeded)
+        ok = g_simGateOn && g_simGateSites == 3 && verify_sim_gates(s, true);
 
     if (!ok) {
-        FL_ERR("安装失败,正在整体回滚(不留半套补丁)");
-        rollback();
-        g_simPinSites = 0;
+        FL_ERR("安装失败，尝试按撤销表还原；还原结果单独核验");
+        const int bad = rollback();
+        if (bad == 0) {
+            g_visPhaseOn = false;
+            g_simPinSites = 0;
+            g_simGateSites = 0;
+            g_simGateOn = false;
+            memset(&g_simInstalled, 0, sizeof g_simInstalled);
+        } else {
+            FL_ERR("仍有 %d 处还原失败；保留包装状态与撤销记录，拒绝再次安装", bad);
+        }
         return FL_ERR_WRITE;
     }
+    // measure-only不解析调度目标；0表示未设置，不能沿用之前干扫的目标。
+    g_simInstalled.targetFps = measureOnly ? 0 : targetFps;
+    g_simInstalled.ratio = measureOnly ? 0 : g_ratio;
+    g_simInstalled.retailFps = measureOnly ? 0 : g_retailFps;
+    g_simInstalled.requestedGroups = (unsigned)g_groups;
+    g_simInstalled.measureOnly = measureOnly;
+    g_simInstalled.pinNeeded = s.simPinNeeded;
+    g_simInstalled.pinRequired = s.simPinRequired;
+    g_simInstalled.gateNeeded = s.simGateNeeded;
+    g_simInstalled.gateRequired = s.simGateRequired;
     g_installed = true;
     g_frameCount = 0;
     FL_INFO("撤销表用量 %d / %d 处", g_undoCount, kUndoMax);
@@ -3161,10 +3359,14 @@ static int install(int targetFps, bool measureOnly) {
 }
 
 static int uninstall() {
-    if (!g_installed) return FL_ERR_NOT_INSTALLED;
+    if (!g_installed && g_undoCount == 0) return FL_ERR_NOT_INSTALLED;
+    log::PatchLogLock logLock;
     mem::ThreadFreezer freeze;
+    if (!freeze.ready) { FL_ERR("未能挂起完整线程快照,拒绝卸载写入"); return FL_ERR_SUSPEND; }
     FL_INFO("开始卸载,挂起其它线程 %d 个", freeze.count);
-    rollback();
+    if (rollback() != 0) {
+        FL_ERR("卸载还原失败,保留撤销记录和包装状态;请重启游戏"); return FL_ERR_WRITE;
+    }
     // 车身外观包装的 call 已被撤销表还原 ⇒ 登记也要清掉,否则 chassisrate 会把「已卸载」
     // 报成「装着但没数据」(「没装」与「没采到」必须是两句不同的话)。g_chsOrigFn 故意**不清**:
     // 万一有线程此刻正停在包装函数里,它醒来后还要用它转发一次。
@@ -3175,6 +3377,7 @@ static int uninstall() {
     g_camSites = 0; g_camOn = false;
     g_tintSites = 0; g_tintOn = false;
     g_visPhaseOn = false; g_simPinSites = 0; g_simGateSites = 0; g_simGateOn = false;
+    memset(&g_simInstalled, 0, sizeof g_simInstalled);
     g_installed = false;
     FL_INFO("已卸载,全部字节还原");
     return FL_OK;
@@ -3183,7 +3386,11 @@ static int uninstall() {
 
 // ───────────────────────────── 导出接口 ─────────────────────────────
 extern "C" __declspec(dllexport) int __stdcall FrameLabEnable(int targetFps) {
+    api::PatchGuard transaction;
     FL_INFO("收到启用请求,目标帧率 %d", targetFps);
+    if (fl::g_patchPoisoned) return FL_ERR_WRITE;
+    if (fl::g_installed) return FL_ERR_ALREADY;
+    if (fl::g_undoCount != 0) return FL_ERR_WRITE;
     fl::g_measureOnly = false;
     const int rc = fl::install(targetFps, false);
     FL_INFO("启用结果 = %d", rc);
@@ -3199,6 +3406,10 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabEnable(int targetFps) {
 // ★为什么必须有它:新判据(逐字节 memcmp)如果从没红过,我就不知道它有没有资格当判据 ——
 //   而这里注入的正是它要防的那个病:**写入报告成功,字节却没变**。
 extern "C" __declspec(dllexport) int __stdcall FrameLabSelfTestRollback() {
+    api::PatchGuard transaction;
+    if (fl::g_installed || fl::g_undoCount != 0 || fl::g_patchPoisoned) {
+        FL_ERR("还原自检仅允许在没有游戏补丁或待还原记录时运行"); return 0;
+    }
     static unsigned char target[16];
     unsigned char original[16], modified[16];
     memset(original, 0xA5, sizeof original);
@@ -3206,8 +3417,6 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabSelfTestRollback() {
     memcpy(target, original, sizeof target);
 
     int result = 0;
-    const int savedUndo = fl::g_undoCount;
-    fl::g_undoCount = 0;
 
     // ① 诚实路径:改掉再还原,核验应当通过,且字节确实回到 0xA5
     if (fl::patch(target, modified, (int)sizeof modified, "自检·诚实路径")) {
@@ -3216,20 +3425,39 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabSelfTestRollback() {
         else FL_ERR("自检①失败:bad=%d,字节%s回到原样", bad,
                     memcmp(target, original, sizeof target) == 0 ? "" : "未");
     }
+    if (fl::g_undoCount != 0 && fl::rollback() != 0) return result;
 
     // ② 故障注入:让写入**谎称成功**(模拟"动作报成功但字节没变")—— 闸门必须当场报红
-    fl::g_undoCount = 0;
     memcpy(target, original, sizeof target);
     if (fl::patch(target, modified, (int)sizeof modified, "自检·故障注入")) {
         fl::g_selfTestNoWrite = true;
         const int bad = fl::rollback();
         fl::g_selfTestNoWrite = false;
-        if (bad == 1) result |= 2;
+        if (bad == 1 && fl::g_undoCount == 1 && fl::g_patchPoisoned) result |= 2;
         else FL_ERR("★自检②:注入了故障但闸门**没红**(bad=%d)—— 这道闸门不合格", bad);
-        memcpy(target, original, sizeof target);   // 自己收拾干净
+        if (fl::install(60, false) == FL_ERR_WRITE) result |= 0x20;
+        if (fl::rollback() == 0 && fl::g_undoCount == 0 && !fl::g_patchPoisoned &&
+            memcmp(target, original, sizeof target) == 0) result |= 0x40;
     }
+    if (fl::g_undoCount != 0 && fl::rollback() != 0) return result;
 
-    fl::g_undoCount = savedUndo;
+    // Exercise the same patch/undo path on owned data, including a write that
+    // changed bytes before reporting failure and a protection restore failure.
+    for (int fault = 1; fault <= 4; ++fault) {
+        MEMORY_BASIC_INFORMATION beforeProtect, afterProtect;
+        if (!VirtualQuery(target, &beforeProtect, sizeof beforeProtect)) break;
+        mem::g_writeFault = fault;
+        const bool patched = fl::patch(target, modified, (int)sizeof modified, "自检·写入故障");
+        const bool retained = !patched && fl::g_undoCount == 1;
+        const int bad = fl::rollback();
+        const bool restored = bad == 0 && fl::g_undoCount == 0 && !fl::g_patchPoisoned &&
+            memcmp(target, original, sizeof target) == 0 &&
+            VirtualQuery(target, &afterProtect, sizeof afterProtect) != 0 &&
+            afterProtect.Protect == beforeProtect.Protect;
+        if (retained && restored) result |= fault == 1 ? 4 : fault == 2 ? 8 : fault == 3 ? 16 : 128;
+        if (bad != 0) break;
+    }
+    mem::g_writeFault = 0;
     FL_INFO("还原核验闸门自检:诚实路径=%s 故障注入=%s",
             (result & 1) ? "通过" : "★失败", (result & 2) ? "抓到了" : "★没抓到");
     return result;
@@ -3253,6 +3481,10 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabSelfTestRollback() {
 //
 // 返回位掩码:bit(r-2) 置 1 = 该 r 通过;bit5(0x20) = 自检资格成立。全通过 = 0x3F。
 extern "C" __declspec(dllexport) int __stdcall FrameLabSelfTestClock() {
+    api::PatchGuard transaction;
+    if (fl::g_installed || fl::g_undoCount != 0 || fl::g_patchPoisoned) {
+        FL_ERR("时钟自检仅允许在补丁未安装且无待还原记录时运行"); return 0;
+    }
     const int savedAcc   = fl::g_clockAcc;
     const int savedWant  = fl::g_clockWant;
     const int savedMs    = fl::g_msPerFrame;
@@ -3303,6 +3535,11 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabSelfTestClock() {
 }
 
 extern "C" __declspec(dllexport) int __stdcall FrameLabSetGroups(int mask) {
+    api::PatchGuard transaction;
+    if (fl::g_installed || fl::g_patchPoisoned || fl::g_undoCount != 0) {
+        FL_WARN("补丁已安装或待还原,保留当前分组0x%X;分组必须在启用前设置", fl::g_groups);
+        return fl::g_groups;
+    }
     fl::g_groups = (mask <= 0) ? FL_G_ALL : (mask & FL_G_EVERYTHING);
     FL_INFO("改动分组掩码设为 0x%04X", fl::g_groups);
     FL_INFO("  算r=%s 除帧率=%s 未确认两处=%s 批次=%s 系数=%s 粒子=%s 视觉步长=%s 逐帧=%s",
@@ -3374,10 +3611,9 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabSetGroups(int mask) {
             (fl::g_groups & FL_G_SIMPIN) ? "开" : "关",
             (fl::g_groups & FL_G_SIMPIN) ? "(高于零售帧率时要求三处核验并钉回 30.0;同步待实测)"
                                       : "(高 FPS 改共享 DER_FPS 时仍自动要求三处钉回 30.0;无需设置此位)");
-    FL_INFO("  相位边界门=%s%s",
+    FL_INFO("  相位边界门显式请求=%s%s",
             (fl::g_groups & FL_G_SIMGATE) ? "开" : "关",
-            (fl::g_groups & FL_G_SIMGATE) ? "(联机安全修正 R-2/R-3/R-6a;只在 60 / 90 帧生效;未经实机验证)"
-                                          : "(默认:销毁表 / 变换冲刷 / ModelCondition 同步随 r 换位置,联机会分歧)");
+            "(规范零售30/逻辑15的60/90自动要求三处核验与安装，不依赖此位；装齐不代表所有对局同步已验证)");
     FL_INFO("  单位闪烁 / 染色计时=%s%s",
             (fl::g_groups & FL_G_TINT) ? "开" : "关",
             (fl::g_groups & FL_G_TINT)
@@ -3428,7 +3664,11 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabSetGroups(int mask) {
 }
 
 extern "C" __declspec(dllexport) int __stdcall FrameLabMeasureOnly() {
+    api::PatchGuard transaction;
     FL_INFO("收到「只量不改」请求(基线组)");
+    if (fl::g_patchPoisoned) return FL_ERR_WRITE;
+    if (fl::g_installed) return FL_ERR_ALREADY;
+    if (fl::g_undoCount != 0) return FL_ERR_WRITE;
     fl::g_measureOnly = true;
     const int rc = fl::install(0, true);
     FL_INFO("只量不改结果 = %d", rc);
@@ -3443,7 +3683,11 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabMeasureOnly() {
 // 这个入口一次把两件事做完:设 measureOnly、设 groups、再 install。
 // groups 里目前只期望 FL_G_ANIMPROBE(只读尺子,不改任何数据)。
 extern "C" __declspec(dllexport) int __stdcall FrameLabMeasureOnlyEx(int groups) {
+    api::PatchGuard transaction;
     FL_INFO("收到「只量不改」请求(groups=0x%X)", (unsigned)groups);
+    if (fl::g_patchPoisoned) return FL_ERR_WRITE;
+    if (fl::g_installed) return FL_ERR_ALREADY;
+    if (fl::g_undoCount != 0) return FL_ERR_WRITE;
     fl::g_measureOnly = true;
     if (groups) fl::g_groups = (unsigned)groups;
     const int rc = fl::install(0, true);
@@ -3678,20 +3922,22 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabTracerStatus() {
     return 1000000 + ratio;
 }
 
-// FrameLabSimStatus():2026-09-28 可见性 / 联机修正的状态。0 = 没装;否则按位:1 = 迷雾可见性相位已改回原版语义,
-//   2 = 高度斜坡已钉住(3/3),4 = 相位边界门已装(3/3),8 = R4 保持原版。-2 = 请求了 SIMPIN / SIMGATE 却没装上
-//   (SIMGATE 在 45 / 75 帧下按设计拒装,不算失败)。
+// 只报告实际安装位：1可见性相位、2高度3/3、4边界门3/3、8保持R4。
+// 0未安装；-2需要的修正未装齐或还原不完整。需求来自成功安装快照，不再读可变groups。
 extern "C" __declspec(dllexport) int __stdcall FrameLabSimStatus() {
+    api::PatchGuard transaction;
+    if (fl::g_patchPoisoned) return -2;
     if (!fl::g_installed) return 0;
     int v = 8;
     if (fl::g_visPhaseOn) v |= 1;
     if (fl::g_simPinSites == 3) v |= 2;
-    if (fl::g_simGateOn) v |= 4;
-    const bool above = !fl::g_measureOnly && fl::g_targetFps > fl::g_retailFps;   // 只量不改按设计不装这些
-    const bool wantPin  = above && (fl::g_groups & FL_G_SIMPIN) != 0;
-    const bool wantGate = above && (fl::g_groups & FL_G_SIMGATE) != 0 && fl_sim_gate_exact(fl::g_ratio);
-    if ((wantPin && !(v & 2)) || (wantGate && !(v & 4))) return -2;
-    FL_INFO("可见性 / 联机修正状态 0x%X(边界门挡下 %ld 次)", v, fl::g_simGateHeld);
+    if (fl::g_simGateOn && fl::g_simGateSites == 3) v |= 4;
+    const fl::SimInstallContract& c = fl::g_simInstalled;
+    FL_INFO("模拟修正状态0x%X：安装请求mask=0x%08X，零售%d/目标%d/r%d，measure=%s；高度needed/required=%d/%d installed=%d/3；边界门needed/required=%d/%d installed=%d/3(挡下%ld次)",
+            v, c.requestedGroups, c.retailFps, c.targetFps, c.ratio, c.measureOnly ? "是" : "否",
+            c.pinNeeded, c.pinRequired, fl::g_simPinSites, c.gateNeeded, c.gateRequired,
+            fl::g_simGateSites, fl::g_simGateHeld);
+    if ((c.pinNeeded && !(v & 2)) || (c.gateNeeded && !(v & 4))) return -2;
     return v;
 }
 
@@ -3925,6 +4171,7 @@ static bool chs_selftest_lerp(int fps, const float* ref, int* advOut, int* endsO
 }
 
 extern "C" __declspec(dllexport) int __stdcall FrameLabSelfTestChassis() {
+    api::PatchGuard transaction;
     static float ref[CHS_TEST_FRAMES], got[CHS_TEST_FRAMES];
     long holds = 0; int maxRun = 0, dbl = 0, mism = 0;
     int mask = 0;
@@ -4847,6 +5094,7 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabDesyncRestore() {
 // 干扫:排障第一步。不改游戏任何字节,只把「能不能装、卡在哪一步」写进日志。
 // 日期:2026-09-16  初始研究实现
 extern "C" __declspec(dllexport) int __stdcall FrameLabDryRun(int targetFps) {
+    api::PatchGuard transaction;
     FL_INFO("收到干扫请求,目标帧率 %d", targetFps);
     const int rc = fl::dry_run(targetFps);
     FL_INFO("干扫结果 = %d", rc);
@@ -4854,6 +5102,7 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabDryRun(int targetFps) {
 }
 
 extern "C" __declspec(dllexport) int __stdcall FrameLabDisable() {
+    api::PatchGuard transaction;
     FL_INFO("收到关闭请求");
     const int rc = fl::uninstall();
     FL_INFO("关闭结果 = %d", rc);
@@ -4861,6 +5110,7 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabDisable() {
 }
 
 extern "C" __declspec(dllexport) int __stdcall FrameLabStatus() {
+    api::PatchGuard transaction;
     return fl::g_installed ? fl::g_targetFps : 0;
 }
 
@@ -4870,6 +5120,7 @@ extern "C" __declspec(dllexport) const char* __stdcall FrameLabVersion() {
 
 // 出问题时让用户点一下:把当前实况(帧率全局量、派生量、各补丁点当前字节)全打进日志再上传
 extern "C" __declspec(dllexport) int __stdcall FrameLabDumpDiagnostics() {
+    api::PatchGuard transaction;
     FL_INFO("──── 诊断快照 ────");
     if (!fl::g_base && !fl::resolve_module()) { FL_ERR("拿不到主模块"); return FL_ERR_NO_MODULE; }
     fl::log_environment();
@@ -4878,12 +5129,14 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabDumpDiagnostics() {
         FL_INFO("状态:已安装,目标帧率 %d,r = %d,记录在案的改动 %d 处",
                 fl::g_targetFps, fl::g_ratio, fl::g_undoCount);
     else
-        FL_INFO("状态:未安装(游戏仍是原版帧率),记录在案的改动 %d 处", fl::g_undoCount);
+        FL_INFO("状态:未提交安装,待还原记录 %d 处,还原失败状态=%d", fl::g_undoCount, fl::g_patchPoisoned);
     if (fl::g_fpsClient && mem::read_ok(fl::g_fpsClient, 4))
         FL_INFO("当前客户端帧率全局量 = %d(原版 %d)", *fl::g_fpsClient, fl::g_retailFps);
     for (int i = 0; i < fl::g_undoCount; ++i) {
         char now[256], before[256];
-        log::hex(fl::g_undo[i].address, (size_t)(fl::g_undo[i].size > 24 ? 24 : fl::g_undo[i].size), now, sizeof now);
+        const size_t show = (size_t)(fl::g_undo[i].size > 24 ? 24 : fl::g_undo[i].size);
+        if (mem::read_ok(fl::g_undo[i].address, show)) log::hex(fl::g_undo[i].address, show, now, sizeof now);
+        else strcpy_s(now, "<不可读>");
         log::hex(fl::g_undo[i].before, (size_t)(fl::g_undo[i].size > 24 ? 24 : fl::g_undo[i].size), before, sizeof before);
         FL_INFO("改动 %d @ %08X:现在 %s | 原始 %s", i, (unsigned)(uintptr_t)fl::g_undo[i].address, now, before);
     }

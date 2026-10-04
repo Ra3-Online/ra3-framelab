@@ -3,7 +3,7 @@
 # Keep this script ASCII so Windows PowerShell 5.1 reads it without a BOM.
 [CmdletBinding()]
 param(
-    [ValidateSet('test', 'loader', 'ctl', 'dll', 'gui', 'all')]
+    [ValidateSet('test', 'loader', 'contract', 'ctl', 'dll', 'gui', 'all')]
     [string]$Target = 'all',
     [string]$BuildDir = $env:FLAB_BUILD_DIR,
     [switch]$RunTests
@@ -163,11 +163,16 @@ try {
     try {
         if ($Target -in @('test', 'all')) { Build-Executable 'test_schedule.exe' (Join-Path $root 'tests\test_schedule.cpp') }
         if ($Target -in @('loader', 'all')) { Build-Executable 'test_loader.exe' (Join-Path $root 'tests\test_loader.cpp') }
+        if ($Target -in @('contract', 'all')) {
+            # Only this test owns a bounded, non-executable IMAGE data fixture.
+            # Its canonical fake page is checked inside that declared array before use.
+            Build-Executable 'test_sim_contract.exe' (Join-Path $root 'tests\test_sim_contract.cpp') @('/BASE:0x00400000', '/DYNAMICBASE:NO', '/SECTION:.flfix,RW', '/MANIFEST:EMBED', "/MANIFESTUAC:level='asInvoker' uiAccess='false'")
+        }
         if ($Target -in @('ctl', 'all')) { Build-Executable 'flctl.exe' (Join-Path $root 'tools\flctl.cpp') @('advapi32.lib') }
         if ($Target -in @('dll', 'gui', 'all')) { Build-Dll }
         if ($Target -in @('gui', 'all')) { Build-Gui }
         if ($RunTests) {
-            foreach ($name in @('test_schedule.exe', 'test_loader.exe')) {
+            foreach ($name in @('test_schedule.exe', 'test_loader.exe', 'test_sim_contract.exe')) {
                 $test = Join-Path $out $name
                 if (-not (Test-Path -LiteralPath $test -PathType Leaf)) { throw "-RunTests requires $name; build -Target all first." }
                 Invoke-BuildTool $test @() ($name + '.run.txt')

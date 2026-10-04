@@ -626,7 +626,7 @@ static const wchar_t* Explain(int rc) {
     case 22: return L"帧率全局量还不是 15/30（引擎还没初始化）";
     case 23: return L"目标帧率不是 15 的整数倍，或超出支持范围";
     case 24: return L"内存状态与预期不符（引擎还没初始化完，或版本不对）";
-    case 30: return L"写内存失败（已回滚）";
+    case 30: return L"写入或还原核验失败，请查看日志；还原未完成时请重启游戏";
     case 31: return L"挂起其它线程失败";
     default: return L"未知错误";
     }
@@ -934,11 +934,12 @@ static bool JobPatch(DWORD& outPid, HANDLE& outProc, JobCtx& ctx) {
                 break;
             }
             DWORD gr = 0;
-            if (RemoteCall(proc, setGroups, (void*)(uintptr_t)EffectiveGroups(), &gr, 60000)) {
+            if (RemoteCall(proc, setGroups, (void*)(uintptr_t)EffectiveGroups(), &gr, 60000) && gr == EffectiveGroups()) {
                 LogF(L"[OK]   改动分组 = 0x%04X（返回 %lu）%s", EffectiveGroups(), (unsigned long)gr,
                      g_groupsOverridden ? L" ★由环境变量 RA3FL_GROUPS 覆盖，未采用界面选项组合" : L"");
             } else {
-                LogLine(L"[WARN] 设置改动分组失败，继续尝试启用。");
+                LogF(L"[FAIL] 设置改动分组失败或返回不符（请求0x%08X，返回0x%08X），本次启用停止。", EffectiveGroups(), gr);
+                break;
             }
         }
 
@@ -974,22 +975,31 @@ static bool JobPatch(DWORD& outPid, HANDLE& outProc, JobCtx& ctx) {
                 }
             }
             // 高帧率修改共享 DER_FPS 时自动要求三处逻辑高度 pin；无需显式 SIMPIN 位。
-            // SIMGATE 仍是显式实验组。这里报告安装状态，不把它当作完整场景验收。
+            // 60/90 自动要求三处相位边界门；状态只确认安装，不代替联机验证。
             if (ctx.fps > 30) {
                 void* simStatus = RemoteExport(pid, localBase, "FrameLabSimStatus");
                 DWORD ss3 = 0;
                 if (simStatus && RemoteCall(proc, simStatus, NULL, &ss3, 60000)) {
                     const int v = (int)ss3;
+                    if ((ctx.fps == 60 || ctx.fps == 90) && (v <= 0 || !(v & 4))) {
+                        installed = false;
+                        lastRc = 24;
+                        LogLine(L"[FAIL] 60/90 必需的三处相位边界门未确认安装，本次启用失败。请查看 DLL 日志。");
+                        break;
+                    }
                     if (v == -2) {
                         LogLine(L"[!!]   联机修正【没装上】（特征未命中？）—— 请把 logs 里的日志发给开发者。");
                     } else if (v > 0) {
                         if (v & 1) LogLine(L"[OK]   迷雾可见性相位补丁已安装；敌方可见性仍需按实际场景核对。");
                         else       LogLine(L"[!!]   迷雾可见性相位【没改成】—— 60/90 帧下敌方单位可能偶尔「隐身」。");
                         if (v & 2) LogLine(L"[OK]   三处运动器高度时间尺度保持原版（高帧率默认组合自动安装）。");
-                        if (v & 4) LogLine(L"[OK]   联机修正：相位边界门已生效（0x40000000）。");
+                        if (v & 4) LogLine(L"[OK]   三处相位边界门已安装并核验（60/90 自动必需）；有限联机测试见技术报告。");
                     }
                 } else {
-                    LogLine(L"[WARN] 读不到迷雾可见性 / 联机修正的状态（DLL 太旧？）。");
+                    LogLine(L"[FAIL] 读不到模拟修正安装状态，本次启用停止。请检查 DLL 版本与日志。");
+                    installed = false;
+                    lastRc = 24;
+                    break;
                 }
             }
             // 2026-09-28:单位闪烁 / 染色计时同样报「到底开没开成」。
@@ -1306,7 +1316,7 @@ static void JobMeasureLoop(DWORD pid, HANDLE gameProc, int targetFps, int maxCyc
 // --auto usable from a script: an always-zero exit code would make a failing run look fine.
 static bool RunJob(JobCtx ctx) {
     LogF(L"===== 目标 %d 帧 ｜ 目录 %s =====", ctx.fps, ctx.dir.c_str());
-    LogF(L"补丁版本 %s ｜ 改动分组 0x%04X%s", L"0.2.1 research-r2", EffectiveGroups(),
+    LogF(L"补丁版本 %s ｜ 改动分组 0x%04X%s", L"0.2.2-dev1", EffectiveGroups(),
          g_groupsOverridden ? L"（★环境变量 RA3FL_GROUPS 覆盖；未采用界面选项组合）" : L"");
     if (!g_groupsOverridden)
         LogF(L"载具颠簸修复 = %s", g_chassisFix

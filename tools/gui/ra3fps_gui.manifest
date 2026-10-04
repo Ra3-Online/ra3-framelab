@@ -20,7 +20,7 @@
       "true" (system DPI aware) rather than per-monitor: simpler, and enough here.
 -->
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity type="win32" name="Ra3FrameLab.Ra3FpsTest" version="0.2.1.0"
+  <assemblyIdentity type="win32" name="Ra3FrameLab.Ra3FpsTest" version="0.2.2.1"
                     processorArchitecture="x86"/>
   <description>Red Alert 3 frame-rate test tool (runtime memory patch, nothing on disk is modified)</description>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
