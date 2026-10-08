@@ -45,7 +45,7 @@
 #include "visual_timing.h"
 
 // ───────────────────────────── 版本与状态码 ─────────────────────────────
-#define FL_VERSION "0.2.3-dev1-visual1"
+#define FL_VERSION "0.2.3-dev1-visual2"
 
 enum FlStatus {
     FL_OK = 0,
@@ -858,6 +858,13 @@ static const short kSigPsysUpdate[] = {                  // sub_5F43A0 开头,�
     0xBD,0x2F,0x00,0x00,0x00              // mov  ebp, 47
 };
 
+// Native GPU container creation: ECX=self, two stack args (handle, params),
+// return EAX. The refcounted handle contains another pointer to the system.
+static const short kSigGpuGlowCtor[] = {
+    0x8B,0x4C,0x24,0x3C,0x51,0x8D,0x53,0x04,0x52,0x8B,0xC8,
+    0xE8,W,W,W,W,0xEB,0x02,0x33,0xC0,0x89,0x70,0x4C,0x89,0x78,0x50
+};
+
 // ── ★★★ 2026-09-26(用户 90 帧实机报告 #4):战役过场「运镜一下就过去了」—— 脚本镜头计时,**默认关** ─────
 //   用户原话:90 帧下过场镜头跑得飞快,提前到了地方等了一会飞机才过来(正常应镜头跟着飞机),约快 3 倍;
 //   但有些过场(如苏联第一关开场)又是正常的。录像抽帧核对:镜头 ~3 秒扫完、4~8 秒原地等、8.3 秒飞机才到。
@@ -1202,7 +1209,7 @@ static const uintptr_t kDisplayClockVa = 0x00CDB750;
 
 // 2026-10-08: construction visual clock. Independently checked against the
 // supported retail binary; these are instruction bytes, not upstream code.
-// First window includes fldcw: it MUST be retained before the replacement call.
+// Both getter windows stay native, including fldcw in the first window.
 static const short kSigConstructionNow[] = {
     0x8B,0x50,0x74,0xD9,0x6C,0x24,0x12,0xFF,0xD2,0x8B,0xF0,0x2B,0xF5,0x5D
 };
@@ -1341,6 +1348,10 @@ static unsigned       g_psVFrame = 0xFFFFFFFFu;  // 上一次放行时的 30 Hz 
 static bool           g_psOn     = false;   // 节拍门是否真的生效
 static volatile long  g_psCalls  = 0;       // 包装被进入的次数
 static volatile long  g_psFwd    = 0;       // 真的转发给引擎的次数(放行 ÷ 调用 应 ≈ 30 ÷ 目标帧率)
+static const uintptr_t kEngineGpuCtorVa = 0x006C1770;
+static bool           g_glowOn = false;
+static void*          g_glowOrigFn = NULL; // retained for in-flight calls after uninstall
+static volatile long  g_glowSeen = 0, g_glowAdjusted = 0, g_glowSkipped = 0;
 // 2026-09-26:过场运镜计时(见 FL_G_CAMERA)。被改指过来的 11 条换算指令直接读 g_camMs。
 static int            g_camMs    = 33;      // round(1000 ÷ 目标帧率),install() 里算
 static int            g_camSites = 0;       // 实际改指成功的处数(应为 16)
@@ -1835,13 +1846,32 @@ extern "C" void __fastcall fl_wrap_tracer(void* mgr, void* unused) {
 // 不分配、不用 SEH。节拍门不生效时每次都转发 ⇒ 行为逐位不变。
 typedef void (__thiscall *FnPsysUpdate)(void* self);
 
-// Native getFrame leaves the FP stack and XMM registers alone. Keep this
-// replacement integer-only too; both construction getter sites are mode 0.
-extern "C" unsigned __fastcall fl_construction_now(void* client, void* unused) {
+typedef void* (__thiscall *FnGpuCtor)(void*, void*, const FlGpuParticleParams*);
+extern "C" void* __fastcall fl_wrap_gpu_ctor(void* self, void* unused,
+                                            void* handle, const FlGpuParticleParams* params) {
     (void)unused;
-    const unsigned char* gl = *(unsigned char**)(uintptr_t)0x00CD8CE4;
-    if (gl) return fl_construction_clock(*(unsigned*)(gl + 0x50), g_ratio);
-    return (unsigned)((FnClientFrame)(*(void***)client)[0x74 / 4])(client);
+    FlGpuParticleParams adjusted;
+    const FlGpuParticleParams* use = params;
+    if (g_glowOn && g_psOn && (g_targetFps == 60 || g_targetFps == 90) && handle && params) {
+        const void* ref = *(const void**)handle;
+        const void* system = ref ? *(const void**)ref : NULL;
+        const void* tpl = system ? *(const void**)((const unsigned char*)system + 8) : NULL;
+        if (tpl && fl_visual_word(tpl, 256) == kFlSovietPowerGlowId) {
+            ++g_glowSeen;
+            if (fl_retail_power_glow(tpl, params->words[9])) {
+                // Emit countdown 15 takes 16 updates. Keep the final glow alive
+                // to the next emission on intermediate display frames. Do not
+                // change the caller's params, birth clock, emitter or RNG calls.
+                adjusted = *params;
+                adjusted.words[9] = 16;
+                use = &adjusted;
+                ++g_glowAdjusted;
+            } else {
+                ++g_glowSkipped;
+            }
+        }
+    }
+    return ((FnGpuCtor)g_glowOrigFn)(self, handle, use);
 }
 
 // At this native window ESI = elapsed; [esp+24h] still contains the mode.
@@ -3019,9 +3049,35 @@ static int install(int targetFps, bool measureOnly) {
         }
     }
 
-    // Construction display clock and signed elapsed guard. All three windows
-    // are checked before writing any of them. A miss fails this candidate's
-    // installation and enters the existing complete rollback below.
+    // Candidate only with the 30-Hz PSYS gate and the 60/90 targets.
+    // Fail the transaction if the required native call cannot be verified.
+    g_glowOn = false; g_glowSeen = 0; g_glowAdjusted = 0; g_glowSkipped = 0;
+    if (ok && !measureOnly && (g_groups & FL_G_PSYS) &&
+        (targetFps == 60 || targetFps == 90)) {
+        Pattern pGlow = {"苏联光团 GPU 构造调用", kSigGpuGlowCtor,
+                         (int)(sizeof kSigGpuGlowCtor / sizeof kSigGpuGlowCtor[0]), 0x006D2635};
+        unsigned char* hit = scan(pGlow);
+        ok = g_psOn && hit && hit != (unsigned char*)-1;
+        if (ok) {
+            unsigned char* call = hit + 11;
+            void* original = call + 5 + *(int*)(call + 1);
+            ok = original == (void*)kEngineGpuCtorVa;
+            if (ok) {
+                unsigned char code[5] = {0xE8,0,0,0,0};
+                const int rel = (int)((unsigned char*)&fl_wrap_gpu_ctor - (call + 5));
+                memcpy(code + 1, &rel, sizeof rel);
+                g_glowOrigFn = original;
+                g_glowOn = true;
+                ok = patch(call, code, sizeof code, "苏联光团寿命候选(仅零售模板 15→16)");
+                if (ok) FL_INFO("苏联光团候选已装 @%08X；仅 SovietPowerGlow/BD8CD4C6 与零售字段一致时寿命 15→16；出生时间、发射间隔和随机调用不改；需手动验收", (unsigned)(uintptr_t)call);
+            }
+        }
+        if (!ok) FL_ERR("苏联光团候选:PSYS 门或 GPU 构造调用未确认，拒绝安装并回滚");
+    }
+
+    // Keep both native display-frame getters. visual1's logicFrame * ratio
+    // quantized construction animation to 15 Hz and failed manual validation.
+    // Check the whole native path before installing the mode-0 negative guard.
     g_constructionSites = 0; g_constructionClamps = 0;
     if (ok && !measureOnly && targetFps > g_retailFps &&
         (g_groups & FL_G_RATIO) && (g_groups & FL_G_DER_FPMS)) {
@@ -3039,25 +3095,13 @@ static int install(int targetFps, bool measureOnly) {
         if (!ok) {
             FL_ERR("施工显示计时:三处特征未全部确认，候选版拒绝安装并回滚");
         } else {
-            // fldcw [esp+12h] is relocated within the same nine-byte window;
-            // the stack pointer has not changed. The replacement call follows.
-            unsigned char codeNow[9] = {0xD9,0x6C,0x24,0x12,0xE8,0,0,0,0};
-            int rel = (int)((unsigned char*)&fl_construction_now - (now + 9));
-            memcpy(codeNow + 5, &rel, 4);
-            ok = patch(now, codeNow, 9, "施工显示当前时钟(保留 fldcw)");
-            if (ok) ++g_constructionSites;
-            unsigned char codeHold[5] = {0xE8,0,0,0,0};
-            rel = (int)((unsigned char*)&fl_construction_now - (hold + 5));
-            memcpy(codeHold + 1, &rel, 4);
-            if (ok) ok = patch(hold, codeHold, 5, "施工显示暂停时钟");
-            if (ok) ++g_constructionSites;
             unsigned char codeElapsed[6] = {0xE9,0,0,0,0,0x90};
-            rel = (int)((unsigned char*)&fl_construction_signed_elapsed - (elapsed + 5));
+            const int rel = (int)((unsigned char*)&fl_construction_signed_elapsed - (elapsed + 5));
             memcpy(codeElapsed + 1, &rel, 4);
             g_constructionResume = elapsed + 6;
             if (ok) ok = patch(elapsed, codeElapsed, 6, "施工显示负差值保护(仅 mode 0)");
             if (ok) ++g_constructionSites;
-            if (ok) FL_INFO("施工显示计时候选已装:3 处；当前/暂停时钟使用逻辑帧 × %d；mode 1 未改；需手动验收模型闪现", g_ratio);
+            if (ok) FL_INFO("施工显示负差值保护已装:1 处；当前/暂停 getter 保留原生显示帧时钟，按目标 %d Hz 连续推进；mode 1 未改；模型闪现仍需验收", targetFps);
         }
     }
 
@@ -3354,6 +3398,8 @@ static int install(int targetFps, bool measureOnly) {
         const int bad = rollback();
         if (bad == 0) {
             g_constructionSites = 0;
+            g_glowOn = false;
+            g_psSite = NULL; g_psOn = false;
             g_visPhaseOn = false;
             g_simPinSites = 0;
             g_simGateSites = 0;
@@ -3463,6 +3509,7 @@ static int uninstall() {
     g_scrollOn = false;
     g_trcSite = NULL; g_trcOn = false;
     g_psSite = NULL; g_psOn = false;
+    g_glowOn = false; g_constructionSites = 0;
     g_camSites = 0; g_camOn = false;
     g_tintSites = 0; g_tintOn = false;
     g_visPhaseOn = false; g_simPinSites = 0; g_simGateSites = 0; g_simGateOn = false;
@@ -4055,15 +4102,17 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabPsysStatus() {
     const long c = fl::g_psCalls, f = fl::g_psFwd;
     const int ratio = c > 0 ? (int)((long long)f * 1000 / c) : 0;
     FL_INFO("粒子系统节拍门:调用 %ld 转发 %ld ⇒ 放行比例 %d/1000(90 帧应 ≈ 333,60 帧 ≈ 500)", c, f, ratio);
+    FL_INFO("苏联光团寿命候选:安装=%d，模板命中 %ld，15→16 修正 %ld，字段不符跳过 %ld；仅安装不能视为闪烁验收",
+            fl::g_glowOn ? 1 : 0, fl::g_glowSeen, fl::g_glowAdjusted, fl::g_glowSkipped);
     return 1000000 + ratio;
 }
 
 // Query outside the render hook: logging never runs in a construction callback.
 extern "C" __declspec(dllexport) int __stdcall FrameLabConstructionStatus() {
     if (!fl::g_installed) return 0;
-    FL_INFO("施工显示计时候选:安装 %d/3 处；负差值保护命中 %ld 次；光效与模型闪现尚待手动验收",
+    FL_INFO("施工显示保护:安装 %d/1 处；负差值保护命中 %ld 次；保留原生显示时钟，未量化到逻辑帧；模型闪现尚待手动验收",
             fl::g_constructionSites, fl::g_constructionClamps);
-    return fl::g_constructionSites == 3 ? 7 : 0;
+    return fl::g_constructionSites == 1 ? 4 : 0;
 }
 
 // FrameLabScrollStatus():卷屏归一的状态。-2 = 两处补丁点没就位(特征没命中 / 常量不对);0 = 关;1 = 已生效。

@@ -1,6 +1,7 @@
-// Execute the actual candidate's signed-elapsed assembly in an owned stack
-// fixture. No game globals, engine calls, injection or GUI are used.
+// Execute actual visual wrappers/assembly with owned params, objects and stack.
+// No game globals, engine calls, injection, GPU drawing or GUI are used.
 #include "../src/framelab.cpp"
+#include <initializer_list>
 
 using namespace fl;
 static int passed = 0, failed = 0;
@@ -51,23 +52,113 @@ __declspec(naked) static void __cdecl elapsed_fixture(int, int, unsigned*) {
     }
 }
 
-int main() {
-    for (int fps = 30; fps <= 90; fps += 30) {
-        const int ratio = fps / 15;
-        const unsigned start = 1500, duration = 450;
-        check(fl_construction_clock(start, ratio) == static_cast<unsigned>(fps * 100), "clock agrees with 100 seconds at target rate");
-        const unsigned elapsedSamples[] = {0u, 1u, 225u, 450u};
-        for (unsigned elapsed : elapsedSamples) {
-            const unsigned now = fl_construction_clock(start + elapsed, ratio);
-            const unsigned birth = fl_construction_clock(start, ratio);
-            const unsigned span = fl_construction_clock(duration, ratio);
-            check((now - birth) * duration == elapsed * span, "creation/midpoint/completion use one unit at every FPS");
-            const unsigned pausedNow = fl_construction_clock(start + elapsed + 100, ratio);
-            check((pausedNow - birth) + (now - pausedNow) == now - birth, "pause stamp cancels current time without changing progress");
-        }
+static void put(unsigned char* tpl, unsigned off, unsigned value) {
+    memcpy(tpl + off, &value, sizeof value);
+}
+static void retail_template(unsigned char* tpl) {
+    memset(tpl, 0, 260);
+    put(tpl, 256, kFlSovietPowerGlowId);
+    put(tpl, 80, 5);
+    for (unsigned off : {100u,156u,168u}) put(tpl, off, 1);
+    for (unsigned off : {104u,108u,160u,164u}) put(tpl, off, 0x41700000u);
+    for (unsigned off : {172u,176u}) put(tpl, off, 0x3F800000u);
+}
+static void* mockSelf = NULL;
+static void* mockHandle = NULL;
+static const FlGpuParticleParams* mockInput = NULL;
+static FlGpuParticleParams mockParams;
+static int mockCalls = 0;
+// A fastcall with unused EDX has the same ABI as the native thiscall: ECX,
+// two stack args, callee ret 8, and EAX result. It never calls the game.
+static void* __fastcall mock_gpu_ctor(void* self, void*, void* handle, const FlGpuParticleParams* params) {
+    ++mockCalls;
+    mockSelf = self; mockHandle = handle; mockInput = params;
+    if (params) mockParams = *params;
+    return self;
+}
+static void run_glow(void* self, void* handle, const FlGpuParticleParams* params,
+                     const FlGpuParticleParams& expected, bool adjusted) {
+    mockCalls = 0;
+    const FlGpuParticleParams before = *params;
+    void* result = fl_wrap_gpu_ctor(self, NULL, handle, params);
+    check(mockCalls == 1 && result == self && mockSelf == self && mockHandle == handle,
+          "actual GPU wrapper calls original exactly once and preserves ABI arguments/result");
+    check(!memcmp(&mockParams, &expected, sizeof expected), "all 48 native parameter bytes forwarded correctly");
+    check(!memcmp(params, &before, sizeof before), "caller creation params remain byte-identical");
+    check((mockInput != params) == adjusted, "stack clone used only for eligible glow");
+}
+static void test_glow() {
+    unsigned char tpl[260], system[12] = {}, self[4] = {};
+    retail_template(tpl);
+    void* templatePointer = tpl;
+    memcpy(system + 8, &templatePointer, sizeof templatePointer);
+    void* ref[2] = {system, NULL};
+    void* handle = ref;
+    FlGpuParticleParams input;
+    for (unsigned i = 0; i < 12; ++i) input.words[i] = 0xAABBCC00u + i;
+    input.words[9] = 15;
+    FlGpuParticleParams expected = input;
+    expected.words[9] = 16;
+    g_glowOrigFn = (void*)&mock_gpu_ctor;
+    g_glowOn = true; g_psOn = true;
+    g_glowSeen = 0; g_glowAdjusted = 0; g_glowSkipped = 0;
+    for (int fps : {60,90}) {
+        g_targetFps = fps;
+        run_glow(self, &handle, &input, expected, true);
     }
-    check(fl_construction_clock(0xffffffffu, 6) == 0xfffffffau, "clock preserves unsigned counter wrap");
-    check(fl_construction_clock(0, 6) == 0, "new session clock restarts at zero");
+    check(g_glowSeen == 2 && g_glowAdjusted == 2 && g_glowSkipped == 0, "eligible glow diagnostics count actual corrections");
+    for (int fps : {30,120}) {
+        g_targetFps = fps;
+        run_glow(self, &handle, &input, input, false);
+    }
+    g_targetFps = 90;
+    g_psOn = false;
+    run_glow(self, &handle, &input, input, false);
+    g_psOn = true; g_glowOn = false;
+    run_glow(self, &handle, &input, input, false);
+    g_glowOn = true;
+    const unsigned offsets[] = {80,100,104,108,112,156,160,164,168,172,176,256};
+    for (unsigned off : offsets) {
+        retail_template(tpl);
+        put(tpl, off, fl_visual_word(tpl, off) ^ 1u);
+        run_glow(self, &handle, &input, input, false);
+    }
+    retail_template(tpl); tpl[72] = 1;
+    run_glow(self, &handle, &input, input, false);
+    retail_template(tpl);
+    for (unsigned life : {0u,14u,16u,0xffffffffu}) {
+        input.words[9] = life;
+        run_glow(self, &handle, &input, input, false);
+    }
+    check(g_glowAdjusted == 2 && g_glowSeen == 18 && g_glowSkipped == 16,
+          "different template not counted; changed fields/lifetimes explicitly counted as skipped");
+    input.words[9] = 15;
+    handle = NULL;
+    run_glow(self, &handle, &input, input, false);
+    ref[0] = NULL; handle = ref;
+    run_glow(self, &handle, &input, input, false);
+    templatePointer = NULL;
+    memcpy(system + 8, &templatePointer, sizeof templatePointer);
+    ref[0] = system;
+    run_glow(self, &handle, &input, input, false);
+    run_glow(self, NULL, &input, input, false);
+    // Offline shader/emitter model, not a GPU capture: emission interval 16,
+    // shader kills age > lifetime. The 15/16 boundary is visible at 60/90 Hz.
+    for (int fps : {60,90}) {
+        const int rendersPerStep = fps / 30;
+        int gaps15 = 0, gaps16 = 0;
+        for (int frame = 0; frame < 16 * rendersPerStep; ++frame) {
+            gaps15 += frame > 15 * rendersPerStep;
+            gaps16 += frame > 16 * rendersPerStep;
+        }
+        check(gaps15 == rendersPerStep - 1 && gaps16 == 0,
+              "shader/emitter model covers intermediate-frame lifetime seam at 60/90");
+    }
+    g_glowOn = false; g_psOn = false; g_glowOrigFn = NULL;
+}
+
+int main() {
+    test_glow();
     const int samples[] = {-2147483647, -1, 0, 1, 2147483647};
     const int modes[] = {0, 1, 2};
     for (int mode : modes) for (int input : samples) {

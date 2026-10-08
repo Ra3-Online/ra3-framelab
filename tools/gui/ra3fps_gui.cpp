@@ -1313,7 +1313,7 @@ static void JobMeasureLoop(DWORD pid, HANDLE gameProc, int targetFps, int maxCyc
         // These calls run on this worker and never log from a game draw hook.
         DWORD visual = 0, ps = 0;
         if (constructionStatus && RemoteCall(proc, constructionStatus, NULL, &visual, 30000))
-            LogF(L"      施工显示计时候选：%s（安装核验，不代表模型闪现已验收）", visual == 7 ? L"3 处已安装" : L"未启用");
+            LogF(L"      施工显示保护：%s（模型闪现仍需手测）", visual == 4 ? L"负差值保护已装，保留连续显示时钟" : L"未启用");
         if ((EffectiveGroups() & 0x4000000u) && psStatus && RemoteCall(proc, psStatus, NULL, &ps, 30000)) {
             if ((int)ps >= 1000000)
                 LogF(L"      粒子推进放行比例 %d/1000（90 帧约 333，60 帧约 500；光团熄灭仍待验证）", (int)ps - 1000000);
@@ -1403,7 +1403,7 @@ static void JobMeasureLoop(DWORD pid, HANDLE gameProc, int targetFps, int maxCyc
 // --auto usable from a script: an always-zero exit code would make a failing run look fine.
 static bool RunJob(JobCtx ctx) {
     LogF(L"===== 目标 %d 帧 ｜ 目录 %s =====", ctx.fps, ctx.dir.c_str());
-    LogF(L"补丁版本 %s ｜ 改动分组 0x%04X%s", L"0.2.3-dev1-visual1", EffectiveGroups(),
+    LogF(L"补丁版本 %s ｜ 改动分组 0x%04X%s", L"0.2.3-dev1-visual2", EffectiveGroups(),
          g_groupsOverridden ? L"（★环境变量 RA3FL_GROUPS 覆盖；未采用界面选项组合）" : L"");
     if (!g_groupsOverridden)
         LogF(L"载具颠簸修复 = %s", g_chassisFix
@@ -1900,7 +1900,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR /*lpCmdLine*/, int) {
     // 2026-09-22:高度 472 → 496,给第三个复选框腾出那 24 px(实测截图发现它压在「游戏目录」行上)。
     RECT rc = { 0, 0, 616, 496 };
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
-    g_hMain = CreateWindowExW(0, wc.lpszClassName, L"红警3 帧率测试工具 — 视觉候选 1",
+    g_hMain = CreateWindowExW(0, wc.lpszClassName, L"红警3 帧率测试工具 — 视觉候选 2",
                               WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
                               CW_USEDEFAULT, CW_USEDEFAULT,
                               rc.right - rc.left, rc.bottom - rc.top,
