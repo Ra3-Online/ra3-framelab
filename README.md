@@ -8,7 +8,7 @@
 
 ## 下载与运行
 
-从 [0.2.2-dev1-gui-fix1 研究预发行](https://github.com/Ra3-Online/ra3-framelab/releases/tag/v0.2.2-dev1-gui-fix1) 下载 `Ra3FrameLab-0.2.2-dev1-gui-fix1-windows-x86.zip`，完整解压到可写目录，运行 `Ra3FpsTest.exe`。GUI内嵌对应版本DLL，普通用户无需安装Python、Visual Studio，也无需手工复制DLL到游戏目录。该候选包含本轮自动门控修复，适合按研究记录复测；有限匹配不能保证所有联机场景安全。
+从 [0.2.2-dev1-gui-fix2 研究预发行](https://github.com/Ra3-Online/ra3-framelab/releases/tag/v0.2.2-dev1-gui-fix2) 下载 `Ra3FrameLab-0.2.2-dev1-gui-fix2-windows-x86.zip`，完整解压到可写目录，运行 `Ra3FpsTest.exe`。GUI内嵌对应版本DLL，普通用户无需安装Python、Visual Studio，也无需手工复制DLL到游戏目录。该候选包含自动门控、GUI 清单及启动冲突提示修复，适合按研究记录复测；有限匹配不能保证所有联机场景安全。
 
 2026-10-08 修正了旧 GUI 启动时报“并行配置不正确”的错误：内嵌启动清单的 XML 注释包含非法的连续减号。旧 `v0.2.2-dev1` Windows 包也存在此问题，请使用上述修复包。构建现已校验清单 XML，并在 Windows 上解析最终 EXE 的激活上下文；打包已有产物时也执行检查。此次修复包保留原研究预发行 DLL 的完整字节（SHA-256 `9b500e2fa1e4e808cd646cb4ed62172305bea57a33022353bbe9e60a60e01d46`），联机研究结果的覆盖范围不变。
 
@@ -20,6 +20,8 @@
 4. 测试结束退出游戏。切换补丁版本或恢复原版时，退出游戏后重新启动；游戏运行期间关闭或卸载补丁曾出现冻结，不能当作可靠的恢复流程。
 
 使用外部 MOD、启动器、已加载的帧率补丁或不同主程序构建时，特征校验可能拒绝安装。请保留日志中的失败原因，不要绕过校验。发行包不包含游戏主程序、游戏数据或回放。
+
+苏联电厂 / 矿场光效反馈的本轮日志发现，另一自动加载器先把基准改为 120，FrameLab 90 随后拒装。已勾选“额外特效修复”不等于补丁安装成功。当前源码新增启动前冲突检查及 `Ra3FpsTest.exe --check-conflicts "<游戏目录>"` 只读命令；识别引用 `CnCFpsUnlocker.dll` 的已知代理组合，不会自动删除游戏目录文件。返回 22 也可能是基准已被其他补丁改写。复测需要只加载一种工具；仅把另一工具的 fps 改为 30 仍会留下代码补丁。源码对照、上游 apitrace 方法和未完成的画面验证见 [光效调查](docs/EFFECTS_INVESTIGATION.md)。这项防护尚不构成光效已修复的声明。
 
 ## 支持范围与已知问题
 
@@ -51,6 +53,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build.ps1 -Target al
 ```
 
 脚本自动发现 VS / SDK，以 x86 MSVC 构建。默认输出到仓库 `build`，包含 DLL、CLI、GUI 和三个测试程序。目录可以含中文和空格；CLI 和日志路径使用 Unicode 文件接口。依赖检查确保产物无需作者电脑上的环境或 VC 运行库安装路径。
+
+`-Target gui-only` 可围绕指定构建目录已有的 DLL 仅重建 GUI，避免改变已验证 DLL 的完整字节；此模式的 `-RunTests` 执行 13 项 GUI 冲突检查。正常 `all -RunTests` 另执行三个离线 DLL / 调度测试。构建检查仍核对 GUI 内嵌载荷与构建目录的 DLL 一致。
 
 可选环境变量：
 
@@ -90,7 +94,7 @@ CLI 必须与 `Ra3FrameLab.dll` 放在同一目录。自动化时显式提供 PI
 生成当前研究分支的候选包：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version 0.2.2-dev1-gui-fix1 -Rebuild
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version 0.2.2-dev1-gui-fix2 -Rebuild
 ```
 
 默认包名使用 `0.2.2-dev1-gui-fix1`，CI 使用 `0.2.2-dev1-gui-fix1-<提交短 SHA>`，GUI/DLL 内部版本仍为 `0.2.2-dev1`，与公开 `v0.2.1` 基线分开标识。打包检查源码、GUI 与 DLL 的实际版本一致，提取GUI的实际RCDATA/101资源并核验完整DLL字节及SHA，拒绝同版本但内容不同的载荷；另核验内嵌启动清单与 Windows 激活上下文，并运行三项离线测试。本研究树拒绝冒用公开 `0.2.1` 标签或未经源码版本更新的正式版本号；候选标识不代表已通过联机验收。

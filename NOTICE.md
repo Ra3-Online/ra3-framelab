@@ -8,4 +8,6 @@ Command & Conquer、Red Alert 3 及游戏内容属于相应权利人。本项目
 
 MSVC、Windows SDK、Python 及可选 Python 分析库由开发者自行安装，不随本项目源码授权。发行物使用 Windows 系统接口和静态 MSVC 运行库；具体运行库权利仍受 Microsoft 适用许可约束。
 
+2026-10-08 的光效机制对照另参考了改名后的 [SAGE-Unlocked](https://github.com/TheeHorse/SAGE-Unlocked/tree/87d2481217379fe0592e020cdaf2b7ca0e94910d)，比较版本为 `87d2481217379fe0592e020cdaf2b7ca0e94910d`。仅分析粒子时间单位、更新节拍、绘制诊断和 Drawable pulse 的机制，没有复制其实现；第三方源码未纳入本项目发行树。
+
 发布仓库保留正常 Git 提交历史；2026-10-03 的便携化整理从当前源码树移除了过时本机交接、私人协调记录及重复旧快照。原始记录在维护者本地另行保存，未重写早期提交。它们不属于本版发行包的使用说明。

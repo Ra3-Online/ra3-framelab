@@ -3,7 +3,7 @@
 # Keep this script ASCII so Windows PowerShell 5.1 reads it without a BOM.
 [CmdletBinding()]
 param(
-    [ValidateSet('test', 'loader', 'contract', 'ctl', 'dll', 'gui', 'all')]
+    [ValidateSet('test', 'loader', 'contract', 'ctl', 'dll', 'gui', 'gui-only', 'all')]
     [string]$Target = 'all',
     [string]$BuildDir = $env:FLAB_BUILD_DIR,
     [switch]$RunTests
@@ -160,7 +160,7 @@ try {
     Set-BuildEnvironment 'PYTHONUTF8' '1'
     Set-BuildEnvironment 'PYTHONDONTWRITEBYTECODE' '1'
     Import-VsEnvironment (Find-VsDevCmd)
-    $python = if ($Target -in @('dll', 'gui', 'all')) { Find-Python } else { $null }
+    $python = if ($Target -in @('dll', 'gui', 'gui-only', 'all')) { Find-Python } else { $null }
     Push-Location -LiteralPath $out
     try {
         if ($Target -in @('test', 'all')) { Build-Executable 'test_schedule.exe' (Join-Path $root 'tests\test_schedule.cpp') }
@@ -172,12 +172,17 @@ try {
         }
         if ($Target -in @('ctl', 'all')) { Build-Executable 'flctl.exe' (Join-Path $root 'tools\flctl.cpp') @('advapi32.lib') }
         if ($Target -in @('dll', 'gui', 'all')) { Build-Dll }
-        if ($Target -in @('gui', 'all')) { Build-Gui }
+        # gui-only preserves a previously verified DLL's exact bytes in $out.
+        if ($Target -in @('gui', 'gui-only', 'all')) { Build-Gui }
         if ($RunTests) {
-            foreach ($name in @('test_schedule.exe', 'test_loader.exe', 'test_sim_contract.exe')) {
+            $testNames = if ($Target -eq 'gui-only') { @() } else { @('test_schedule.exe', 'test_loader.exe', 'test_sim_contract.exe') }
+            foreach ($name in $testNames) {
                 $test = Join-Path $out $name
                 if (-not (Test-Path -LiteralPath $test -PathType Leaf)) { throw "-RunTests requires $name; build -Target all first." }
                 Invoke-BuildTool $test @() ($name + '.run.txt')
+            }
+            if ($Target -in @('gui', 'gui-only', 'all')) {
+                Invoke-BuildTool $python @('-B', (Join-Path $root 'tools\re\test_gui_conflicts.py'), (Join-Path $out 'Ra3FpsTest.exe')) 'gui.conflicts.check.txt'
             }
         }
     } finally { Pop-Location }

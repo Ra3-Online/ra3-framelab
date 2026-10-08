@@ -118,6 +118,8 @@ TTL仍为10000ms，传输竞争或已明确资格的捕获转换共用原gamepla
 
 ## 5. CnC-FPS-Unlocker 比我们先进在哪
 
+本节保留 v1.6 的历史比较。2026-10-08 针对苏联电厂 / 矿场光效另行检查了改名后的 SAGE-Unlocked v1.9.4，并核对本地 P4、粒子门、Drawable pulse 与实际拒装日志；见 [光效调查](EFFECTS_INVESTIGATION.md)。
+
 比较固定于 [7dc116f](https://github.com/TheeHorse/CnC-FPS-Unlocker/tree/7dc116f474fddee26e3b09499244b4923bffa6cb)。[v1.6 发布说明](https://github.com/TheeHorse/CnC-FPS-Unlocker/releases/tag/v1.6) 明确把 240 FPS 标为实验功能；作者列出的 RA3 逻辑率测量主要为 60 / 120 FPS。不能把功能档位等同于全部场景稳定 240。
 
 | 领域 | FrameLab 当前实现 | 上游实现及价值 |

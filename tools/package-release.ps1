@@ -3,7 +3,7 @@
 [CmdletBinding()]
 param(
     [ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+(?:[-.][A-Za-z0-9.-]+)?$')]
-    [string]$Version = '0.2.2-dev1-gui-fix1',
+    [string]$Version = '0.2.2-dev1-gui-fix2',
     [string]$BuildDir = $env:FLAB_BUILD_DIR,
     [string]$PackageDir,
     [switch]$Rebuild
@@ -33,7 +33,7 @@ New-Item -ItemType Directory -Force -Path $packages | Out-Null
 if ($Rebuild) { & (Join-Path $PSScriptRoot 'build.ps1') -Target all -BuildDir $build -RunTests }
 
 $binaryNames = @('Ra3FpsTest.exe', 'Ra3FrameLab.dll', 'flctl.exe', 'test_schedule.exe', 'test_loader.exe', 'test_sim_contract.exe')
-$documents = @('README.md', 'LICENSE', 'NOTICE.md', 'CHANGELOG.md', 'SETUP.md', 'docs\TECHNICAL.md')
+$documents = @('README.md', 'LICENSE', 'NOTICE.md', 'CHANGELOG.md', 'SETUP.md', 'docs\TECHNICAL.md', 'docs\EFFECTS_INVESTIGATION.md')
 $researchDocument = 'docs\CROSSFPS_RESEARCH.md'
 if (Test-Path -LiteralPath (Join-Path $root $researchDocument) -PathType Leaf) { $documents += $researchDocument }
 foreach ($name in $binaryNames) {

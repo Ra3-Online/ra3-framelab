@@ -46,6 +46,8 @@
 //    Ra3FpsTest.exe --auto "<game folder>" <fps> [cycles]
 //      Headless version of the same job, for scripted runs. Writes to stdout and to
 //      %TEMP%\Ra3FrameLab\gui-*.log. Exits 0 on success, 1 on failure.
+//    Ra3FpsTest.exe --check-conflicts "<game folder>"
+//      Read-only check for a known automatic FPS loader; never launches the game.
 //
 //  ============================================================================
 
@@ -518,6 +520,75 @@ static bool FindGame(const std::wstring& userDir, GameFind& g, std::wstring& err
     return true;
 }
 
+// A d3d9/dinput8 proxy alone can be a renderer or a capture tool. Only reject the
+// known FPS loader combination: a proxy referring to CnCFpsUnlocker.dll AND that
+// companion DLL beside the actual game executable. Inspect bytes; never load it.
+static bool RefersToFpsUnlocker(const std::vector<unsigned char>& bytes) {
+    const char name[] = "cncfpsunlocker.dll";
+    for (size_t stride = 1; stride <= 2; ++stride) {
+        const size_t needed = sizeof(name) * stride;  // includes the terminator
+        if (bytes.size() < needed) continue;
+        for (size_t start = 0; start <= bytes.size() - needed; ++start) {
+            bool match = true;
+            for (size_t j = 0; j < sizeof(name); ++j) {
+                unsigned char c = bytes[start + j * stride];
+                if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+                if (c != (unsigned char)name[j] ||
+                    (stride == 2 && bytes[start + j * stride + 1] != 0)) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return true;
+        }
+    }
+    return false;
+}
+
+static bool CheckFpsLoader(const GameFind& g) {
+    const std::wstring dir = ParentDir(g.exe);
+    const std::wstring companion = Join(dir, L"CnCFpsUnlocker.dll");
+    if (!FileExistsW(companion)) return true;
+    const wchar_t* proxies[] = { L"d3d9.dll", L"dinput8.dll" };
+    for (size_t i = 0; i < _countof(proxies); ++i) {
+        const std::wstring path = Join(dir, proxies[i]);
+        if (!FileExistsW(path)) continue;
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (file == INVALID_HANDLE_VALUE) {
+            LogF(L"[FAIL] 无法检查自动加载器：%s（错误 %lu）。", path.c_str(), GetLastError());
+            return false;
+        }
+        LARGE_INTEGER size;
+        const bool validSize = GetFileSizeEx(file, &size) != FALSE &&
+            size.QuadPart >= 0 && size.QuadPart <= 64LL * 1024 * 1024;
+        if (!validSize) {
+            CloseHandle(file);
+            LogF(L"[FAIL] 自动加载器文件大小无法检查或超过 64 MiB：%s", path.c_str());
+            return false;
+        }
+        std::vector<unsigned char> bytes((size_t)size.QuadPart);
+        DWORD read = 0;
+        const bool complete = bytes.empty() ||
+            (ReadFile(file, &bytes[0], (DWORD)bytes.size(), &read, NULL) && read == bytes.size());
+        CloseHandle(file);
+        if (!complete) {
+            LogF(L"[FAIL] 自动加载器读取不完整：%s", path.c_str());
+            return false;
+        }
+        if (RefersToFpsUnlocker(bytes)) {
+            LogLine(L"[FAIL] 检测到另一个帧率补丁的自动加载器；FrameLab 未启动游戏、未安装补丁。");
+            LogF(L"       代理：%s", path.c_str());
+            LogF(L"       帧率补丁：%s", companion.c_str());
+            LogLine(L"       两套帧率补丁不能叠加。请先退出游戏，在独立的原版游戏副本中运行 FrameLab，");
+            LogLine(L"       或按另一工具的卸载说明关闭其自动加载器。仅把其 fps 改为 30 仍会安装其他补丁。");
+            return false;
+        }
+    }
+    return true;
+}
+
 // ───────────────────────────── process helpers ─────────────────────────────
 
 struct ProcEntry { DWORD pid; std::wstring name; };
@@ -623,7 +694,7 @@ static const wchar_t* Explain(int rc) {
     case 11: return L"游戏主程序不是有效的 PE";
     case 20: return L"特征码没找到 —— 这个游戏不是 1.12 版（本补丁只支持 1.12）";
     case 21: return L"特征码命中多处，不敢下手";
-    case 22: return L"帧率全局量还不是 15/30（引擎还没初始化）";
+    case 22: return L"帧率基准未就绪或已被其他补丁改写；查看 DLL 日志中的原始值";
     case 23: return L"目标帧率不是 15 的整数倍，或超出支持范围";
     case 24: return L"内存状态与预期不符（引擎还没初始化完，或版本不对）";
     case 30: return L"写入或还原核验失败，请查看日志；还原未完成时请重启游戏";
@@ -827,14 +898,6 @@ static bool JobPatch(DWORD& outPid, HANDLE& outProc, JobCtx& ctx) {
     outPid = 0;
     outProc = NULL;
 
-    // --- 1. refuse if a game is already up -------------------------------------------------
-    std::wstring who;
-    if (GameRunning(who)) {
-        LogF(L"[FAIL] 已经有一个红警3在运行：%s", who.c_str());
-        LogLine(L"       为避免误碰别人的对局，本工具不会去注入它。请先关闭游戏再试。");
-        return false;
-    }
-
     // --- 2. locate the game ---------------------------------------------------------------
     if (!DirExistsW(TrimSlash(ctx.dir))) {
         LogF(L"[FAIL] 目录不存在：%s", ctx.dir.c_str());
@@ -849,6 +912,16 @@ static bool JobPatch(DWORD& outPid, HANDLE& outProc, JobCtx& ctx) {
     if (VersionScore(FileName(g.exe)) != 1012) {
         LogLine(L"[WARN] 主程序文件名不像 1.12 版。本补丁的特征码是按 1.12 定位的，");
         LogLine(L"       其它版本会在下面报「特征码没找到」。");
+    }
+    if (!CheckFpsLoader(g)) return false;
+
+    // Check the selected files before the process guard so an old automatic FPS
+    // loader is reported even when its launcher is still running.
+    std::wstring who;
+    if (GameRunning(who)) {
+        LogF(L"[FAIL] 已经有一个红警3在运行：%s", who.c_str());
+        LogLine(L"       为避免误碰别人的对局，本工具不会去注入它。请先关闭游戏再试。");
+        return false;
     }
 
     // --- 3. extract our DLL ---------------------------------------------------------------
@@ -1093,7 +1166,7 @@ static bool JobPatch(DWORD& outPid, HANDLE& outProc, JobCtx& ctx) {
         if (Retryable(lastRc)) {
             ++attempt;
             if (attempt == 1 || attempt % 5 == 0) {
-                LogF(L"[WAIT] 引擎还没准备好（返回 %d，%s），继续等…（已等 %lu 秒）",
+                LogF(L"[WAIT] 安装前置条件尚未通过（返回 %d，%s），继续等…（已等 %lu 秒）",
                      lastRc, Explain(lastRc), (unsigned long)((GetTickCount() - t0) / 1000));
             }
             Sleep(1000);
@@ -1108,7 +1181,7 @@ static bool JobPatch(DWORD& outPid, HANDLE& outProc, JobCtx& ctx) {
         // printing "timed out" after 3 seconds was actively misleading.
         const unsigned long waited = (unsigned long)((GetTickCount() - t0) / 1000);
         if (lastRc < 0) {
-            LogF(L"[FAIL] 等了 %lu 秒还是没装上补丁（引擎一直没就绪）。", waited);
+            LogF(L"[FAIL] 等了 %lu 秒仍未完成补丁安装；查看前面的注入与启用日志。", waited);
         } else {
             LogF(L"[FAIL] 装补丁失败：最后返回 %d（%s），等了 %lu 秒。",
                  lastRc, Explain(lastRc), waited);
@@ -1739,6 +1812,26 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR /*lpCmdLine*/, int) {
     // ── optional headless mode: Ra3FpsTest.exe --auto "<dir>" <fps> [cycles] ──
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+
+    if (argc >= 2 && _wcsicmp(argv[1], L"--check-conflicts") == 0) {
+        g_auto = true;
+        if (!GetStdHandle(STD_OUTPUT_HANDLE)) AttachConsole(ATTACH_PARENT_PROCESS);
+        OpenLogFile();
+        GameFind game;
+        std::wstring error;
+        int result = 2;
+        if (argc != 3) LogLine(L"用法：Ra3FpsTest.exe --check-conflicts \"<游戏目录>\"");
+        else if (!FindGame(argv[2], game, error)) LogF(L"[FAIL] %s", error.c_str());
+        else {
+            LogF(L"主程序     : %s", game.exe.c_str());
+            result = CheckFpsLoader(game) ? 0 : 1;
+            if (!result) LogLine(L"[OK] 未发现已知的 FPS 自动加载器组合；安装时仍会执行内存基准和特征校验。");
+        }
+        LocalFree(argv);
+        if (g_hLogFile != INVALID_HANDLE_VALUE) CloseHandle(g_hLogFile);
+        CoUninitialize();
+        return result;
+    }
 
     // ── self-test mode: Ra3FpsTest.exe --gui-autostart "<dir>" <fps> [cycles] ──
     // Builds the real GUI, pre-fills the real controls and clicks the real button. Does NOT
