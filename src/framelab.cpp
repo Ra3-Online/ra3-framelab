@@ -42,9 +42,10 @@
 #include "schedule.h"
 #include "sim_gate.h"      // 2026-09-28:相位边界门 / 迷雾可见性相位的纯逻辑(与 test_schedule 共用)
 #include "chassis_gate.h"   // 2026-09-21:车身外观 30 Hz 节拍门的纯逻辑(与离线自检共用)
+#include "visual_timing.h"
 
 // ───────────────────────────── 版本与状态码 ─────────────────────────────
-#define FL_VERSION "0.2.2-dev1"
+#define FL_VERSION "0.2.3-dev1-visual1"
 
 enum FlStatus {
     FL_OK = 0,
@@ -1198,6 +1199,22 @@ static const uintptr_t kEngineMsPerFrameFloatVa = 0x00CDBC54;
 //   ★ 这是整个「建筑动画」修复的前提数字:若实测 = 60 帧/秒,则 flt_CDBC5C 必须改;
 //     若实测仍是 30 帧/秒,则我上面的推论就是错的,必须回头重查(所以必须先量、再改)。
 static const uintptr_t kDisplayClockVa = 0x00CDB750;
+
+// 2026-10-08: construction visual clock. Independently checked against the
+// supported retail binary; these are instruction bytes, not upstream code.
+// First window includes fldcw: it MUST be retained before the replacement call.
+static const short kSigConstructionNow[] = {
+    0x8B,0x50,0x74,0xD9,0x6C,0x24,0x12,0xFF,0xD2,0x8B,0xF0,0x2B,0xF5,0x5D
+};
+static const short kSigConstructionHold[] = {
+    0x8B,0x42,0x74,0xFF,0xD0,0x2B,0xD8,0x03,0xF3,0x85,0xF6,0x89,0x74,0x24,0x24
+};
+static const short kSigConstructionElapsed[] = {
+    0x85,0xF6,0x89,0x74,0x24,0x24,0xDB,0x44,0x24,0x24,0x7D,0x06,0xD8,0x05,0x74,0x8F,0xBE,0x00
+};
+static int g_constructionSites = 0;
+static volatile long g_constructionClamps = 0;
+static void* g_constructionResume = NULL;
 static int g_retailFps = 30;
 static int g_targetFps = 60;
 static int g_ratio = 4;            // r = 客户端帧率 ÷ 逻辑帧率
@@ -1817,6 +1834,35 @@ extern "C" void __fastcall fl_wrap_tracer(void* mgr, void* unused) {
 // 无栈参数 ⇒ 我们也无栈参数,调用约定对得上。与弹道流包装同一个形状:只读自己的全局 + 一次虚拟帧号计算,
 // 不分配、不用 SEH。节拍门不生效时每次都转发 ⇒ 行为逐位不变。
 typedef void (__thiscall *FnPsysUpdate)(void* self);
+
+// Native getFrame leaves the FP stack and XMM registers alone. Keep this
+// replacement integer-only too; both construction getter sites are mode 0.
+extern "C" unsigned __fastcall fl_construction_now(void* client, void* unused) {
+    (void)unused;
+    const unsigned char* gl = *(unsigned char**)(uintptr_t)0x00CD8CE4;
+    if (gl) return fl_construction_clock(*(unsigned*)(gl + 0x50), g_ratio);
+    return (unsigned)((FnClientFrame)(*(void***)client)[0x74 / 4])(client);
+}
+
+// At this native window ESI = elapsed; [esp+24h] still contains the mode.
+// Preserve all other registers, the native TEST flags and the original store.
+// The following native unsigned conversion is shared with mode 1, so changing
+// that conversion itself would also change simulation. Leave mode 1 untouched.
+__declspec(naked) void fl_construction_signed_elapsed() {
+    __asm {
+        cmp dword ptr [esp+24h], 0
+        jne keep_elapsed
+        test esi, esi
+        jns keep_elapsed
+        xor esi, esi
+        inc dword ptr [g_constructionClamps]
+    keep_elapsed:
+        test esi, esi
+        mov dword ptr [esp+24h], esi
+        jmp dword ptr [g_constructionResume]
+    }
+}
+
 extern "C" void __fastcall fl_wrap_psys(void* mgr, void* unused) {
     (void)unused;
     ++g_psCalls;
@@ -2973,6 +3019,48 @@ static int install(int targetFps, bool measureOnly) {
         }
     }
 
+    // Construction display clock and signed elapsed guard. All three windows
+    // are checked before writing any of them. A miss fails this candidate's
+    // installation and enters the existing complete rollback below.
+    g_constructionSites = 0; g_constructionClamps = 0;
+    if (ok && !measureOnly && targetFps > g_retailFps &&
+        (g_groups & FL_G_RATIO) && (g_groups & FL_G_DER_FPMS)) {
+        Pattern pNow = {"施工显示当前时钟", kSigConstructionNow,
+                        (int)(sizeof kSigConstructionNow / sizeof kSigConstructionNow[0]), 0x006F6DC6};
+        Pattern pHold = {"施工显示暂停时钟", kSigConstructionHold,
+                         (int)(sizeof kSigConstructionHold / sizeof kSigConstructionHold[0]), 0x006F6DF3};
+        Pattern pElapsed = {"施工显示负差值保护", kSigConstructionElapsed,
+                            (int)(sizeof kSigConstructionElapsed / sizeof kSigConstructionElapsed[0]), 0x006F6DFC};
+        unsigned char* now = scan(pNow);
+        unsigned char* hold = scan(pHold);
+        unsigned char* elapsed = scan(pElapsed);
+        ok = now && now != (unsigned char*)-1 && hold && hold != (unsigned char*)-1 &&
+             elapsed && elapsed != (unsigned char*)-1;
+        if (!ok) {
+            FL_ERR("施工显示计时:三处特征未全部确认，候选版拒绝安装并回滚");
+        } else {
+            // fldcw [esp+12h] is relocated within the same nine-byte window;
+            // the stack pointer has not changed. The replacement call follows.
+            unsigned char codeNow[9] = {0xD9,0x6C,0x24,0x12,0xE8,0,0,0,0};
+            int rel = (int)((unsigned char*)&fl_construction_now - (now + 9));
+            memcpy(codeNow + 5, &rel, 4);
+            ok = patch(now, codeNow, 9, "施工显示当前时钟(保留 fldcw)");
+            if (ok) ++g_constructionSites;
+            unsigned char codeHold[5] = {0xE8,0,0,0,0};
+            rel = (int)((unsigned char*)&fl_construction_now - (hold + 5));
+            memcpy(codeHold + 1, &rel, 4);
+            if (ok) ok = patch(hold, codeHold, 5, "施工显示暂停时钟");
+            if (ok) ++g_constructionSites;
+            unsigned char codeElapsed[6] = {0xE9,0,0,0,0,0x90};
+            rel = (int)((unsigned char*)&fl_construction_signed_elapsed - (elapsed + 5));
+            memcpy(codeElapsed + 1, &rel, 4);
+            g_constructionResume = elapsed + 6;
+            if (ok) ok = patch(elapsed, codeElapsed, 6, "施工显示负差值保护(仅 mode 0)");
+            if (ok) ++g_constructionSites;
+            if (ok) FL_INFO("施工显示计时候选已装:3 处；当前/暂停时钟使用逻辑帧 × %d；mode 1 未改；需手动验收模型闪现", g_ratio);
+        }
+    }
+
     // ── ★★★ 战役过场运镜计时(默认关;2026-09-26)。16 处操作数改指,全中才装。──────────────────────
     g_camOn = false; g_camSites = 0;
     if (ok && !measureOnly && (g_groups & FL_G_CAMERA)) {
@@ -3265,6 +3353,7 @@ static int install(int targetFps, bool measureOnly) {
         FL_ERR("安装失败，尝试按撤销表还原；还原结果单独核验");
         const int bad = rollback();
         if (bad == 0) {
+            g_constructionSites = 0;
             g_visPhaseOn = false;
             g_simPinSites = 0;
             g_simGateSites = 0;
@@ -3967,6 +4056,14 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabPsysStatus() {
     const int ratio = c > 0 ? (int)((long long)f * 1000 / c) : 0;
     FL_INFO("粒子系统节拍门:调用 %ld 转发 %ld ⇒ 放行比例 %d/1000(90 帧应 ≈ 333,60 帧 ≈ 500)", c, f, ratio);
     return 1000000 + ratio;
+}
+
+// Query outside the render hook: logging never runs in a construction callback.
+extern "C" __declspec(dllexport) int __stdcall FrameLabConstructionStatus() {
+    if (!fl::g_installed) return 0;
+    FL_INFO("施工显示计时候选:安装 %d/3 处；负差值保护命中 %ld 次；光效与模型闪现尚待手动验收",
+            fl::g_constructionSites, fl::g_constructionClamps);
+    return fl::g_constructionSites == 3 ? 7 : 0;
 }
 
 // FrameLabScrollStatus():卷屏归一的状态。-2 = 两处补丁点没就位(特征没命中 / 常量不对);0 = 关;1 = 已生效。

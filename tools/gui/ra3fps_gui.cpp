@@ -108,7 +108,9 @@
 //   argued from the unit-consistency of sub_6F6CB0 plus the clockrate evidence, not from a
 //   direct reading of the counter. A/B masks if it ever needs re-testing:
 //     0x2CFFF = fixed (shipped)   0x2C1FF = triple OFF (batch-6 behaviour)
-static const unsigned kGroups = 0x2CFFFu;
+// Construction previews are a hot path. Animation diagnostics (0x4000) remain
+// available through RA3FL_GROUPS, but normal GUI runs no longer install them.
+static const unsigned kGroups = 0x28FFFu;
 
 // 2026-09-21 (chassis-suspension session): OPTIONAL override of the groups mask, read once from
 // the environment variable RA3FL_GROUPS (decimal or 0x-hex). Absent / empty / unparsable / 0
@@ -117,8 +119,8 @@ static const unsigned kGroups = 0x2CFFFu;
 // pose interpolation) are default-OFF until they are verified on a machine that really renders
 // 90 fps -- and on that machine this single exe is often the only tool at hand. With this the
 // A/B is one line in a console, no rebuild:
-//     set RA3FL_GROUPS=0x3ACFFF  &&  Ra3FpsTest.exe      (shipped set + probe + gate + interpolation)
-//     set RA3FL_GROUPS=0x1ACFFF  &&  Ra3FpsTest.exe      (shipped set + probe + gate, hold mode)
+//     set RA3FL_GROUPS=0x3A8FFF  &&  Ra3FpsTest.exe      (shipped set + gate + interpolation)
+//     set RA3FL_GROUPS=0x1A8FFF  &&  Ra3FpsTest.exe      (shipped set + gate, hold mode)
 //     set RA3FL_GROUPS=          &&  Ra3FpsTest.exe      (back to the shipped default)
 // The log states the effective mask AND whether it came from the override, so a log sent back
 // to us can never be mistaken for a default run.
@@ -1216,6 +1218,8 @@ static void JobMeasureLoop(DWORD pid, HANDLE gameProc, int targetFps, int maxCyc
     void* fpswin   = RemoteExport(pid, localBase, "FrameLabFpsWindow");
     void* logicfps = RemoteExport(pid, localBase, "FrameLabLogicFps");
     void* readDw   = RemoteExport(pid, localBase, "FrameLabReadDword");
+    void* psStatus = RemoteExport(pid, localBase, "FrameLabPsysStatus");
+    void* constructionStatus = RemoteExport(pid, localBase, "FrameLabConstructionStatus");
     if (!fpswin || !logicfps || !readDw) { LogLine(L"[WARN] 取不到测量用的导出地址。"); return; }
 
     HANDLE proc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
@@ -1305,6 +1309,16 @@ static void JobMeasureLoop(DWORD pid, HANDLE gameProc, int targetFps, int maxCyc
         LogF(L"#%02d  渲染 %s fps ｜ 逻辑 %s Hz ｜ 每帧毫秒 %lu ｜ 逻辑帧率全局 %lu%s",
              cycle, sR, sL, (unsigned long)mspf, (unsigned long)lglob,
              (lowRender && !fg) ? L" ｜ 焦点不在游戏" : L"");
+        // Collect after startup too; the old one-off reading was always 0/0.
+        // These calls run on this worker and never log from a game draw hook.
+        DWORD visual = 0, ps = 0;
+        if (constructionStatus && RemoteCall(proc, constructionStatus, NULL, &visual, 30000))
+            LogF(L"      施工显示计时候选：%s（安装核验，不代表模型闪现已验收）", visual == 7 ? L"3 处已安装" : L"未启用");
+        if ((EffectiveGroups() & 0x4000000u) && psStatus && RemoteCall(proc, psStatus, NULL, &ps, 30000)) {
+            if ((int)ps >= 1000000)
+                LogF(L"      粒子推进放行比例 %d/1000（90 帧约 333，60 帧约 500；光团熄灭仍待验证）", (int)ps - 1000000);
+            else LogF(L"      粒子推进状态 %d", (int)ps);
+        }
 
         // 每轮扫一次报告目录。崩溃 / 不同步是**事后**才知道的,不能让用户自己去翻文件夹找 ——
         // 而且那份报告往往就是唯一能说明问题的东西。已经报过的不会重复报。
@@ -1389,7 +1403,7 @@ static void JobMeasureLoop(DWORD pid, HANDLE gameProc, int targetFps, int maxCyc
 // --auto usable from a script: an always-zero exit code would make a failing run look fine.
 static bool RunJob(JobCtx ctx) {
     LogF(L"===== 目标 %d 帧 ｜ 目录 %s =====", ctx.fps, ctx.dir.c_str());
-    LogF(L"补丁版本 %s ｜ 改动分组 0x%04X%s", L"0.2.2-dev1", EffectiveGroups(),
+    LogF(L"补丁版本 %s ｜ 改动分组 0x%04X%s", L"0.2.3-dev1-visual1", EffectiveGroups(),
          g_groupsOverridden ? L"（★环境变量 RA3FL_GROUPS 覆盖；未采用界面选项组合）" : L"");
     if (!g_groupsOverridden)
         LogF(L"载具颠簸修复 = %s", g_chassisFix
@@ -1886,7 +1900,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR /*lpCmdLine*/, int) {
     // 2026-09-22:高度 472 → 496,给第三个复选框腾出那 24 px(实测截图发现它压在「游戏目录」行上)。
     RECT rc = { 0, 0, 616, 496 };
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
-    g_hMain = CreateWindowExW(0, wc.lpszClassName, L"红警3 帧率测试工具（只改内存，不动游戏文件）",
+    g_hMain = CreateWindowExW(0, wc.lpszClassName, L"红警3 帧率测试工具 — 视觉候选 1",
                               WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
                               CW_USEDEFAULT, CW_USEDEFAULT,
                               rc.right - rc.left, rc.bottom - rc.top,

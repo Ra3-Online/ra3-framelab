@@ -3,7 +3,7 @@
 [CmdletBinding()]
 param(
     [ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+(?:[-.][A-Za-z0-9.-]+)?$')]
-    [string]$Version = '0.2.2-dev1-gui-fix2',
+    [string]$Version = '0.2.3-dev1-visual1',
     [string]$BuildDir = $env:FLAB_BUILD_DIR,
     [string]$PackageDir,
     [switch]$Rebuild
@@ -32,7 +32,7 @@ $packages = [IO.Path]::GetFullPath($PackageDir)
 New-Item -ItemType Directory -Force -Path $packages | Out-Null
 if ($Rebuild) { & (Join-Path $PSScriptRoot 'build.ps1') -Target all -BuildDir $build -RunTests }
 
-$binaryNames = @('Ra3FpsTest.exe', 'Ra3FrameLab.dll', 'flctl.exe', 'test_schedule.exe', 'test_loader.exe', 'test_sim_contract.exe')
+$binaryNames = @('Ra3FpsTest.exe', 'Ra3FrameLab.dll', 'flctl.exe', 'test_schedule.exe', 'test_visual_timing.exe', 'test_loader.exe', 'test_sim_contract.exe')
 $documents = @('README.md', 'LICENSE', 'NOTICE.md', 'CHANGELOG.md', 'SETUP.md', 'docs\TECHNICAL.md', 'docs\EFFECTS_INVESTIGATION.md')
 $researchDocument = 'docs\CROSSFPS_RESEARCH.md'
 if (Test-Path -LiteralPath (Join-Path $root $researchDocument) -PathType Leaf) { $documents += $researchDocument }
@@ -77,13 +77,13 @@ try {
         if (($loaderOutput -join "`n") -notmatch $versionPattern) { throw 'Release DLL version does not match the requested release.' }
         New-Item -ItemType Directory -Force -Path (Join-Path $build 'logs') | Out-Null
         [IO.File]::WriteAllLines((Join-Path $build 'logs\release-loader.check.txt'), [string[]]$loaderOutput, (New-Object Text.UTF8Encoding($true)))
-        foreach ($testName in @('test_schedule.exe', 'test_sim_contract.exe')) {
+        foreach ($testName in @('test_schedule.exe', 'test_visual_timing.exe', 'test_sim_contract.exe')) {
             $testOutput = @(& (Join-Path $build $testName) 2>&1)
             $testExit = $LASTEXITCODE
             [IO.File]::WriteAllLines((Join-Path $build ('logs\release-' + $testName + '.check.txt')), [string[]]$testOutput, (New-Object Text.UTF8Encoding($true)))
             if ($testExit -ne 0) { throw "Release offline test failed: $testName (exit $testExit; output saved in build logs)." }
         }
-        Write-Host "Release GUI/DLL version: $coreVersion; all three offline tests passed."
+        Write-Host "Release GUI/DLL version: $coreVersion; all four offline tests passed."
     } finally { Pop-Location }
 } finally {
     $env:PYTHONIOENCODING = $previousPythonEncoding

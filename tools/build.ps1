@@ -164,6 +164,7 @@ try {
     Push-Location -LiteralPath $out
     try {
         if ($Target -in @('test', 'all')) { Build-Executable 'test_schedule.exe' (Join-Path $root 'tests\test_schedule.cpp') }
+        if ($Target -in @('test', 'all')) { Build-Executable 'test_visual_timing.exe' (Join-Path $root 'tests\test_visual_timing.cpp') }
         if ($Target -in @('loader', 'all')) { Build-Executable 'test_loader.exe' (Join-Path $root 'tests\test_loader.cpp') }
         if ($Target -in @('contract', 'all')) {
             # Only this test owns a bounded, non-executable IMAGE data fixture.
@@ -175,7 +176,7 @@ try {
         # gui-only preserves a previously verified DLL's exact bytes in $out.
         if ($Target -in @('gui', 'gui-only', 'all')) { Build-Gui }
         if ($RunTests) {
-            $testNames = if ($Target -eq 'gui-only') { @() } else { @('test_schedule.exe', 'test_loader.exe', 'test_sim_contract.exe') }
+            $testNames = if ($Target -eq 'gui-only') { @() } else { @('test_schedule.exe', 'test_visual_timing.exe', 'test_loader.exe', 'test_sim_contract.exe') }
             foreach ($name in $testNames) {
                 $test = Join-Path $out $name
                 if (-not (Test-Path -LiteralPath $test -PathType Leaf)) { throw "-RunTests requires $name; build -Target all first." }
