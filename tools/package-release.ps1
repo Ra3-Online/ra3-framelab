@@ -3,7 +3,7 @@
 [CmdletBinding()]
 param(
     [ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+(?:[-.][A-Za-z0-9.-]+)?$')]
-    [string]$Version = '0.2.2-dev1',
+    [string]$Version = '0.2.2-dev1-gui-fix1',
     [string]$BuildDir = $env:FLAB_BUILD_DIR,
     [string]$PackageDir,
     [switch]$Rebuild

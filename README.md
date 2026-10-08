@@ -8,7 +8,9 @@
 
 ## 下载与运行
 
-从 [0.2.2-dev1 研究预发行](https://github.com/Ra3-Online/ra3-framelab/releases/tag/v0.2.2-dev1) 下载 `Ra3FrameLab-0.2.2-dev1-windows-x86.zip`，完整解压到可写目录，运行 `Ra3FpsTest.exe`。GUI内嵌对应版本DLL，普通用户无需安装Python、Visual Studio，也无需手工复制DLL到游戏目录。该候选包含本轮自动门控修复，适合按研究记录复测；有限匹配不能保证所有联机场景安全。
+从 [0.2.2-dev1-gui-fix1 研究预发行](https://github.com/Ra3-Online/ra3-framelab/releases/tag/v0.2.2-dev1-gui-fix1) 下载 `Ra3FrameLab-0.2.2-dev1-gui-fix1-windows-x86.zip`，完整解压到可写目录，运行 `Ra3FpsTest.exe`。GUI内嵌对应版本DLL，普通用户无需安装Python、Visual Studio，也无需手工复制DLL到游戏目录。该候选包含本轮自动门控修复，适合按研究记录复测；有限匹配不能保证所有联机场景安全。
+
+2026-10-08 修正了旧 GUI 启动时报“并行配置不正确”的错误：内嵌启动清单的 XML 注释包含非法的连续减号。旧 `v0.2.2-dev1` Windows 包也存在此问题，请使用上述修复包。构建现已校验清单 XML，并在 Windows 上解析最终 EXE 的激活上下文；打包已有产物时也执行检查。此次修复包保留原研究预发行 DLL 的完整字节（SHA-256 `9b500e2fa1e4e808cd646cb4ed62172305bea57a33022353bbe9e60a60e01d46`），联机研究结果的覆盖范围不变。
 
 此前公开基线保留在 [v0.2.1](https://github.com/Ra3-Online/ra3-framelab/releases/tag/v0.2.1)，其默认模拟门配置与新版不同。两个发行的工件和验收结论分别记录。每个发行提供对应源码ZIP、技术报告、许可和SHA-256校验清单。
 
@@ -88,10 +90,10 @@ CLI 必须与 `Ra3FrameLab.dll` 放在同一目录。自动化时显式提供 PI
 生成当前研究分支的候选包：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version 0.2.2-dev1 -Rebuild
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version 0.2.2-dev1-gui-fix1 -Rebuild
 ```
 
-默认包名使用 `0.2.2-dev1`，CI 使用 `0.2.2-dev1-<提交短 SHA>`，与公开 `v0.2.1` 基线分开标识。打包检查源码、GUI 与 DLL 的实际版本一致，提取GUI的实际RCDATA/101资源并核验完整DLL字节及SHA，拒绝同版本但内容不同的载荷，并运行三项离线测试。本研究树拒绝冒用公开 `0.2.1` 标签或未经源码版本更新的正式版本号；候选标识不代表已通过联机验收。
+默认包名使用 `0.2.2-dev1-gui-fix1`，CI 使用 `0.2.2-dev1-gui-fix1-<提交短 SHA>`，GUI/DLL 内部版本仍为 `0.2.2-dev1`，与公开 `v0.2.1` 基线分开标识。打包检查源码、GUI 与 DLL 的实际版本一致，提取GUI的实际RCDATA/101资源并核验完整DLL字节及SHA，拒绝同版本但内容不同的载荷；另核验内嵌启动清单与 Windows 激活上下文，并运行三项离线测试。本研究树拒绝冒用公开 `0.2.1` 标签或未经源码版本更新的正式版本号；候选标识不代表已通过联机验收。
 
 输出便携二进制 ZIP、对应源码 ZIP 和 SHA-256 清单。内容包括本许可、版权说明、README、技术报告与当前跨帧率研究记录；不包含作者的本地归档、日志、游戏或回放。CI 在 Windows 上重建和运行离线检查，游戏镜像扫描需由拥有游戏的开发者本地完成。
 

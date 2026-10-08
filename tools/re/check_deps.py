@@ -7,8 +7,8 @@ check_deps.py -- verify Ra3FpsTest.exe is actually portable.
 
 WHY THIS EXISTS
     The whole point of Ra3FpsTest.exe is that it gets carried to a machine that has
-    NOTHING installed except the game. Three ways that promise breaks silently, all of
-    which still produce an exe that builds, runs on THIS machine, and looks fine:
+    NOTHING installed except the game. Four ways that promise breaks silently, all of
+    which can still produce an exe that compiles successfully:
 
       1. A missing /MT.  cl.exe defaults to the dynamic CRT, so the exe quietly needs
          msvcp140.dll / vcruntime140.dll / ucrtbase.dll. On a clean machine it then fails
@@ -25,7 +25,11 @@ WHY THIS EXISTS
          an absolute build-directory path ending in "Ra3FpsTest.pdb". Harmless functionally, but the user's
          requirement was explicit: the tool must not carry this machine's paths.
 
-    So all three are checked here, and any of them FAILS the build.
+      4. An invalid startup manifest. rc.exe does not validate its XML; a double hyphen
+         in a comment can make Windows reject the exe before wWinMain. Parse the actual
+         RT_MANIFEST/1 and ask Windows to resolve it, without running the program.
+
+    All four are checked here, and any failure stops the Windows build/package.
 
 USAGE
     python check_deps.py <Ra3FpsTest.exe> <Ra3FrameLab.dll>
@@ -38,6 +42,7 @@ import hashlib
 import os
 import struct
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 # Everything here ships with Windows itself. Anything else means a dependency.
@@ -59,10 +64,12 @@ CRT_RED_PREFIX = "api-ms-win-crt"
 # tools/gui/gui_res.h and ra3fps_gui.rc use this numeric RT_RCDATA resource.
 IDR_FRAMELAB_DLL = 101
 RT_RCDATA = 10
+RT_MANIFEST = 24
 
 
-def embedded_framelab_dll(d):
-    """Extract one unambiguous, file-backed RCDATA/101 DLL without loading the PE."""
+def embedded_resource(d, resource_type, resource_id):
+    """Extract one unambiguous, file-backed numeric resource without loading the PE."""
+    label = "resource %d/%d" % (resource_type, resource_id)
     def checked(offset, size, limit=len(d)):
         if offset < 0 or size < 0 or offset > limit or size > limit - offset:
             raise ValueError("PE/resource range exceeds its file or directory bounds")
@@ -163,24 +170,70 @@ def embedded_framelab_dll(d):
     def subdirectory(entries, key):
         target = entries.get(key)
         if target is None or not target & 0x80000000:
-            raise ValueError("missing RCDATA/101 directory")
+            raise ValueError("missing %s directory" % label)
         return directory(target & 0x7FFFFFFF)
 
-    names = subdirectory(directory(0), RT_RCDATA)
-    languages = subdirectory(names, IDR_FRAMELAB_DLL)
+    names = subdirectory(directory(0), resource_type)
+    languages = subdirectory(names, resource_id)
     if len(languages) != 1:
-        raise ValueError("RCDATA/101 must have exactly one language")
+        raise ValueError("%s must have exactly one language" % label)
     language, target = next(iter(languages.items()))
     if not isinstance(language, int) or target & 0x80000000:
-        raise ValueError("invalid RCDATA/101 language or data entry")
+        raise ValueError("invalid %s language or data entry" % label)
     entry = resource_range(target, 16)
     data_rva, data_size, _, reserved = struct.unpack_from("<IIII", d, entry)
     if reserved:
         raise ValueError("nonzero resource data entry reserved field")
     offset = file_range(data_rva, data_size)
     if any(max(offset, start) < min(offset + data_size, end) for start, end in metadata):
-        raise ValueError("RCDATA payload overlaps resource metadata")
+        raise ValueError("%s payload overlaps resource metadata" % label)
     return d[offset:offset + data_size]
+
+
+def embedded_framelab_dll(d):
+    return embedded_resource(d, RT_RCDATA, IDR_FRAMELAB_DLL)
+
+
+def validate_manifest(d):
+    """Parse the actual startup manifest, including comments, before Windows sees it."""
+    root = ET.fromstring(embedded_resource(d, RT_MANIFEST, 1))
+    if root.tag != "{urn:schemas-microsoft-com:asm.v1}assembly":
+        raise ValueError("startup manifest root is not an asm.v1 assembly")
+    if root.get("manifestVersion") != "1.0":
+        raise ValueError("unsupported startup manifest version")
+    return root
+
+
+def validate_activation_context(exe_path):
+    """Ask Windows to resolve RT_MANIFEST/1; never execute the GUI or DLL."""
+    import ctypes
+    from ctypes import wintypes
+
+    class ACTCTXW(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.ULONG), ("dwFlags", wintypes.DWORD),
+            ("lpSource", wintypes.LPCWSTR), ("wProcessorArchitecture", wintypes.WORD),
+            ("wLangId", wintypes.WORD), ("lpAssemblyDirectory", wintypes.LPCWSTR),
+            ("lpResourceName", ctypes.c_void_p), ("lpApplicationName", wintypes.LPCWSTR),
+            ("hModule", wintypes.HMODULE),
+        ]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateActCtxW.argtypes = [ctypes.POINTER(ACTCTXW)]
+    kernel.CreateActCtxW.restype = wintypes.HANDLE
+    kernel.ReleaseActCtx.argtypes = [wintypes.HANDLE]
+    kernel.ReleaseActCtx.restype = None
+    context = ACTCTXW()
+    context.cbSize = ctypes.sizeof(context)
+    # Select the EXE's startup resource. Let Windows infer the architecture: forcing
+    # x86 here from 64-bit Python is rejected with ERROR_INVALID_PARAMETER.
+    context.dwFlags = 0x008  # ACTCTX_FLAG_RESOURCE_NAME_VALID
+    context.lpSource = str(Path(exe_path).resolve())
+    context.lpResourceName = 1  # MAKEINTRESOURCE(CREATEPROCESS_MANIFEST_RESOURCE_ID)
+    handle = kernel.CreateActCtxW(ctypes.byref(context))
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    kernel.ReleaseActCtx(handle)
 
 
 def pe_layout(d):
@@ -260,6 +313,19 @@ def main():
         failures.append("imports")
     else:
         print("OK   every import is a Windows component -- no runtime to install")
+
+    # rc.exe can embed malformed XML successfully. Check the final PE, not only its source.
+    try:
+        validate_manifest(exe)
+        print("OK   RT_MANIFEST/1 startup manifest is well-formed XML")
+        if sys.platform == "win32":
+            validate_activation_context(exe_path)
+            print("OK   Windows resolves the embedded startup activation context")
+        else:
+            print("SKIP Windows activation-context resolution (requires Windows)")
+    except (ValueError, struct.error, ET.ParseError, OSError) as error:
+        print("FAIL startup manifest/activation context: %s" % error)
+        failures.append("manifest")
 
     # --- 3. the patcher DLL must really be inside ---------------------------------------
     # Check the GUI's actual resource, not an incidental byte sequence elsewhere in the PE.

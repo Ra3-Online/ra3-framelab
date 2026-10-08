@@ -73,7 +73,7 @@ function Import-VsEnvironment([string]$DevCmd) {
     }
     $process.Dispose()
     if ($env:VSCMD_ARG_TGT_ARCH -ne 'x86') { throw 'The discovered MSVC environment is not targeting x86.' }
-    foreach ($name in @('cl.exe', 'link.exe', 'rc.exe')) {
+    foreach ($name in @('cl.exe', 'link.exe', 'rc.exe', 'mt.exe')) {
         if (-not (Get-Command $name -ErrorAction SilentlyContinue)) { throw "Missing tool in the selected environment: $name" }
     }
     Write-Host "MSVC $env:VCToolsVersion, Windows SDK $env:WindowsSDKVersion, target x86"
@@ -142,6 +142,8 @@ function Build-Gui {
         Copy-Item -LiteralPath (Join-Path $root ("tools\gui\$name")) -Destination (Join-Path $stage $name) -Force
     }
     Copy-Item -LiteralPath (Join-Path $out 'Ra3FrameLab.dll') -Destination (Join-Path $stage 'Ra3FrameLab.dll') -Force
+    # rc.exe embeds arbitrary bytes; a successful resource build does not validate XML.
+    Invoke-BuildTool 'mt.exe' @('/nologo', '/validate_manifest', '/manifest', (Join-Path $stage 'ra3fps_gui.manifest')) 'gui.manifest.txt'
     $resource = Join-Path $out 'ra3fps_gui.res'
     Push-Location -LiteralPath $stage
     try { Invoke-BuildTool 'rc.exe' @('/nologo', '/c65001', '/fo', $resource, 'ra3fps_gui.rc') 'gui.resources.txt' $resource }
