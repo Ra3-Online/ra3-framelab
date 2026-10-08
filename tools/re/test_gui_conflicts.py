@@ -132,4 +132,4 @@ if __name__ == "__main__":
                Path(__file__).resolve().parents[2] / "build" / "Ra3FpsTest.exe").resolve()
     if not GUI.is_file():
         raise SystemExit(f"GUI was not built: {GUI}")
-    unittest.main()
+    unittest.main(failfast=True)

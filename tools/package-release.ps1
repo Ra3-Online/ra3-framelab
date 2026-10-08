@@ -65,6 +65,10 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Release export validation failed.' }
     & $python -B (Join-Path $root 'tools\re\check_deps.py') (Join-Path $build 'Ra3FpsTest.exe') (Join-Path $build 'Ra3FrameLab.dll')
     if ($LASTEXITCODE -ne 0) { throw 'Release portability validation failed.' }
+    # The DLL product version is shared by GUI-only fixes. Exercise the actual
+    # GUI so an older same-version EXE cannot be mislabeled as this candidate.
+    & $python -B (Join-Path $root 'tools\re\test_gui_conflicts.py') (Join-Path $build 'Ra3FpsTest.exe')
+    if ($LASTEXITCODE -ne 0) { throw 'Release GUI conflict checks failed.' }
     Push-Location -LiteralPath $build
     try {
         $loaderOutput = @(& (Join-Path $build 'test_loader.exe') (Join-Path $build 'Ra3FrameLab.dll') 2>&1)
