@@ -31,7 +31,7 @@ jobs:
         id: research_package
         shell: powershell
         run: |
-          $researchVersion = '0.2.3-dev1-visual5-' + $env:GITHUB_SHA.Substring(0, 12)
+          $researchVersion = '0.2.3-dev1-visual6-' + $env:GITHUB_SHA.Substring(0, 12)
           .\tools\package-release.ps1 -Version $researchVersion
           "research_version=$researchVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

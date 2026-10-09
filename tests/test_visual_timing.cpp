@@ -14,12 +14,13 @@ static void check(bool ok, const char* label) {
 static void put(unsigned char* tpl, unsigned off, unsigned value) {
     memcpy(tpl + off, &value, sizeof value);
 }
-static void retail_template(unsigned char* tpl) {
+static void retail_template(unsigned char* tpl, unsigned id = kFlSovietPowerGlowId) {
     memset(tpl, 0, 260);
-    put(tpl, 256, kFlSovietPowerGlowId);
+    put(tpl, 256, id);
     put(tpl, 80, 5);
     for (unsigned off : {100u,156u,168u}) put(tpl, off, 1);
-    for (unsigned off : {104u,108u,160u,164u}) put(tpl, off, 0x41700000u);
+    const unsigned lifeBits = id == kFlJapanPowerPlantLightId ? 0x3F800000u : 0x41700000u;
+    for (unsigned off : {104u,108u,160u,164u}) put(tpl, off, lifeBits);
     for (unsigned off : {172u,176u}) put(tpl, off, 0x3F800000u);
 }
 static void* mockSelf = NULL;
@@ -167,28 +168,99 @@ static void test_vertices() {
 // Actual integer millisecond progression and float birth reconstruction, rather
 // than assuming ideal exact ages. This is a CPU model, never a GPU visual test.
 static void test_glow_seam() {
+    for (unsigned nativeLife : {1u,15u})
     for(int fps : {60,90}) for(unsigned base : {0u,100001u,3600000u,28800000u}) {
         const int q=fps/30;
+        const unsigned poolLife = nativeLife + 1;
+        const float visibleLife = (float)poolLife - 0.25f;
         int gaps15=0, overlaps16=0, gapsPair=0, overlapsPair=0;
         for(int phase=0;phase<q;++phase) {
             const unsigned begin=base+(unsigned)(phase*1000/fps);
-            const float expiry=(float)((double)begin*(double)0.03f+16.0);
-            const float birth=(float)((double)expiry-16.0);
-            for(int frame=0;frame<=16*q;++frame) {
+            const float expiry=(float)((double)begin*(double)0.03f+poolLife);
+            const float birth=(float)((double)expiry-poolLife);
+            for(int frame=0;frame<=(int)poolLife*q;++frame) {
                 const unsigned now=base+(unsigned)((frame+phase)*1000/fps);
                 const float shader=(float)((float)((double)now*0.001)*30.0f);
                 const float age=shader-birth;
-                const bool replaced=frame==16*q;
-                gaps15+=!replaced && age>15.0f;
-                overlaps16+=replaced && age<=16.0f;
-                gapsPair+=!replaced && age>kFlGlowVisibleLifetime;
-                overlapsPair+=replaced && age<=kFlGlowVisibleLifetime;
+                const bool replaced=frame==(int)poolLife*q;
+                gaps15+=!replaced && age>(float)nativeLife;
+                overlaps16+=replaced && age<=(float)poolLife;
+                gapsPair+=!replaced && age>visibleLife;
+                overlapsPair+=replaced && age<=visibleLife;
             }
         }
-        check(gaps15>0, "native 15 has sampled intermediate-display gaps in clock model");
-        check(overlaps16>0, "visual2 16 overlaps on replacement in clock model");
+        check(gaps15>0, "retail 1/15-frame lifetime has sampled intermediate-display gaps in clock model");
+        check(overlaps16>0, "pool lifetime alone overlaps on replacement in clock model");
         check(gapsPair==0 && overlapsPair==0, "paired retention/visible-life avoids both gaps and overlap in clock model up to eight hours");
     }
+}
+
+static void test_empire_glow() {
+    unsigned char tpl[260], system[12] = {}, storage[40] = {}, particle[88] = {}, self[4] = {};
+    void* t = tpl; memcpy(system + 8, &t, 4);
+    void* ref[2] = {system, NULL}; void* handle = ref;
+    memcpy(storage + 4, &handle, 4); put(storage, 36, 5);
+    FlGpuParticleParams params;
+    for (unsigned i = 0; i < 12; ++i) params.words[i] = 0xDEADC000u + i;
+    g_glowOrigFn = (void*)&mock_gpu_ctor;
+    g_glowVerticesOrigFn = (void*)&mock_vertices;
+    g_glowOn = g_psOn = true;
+    memset((void*)g_powerGlowStats, 0, sizeof g_powerGlowStats);
+    g_glowVertexTraceCount = g_glowVertexTraceLogged = 0;
+    for (unsigned id : {kFlJapanPowerGlowId,kFlJapanPowerPlantLightId}) {
+        const FlPowerGlowProfile* profile = fl_power_glow_profile(id);
+        retail_template(tpl, id); params.words[9] = profile->nativeLifetime;
+        FlGpuParticleParams expected = params; expected.words[9] = profile->poolLifetime;
+        for (int i = 0; i < 60; ++i) nativeVertices[i] = (float)i * 0.125f;
+        for (unsigned i = 0; i < 5; ++i) nativeVertices[i * 10 + 3] = (float)profile->poolLifetime;
+        put(particle, 40, profile->poolLifetime); nativeWritten = 50;
+        auto upload = [&](bool corrected) {
+            float out[60], expectedOut[60]; memcpy(expectedOut, nativeVertices, sizeof expectedOut);
+            if (corrected) for (unsigned i = 0; i < 5; ++i) expectedOut[i * 10 + 3] = profile->visibleLifetime;
+            unsigned char before[88]; memcpy(before, particle, sizeof before); vertexCalls = 0;
+            float* result = fl_wrap_gpu_vertices(storage, NULL, particle, out);
+            check(vertexCalls == 1 && result == out + nativeWritten && vertexStorage == storage &&
+                  vertexParticle == particle && vertexBuffer == out,
+                  "Empire upload retains one native call, its input pointers and exact end pointer");
+            check(!memcmp(out, expectedOut, sizeof out),
+                  "Empire correction changes only all five lifetime fields including centre; native birth and tail survive");
+            check(!memcmp(particle, before, sizeof before), "Empire vertex correction preserves the whole native particle");
+        };
+        for (int fps : {60,90}) {
+            g_targetFps = fps;
+            run_glow(self, &handle, &params, expected, true); upload(true);
+        }
+        const PowerGlowStats& stats = g_powerGlowStats[profile->index];
+        check(stats.born == 2 && stats.adjusted == 2 && stats.uploads == 2 && stats.corrected == 2,
+              "Empire light and refinery have independent successful runtime diagnostics");
+        for (int fps : {30,120}) {
+            g_targetFps = fps; run_glow(self, &handle, &params, params, false); upload(false);
+        }
+        g_targetFps = 90;
+        for (unsigned offset : {72u,80u,100u,104u,108u,112u,156u,160u,164u,168u,172u,176u}) {
+            retail_template(tpl, id); put(tpl, offset, fl_visual_word(tpl, offset) ^ 1u);
+            run_glow(self, &handle, &params, params, false); upload(false);
+        }
+        retail_template(tpl, id);
+        put(particle, 40, profile->nativeLifetime); upload(false);
+        put(particle, 40, profile->poolLifetime);
+        nativeVertices[43] = (float)profile->nativeLifetime; upload(false);
+        nativeVertices[43] = (float)profile->poolLifetime;
+        put(storage, 36, 4); upload(false); put(storage, 36, 5);
+        nativeWritten = 40; upload(false); nativeWritten = 50;
+        check(stats.corrected == 2 && stats.rejected[0] == 12 && stats.rejected[1] == 1 &&
+              stats.rejected[2] == 1 && stats.rejected[3] == 1 && stats.rejected[4] == 1,
+              "modified Empire timing, layouts, spans and centre lifetime fail closed with per-template reasons");
+        check(g_glowVertexTraceCount > 0 && stats.traces == 16,
+              "each Empire template keeps its own bounded observation quota");
+    }
+    for (unsigned id : {0x607C7AFCu,0x7E32072Fu}) {
+        retail_template(tpl, id); params.words[9] = id == 0x607C7AFCu ? 20 : 25;
+        run_glow(self, &handle, &params, params, false);
+    }
+    check(!fl_power_glow_profile(0) && !fl_power_glow_profile(0x607C7AFCu) &&
+          !fl_power_glow_profile(0x7E32072Fu), "Empire moving glow and spark emitters remain outside the retention patch");
+    g_glowOn = g_psOn = false; g_glowOrigFn = g_glowVerticesOrigFn = NULL;
 }
 static int progressCalls=0, progressMode=0;
 static void* progressModule=NULL;
@@ -663,7 +735,7 @@ static void test_wall_first_display() {
 }
 
 int main() {
-    test_glow();test_vertices();test_glow_seam();test_construction();test_construction_prepare();test_wall_first_display();
+    test_glow();test_vertices();test_glow_seam();test_empire_glow();test_construction();test_construction_prepare();test_wall_first_display();
     std::printf("visual timing: %d passed, %d failed\n",passed,failed);
     return failed?1:0;
 }

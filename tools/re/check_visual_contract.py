@@ -19,6 +19,8 @@ def main():
     parser.add_argument("--glow-asset", type=Path)
     parser.add_argument("--wall-manifest", type=Path,
                         help="optional retail static.manifest (local, read-only)")
+    parser.add_argument("--empire-glow-dir", type=Path,
+                        help="optional local JapanPowerGlow.asset and JapanPowerPlantIdleLight.asset")
     args = parser.parse_args()
     image = Image(args.image)
     source = Path(__file__).resolve().parents[2] / "src" / "visual_timing.h"
@@ -102,6 +104,28 @@ def main():
               "retail glow GPUDrawModule uses native geometry type 2")
     else:
         print("Retail asset checks NOT RUN: optionally pass --glow-asset with your own extracted asset.")
+    if args.empire_glow_dir:
+        for name, sha, identifier, constant, lifetime in (
+            ("JapanPowerGlow", "c6ce21cb524998a23f88b16088b0b8ea6fbdb35263f740d3e063090516e0c2ea",
+             0x565063F6, "kFlJapanPowerGlowId", 15.0),
+            ("JapanPowerPlantIdleLight", "cc5317fc1cf489e3116b6f2b355068ff181e9404a9e7f51282e3a45a2e4a60af",
+             0x56C6A9AD, "kFlJapanPowerPlantLightId", 1.0),
+        ):
+            asset = (args.empire_glow_dir / (name + ".asset")).read_bytes()
+            check(len(asset) == 552 and hashlib.sha256(asset).hexdigest() == sha,
+                  "optional retail Empire asset identity: " + name)
+            check(struct.unpack_from("<Iff", asset, 56) == (1, lifetime, lifetime)
+                  and struct.unpack_from("<Iff", asset, 92) == (1, lifetime, lifetime)
+                  and struct.unpack_from("<Iff", asset, 104) == (1, 1.0, 1.0),
+                  "retail Empire fixed lifetime and matching emission countdown: " + name)
+            draw_offset = struct.unpack_from("<I", asset, 144)[0]
+            check(draw_offset == 300 and struct.unpack_from("<I", asset, draw_offset + 36)[0] == 2,
+                  "retail Empire glow uses native centred-quad geometry: " + name)
+            match = re.search(constant + r"\s*=\s*0x([0-9A-F]+)u", header)
+            check(match is not None and int(match.group(1), 16) == identifier,
+                  "compiled Empire template identity: " + name)
+    else:
+        print("Empire asset checks NOT RUN: optionally pass --empire-glow-dir with your own extracted assets.")
     if args.wall_manifest:
         manifest = args.wall_manifest.read_bytes()
         hdr = struct.unpack_from("<12I", manifest)

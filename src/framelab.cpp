@@ -45,7 +45,7 @@
 #include "visual_timing.h"
 
 // ───────────────────────────── 版本与状态码 ─────────────────────────────
-#define FL_VERSION "0.2.3-dev1-visual5"
+#define FL_VERSION "0.2.3-dev1-visual6"
 
 enum FlStatus {
     FL_OK = 0,
@@ -1455,11 +1455,17 @@ static void*          g_glowVerticesOrigFn = NULL;
 static volatile long  g_glowSeen = 0, g_glowAdjusted = 0, g_glowSkipped = 0;
 static volatile long  g_glowVertexCalls = 0, g_glowVertexAdjusted = 0, g_glowVertexSkipped = 0;
 static volatile long g_glowVertexRejected[5] = {};
+struct PowerGlowStats {
+    volatile long born, adjusted, skipped, uploads, corrected, uploadSkipped;
+    volatile long rejected[5];
+    unsigned traces;
+};
+static PowerGlowStats g_powerGlowStats[kFlPowerGlowProfiles] = {};
 struct GlowVertexTrace {
-    unsigned count, poolLife, writtenBytes, rejected;
+    unsigned templateId, count, poolLife, writtenBytes, rejected;
     float firstLife, lastLife, birth, expiry;
 };
-static GlowVertexTrace g_glowVertexTrace[16];
+static GlowVertexTrace g_glowVertexTrace[kFlPowerGlowProfiles * 16];
 static volatile long g_glowVertexTraceCount = 0;
 static unsigned g_glowVertexTraceLogged = 0;
 // 2026-09-26:过场运镜计时(见 FL_G_CAMERA)。被改指过来的 11 条换算指令直接读 g_camMs。
@@ -1971,18 +1977,23 @@ extern "C" void* __fastcall fl_wrap_gpu_ctor(void* self, void* unused,
         const void* ref = *(const void**)handle;
         const void* system = ref ? *(const void**)ref : NULL;
         const void* tpl = system ? *(const void**)((const unsigned char*)system + 8) : NULL;
-        if (tpl && fl_visual_word(tpl, 256) == kFlSovietPowerGlowId) {
+        const FlPowerGlowProfile* profile = tpl ? fl_power_glow_profile(fl_visual_word(tpl, 256)) : NULL;
+        if (profile) {
             ++g_glowSeen;
+            PowerGlowStats& stats = g_powerGlowStats[profile->index];
+            ++stats.born;
             if (fl_retail_power_glow(tpl, params->words[9])) {
                 // Pool retention and visible life are a paired patch. Keeping
                 // 16 visible (visual2) overlapped old/new additive quads. The
                 // upload wrapper below clips only their float visible lifetime.
                 adjusted = *params;
-                adjusted.words[9] = kFlGlowPoolLifetime;
+                adjusted.words[9] = profile->poolLifetime;
                 use = &adjusted;
                 ++g_glowAdjusted;
+                ++stats.adjusted;
             } else {
                 ++g_glowSkipped;
+                ++stats.skipped;
             }
         }
     }
@@ -1997,36 +2008,45 @@ extern "C" float* __fastcall fl_wrap_gpu_vertices(void* storage, void* unused,
     if (g_glowOn && g_psOn && (g_targetFps == 60 || g_targetFps == 90) &&
         storage && particle && vertices) {
         const void* tpl = fl_gpu_storage_template(storage);
-        if (tpl && fl_visual_word(tpl, 256) == kFlSovietPowerGlowId) {
+        const FlPowerGlowProfile* profile = tpl ? fl_power_glow_profile(fl_visual_word(tpl, 256)) : NULL;
+        if (profile) {
             ++g_glowVertexCalls;
+            PowerGlowStats& stats = g_powerGlowStats[profile->index];
+            ++stats.uploads;
             const unsigned count = fl_visual_word(storage, 36);
             const unsigned poolLife = fl_visual_word(particle, 40);
             const unsigned written = (unsigned)((uintptr_t)result - (uintptr_t)vertices);
             unsigned rejected = 0;
-            if (!fl_retail_power_glow(tpl, 15)) rejected |= 1;
+            if (!fl_retail_power_glow(tpl, profile->nativeLifetime)) rejected |= 1;
             if (count != kFlGlowVertexCount) rejected |= 2;
-            if (poolLife != kFlGlowPoolLifetime) rejected |= 4;
+            if (poolLife != profile->poolLifetime) rejected |= 4;
             if (written != kFlGlowVertexCount * 40u) rejected |= 8;
             // Confirm the native end pointer before reading or writing any of
             // the five 40-byte records (including the centre vertex).
             const bool spanOK = count == kFlGlowVertexCount && written == kFlGlowVertexCount * 40u;
             if (spanOK) for (unsigned i = 0; i < kFlGlowVertexCount; ++i)
-                if (vertices[i * 10 + 3] != (float)kFlGlowPoolLifetime) rejected |= 16;
-            if (g_glowVertexTraceCount < 16) {
+                if (vertices[i * 10 + 3] != (float)profile->poolLifetime) rejected |= 16;
+            if (stats.traces < 16 && g_glowVertexTraceCount < (long)(kFlPowerGlowProfiles * 16)) {
                 GlowVertexTrace& r = g_glowVertexTrace[g_glowVertexTraceCount];
+                r.templateId = profile->id;
                 r.count = count; r.poolLife = poolLife; r.writtenBytes = written; r.rejected = rejected;
                 r.firstLife = spanOK ? vertices[3] : -1.0f;
                 r.lastLife = spanOK ? vertices[43] : -1.0f;
                 r.birth = spanOK ? vertices[7] : -1.0f;
                 r.expiry = *(const float*)((const unsigned char*)particle + 72);
+                ++stats.traces;
                 InterlockedIncrement(&g_glowVertexTraceCount);
             }
             if (!rejected) {
-                for (unsigned i = 0; i < kFlGlowVertexCount; ++i) vertices[i * 10 + 3] = kFlGlowVisibleLifetime;
+                for (unsigned i = 0; i < kFlGlowVertexCount; ++i) vertices[i * 10 + 3] = profile->visibleLifetime;
                 ++g_glowVertexAdjusted;
+                ++stats.corrected;
             } else {
                 ++g_glowVertexSkipped;
-                for (unsigned i = 0; i < 5; ++i) if (rejected & (1u << i)) ++g_glowVertexRejected[i];
+                ++stats.uploadSkipped;
+                for (unsigned i = 0; i < 5; ++i) if (rejected & (1u << i)) {
+                    ++g_glowVertexRejected[i]; ++stats.rejected[i];
+                }
             }
         }
     }
@@ -3482,10 +3502,11 @@ static int install(int targetFps, bool measureOnly) {
     g_glowOn = false; g_glowSeen = 0; g_glowAdjusted = 0; g_glowSkipped = 0;
     g_glowVertexCalls = 0; g_glowVertexAdjusted = 0; g_glowVertexSkipped = 0;
     memset((void*)g_glowVertexRejected, 0, sizeof g_glowVertexRejected);
+    memset((void*)g_powerGlowStats, 0, sizeof g_powerGlowStats);
     g_glowVertexTraceCount = g_glowVertexTraceLogged = 0;
     if (ok && !measureOnly && (g_groups & FL_G_PSYS) &&
         (targetFps == 60 || targetFps == 90)) {
-        Pattern pGlow = {"苏联光团 GPU 构造调用", kSigGpuGlowCtor,
+        Pattern pGlow = {"建筑光团 GPU 构造调用", kSigGpuGlowCtor,
                          (int)(sizeof kSigGpuGlowCtor / sizeof kSigGpuGlowCtor[0]), 0x006D2635};
         Pattern pVertices = {"GPU 粒子顶点上传调用", kSigGpuGlowVertices,
                              (int)(sizeof kSigGpuGlowVertices / sizeof kSigGpuGlowVertices[0]), 0x006C6C8D};
@@ -3506,15 +3527,15 @@ static int install(int targetFps, bool measureOnly) {
                 g_glowOrigFn = original;
                 g_glowVerticesOrigFn = vertexOriginal;
                 g_glowOn = true;
-                ok = patch(call, code, sizeof code, "苏联光团池存活保持(仅零售模板 15→16)");
+                ok = patch(call, code, sizeof code, "建筑光团池存活保持(限定三个零售模板)");
                 const int vertexRel = (int)((unsigned char*)&fl_wrap_gpu_vertices - (vertexCall + 5));
                 memcpy(code + 1, &vertexRel, sizeof vertexRel);
-                if (ok) ok = patch(vertexCall, code, sizeof code, "苏联光团 GPU 可见寿命(16→15.75)");
-                if (ok) FL_INFO("苏联光团交接候选已装 @%08X / %08X；池存活 16、顶点可见寿命 15.75；只改零售五顶点光团，出生时间与发射/RNG 不改；需手动验收",
+                if (ok) ok = patch(vertexCall, code, sizeof code, "建筑光团 GPU 可见寿命(池末步前裁剪)");
+                if (ok) FL_INFO("建筑光团交接已装 @%08X / %08X；苏联/帝国矿场 pool=16 visible=15.75，帝国电厂 pool=2 visible=1.75；仅三个零售五顶点模板；出生与发射/RNG 不改；需画面验收",
                                 (unsigned)(uintptr_t)call, (unsigned)(uintptr_t)vertexCall);
             }
         }
-        if (!ok) FL_ERR("苏联光团交接候选:PSYS 门或 GPU 构造/上传调用未确认，拒绝安装并回滚");
+        if (!ok) FL_ERR("建筑光团交接:PSYS 门或 GPU 构造/上传调用未确认，拒绝安装并回滚");
     }
 
     // Continuous display progress in a single logic-clock domain. This is one
@@ -4627,18 +4648,27 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabPsysStatus() {
     const long c = fl::g_psCalls, f = fl::g_psFwd;
     const int ratio = c > 0 ? (int)((long long)f * 1000 / c) : 0;
     FL_INFO("粒子系统节拍门:调用 %ld 转发 %ld ⇒ 放行比例 %d/1000(90 帧应 ≈ 333,60 帧 ≈ 500)", c, f, ratio);
-    FL_INFO("苏联光团交接候选:安装=%d，构造命中 %ld，池存活修正 %ld，字段不符跳过 %ld；仅安装不能视为闪烁验收",
+    FL_INFO("建筑光团交接:安装=%d，构造命中 %ld，池存活修正 %ld，字段不符跳过 %ld；仅安装不能视为闪烁验收",
             fl::g_glowOn ? 1 : 0, fl::g_glowSeen, fl::g_glowAdjusted, fl::g_glowSkipped);
-    FL_INFO("苏联光团顶点:命中 %ld，五顶点可见寿命 15.75 修正 %ld，布局/字段不符跳过 %ld；出生时间保持原值",
+    FL_INFO("建筑光团顶点:命中 %ld，五顶点修正 %ld，布局/字段不符跳过 %ld；出生时间保持原值",
             fl::g_glowVertexCalls, fl::g_glowVertexAdjusted, fl::g_glowVertexSkipped);
-    FL_INFO("苏联光团拒绝原因:模板 %ld，顶点数量 %ld，池寿命 %ld，写入范围 %ld，顶点寿命 %ld（可同时命中）",
+    FL_INFO("建筑光团拒绝原因:模板 %ld，顶点数量 %ld，池寿命 %ld，写入范围 %ld，顶点寿命 %ld（可同时命中）",
             fl::g_glowVertexRejected[0], fl::g_glowVertexRejected[1], fl::g_glowVertexRejected[2],
             fl::g_glowVertexRejected[3], fl::g_glowVertexRejected[4]);
+    static const char* const names[kFlPowerGlowProfiles] = {"苏联光团", "帝国矿场光团", "帝国电厂灯光"};
+    for (unsigned i = 0; i < kFlPowerGlowProfiles; ++i) {
+        const FlPowerGlowProfile& p = kFlPowerGlows[i];
+        const fl::PowerGlowStats& s = fl::g_powerGlowStats[i];
+        FL_INFO("GLOW tpl=%08X %s:原寿命=%u pool=%u visible=%.2f 构造=%ld 修正=%ld 跳过=%ld 上传=%ld 修正=%ld 跳过=%ld 拒绝=%ld/%ld/%ld/%ld/%ld",
+                p.id, names[i], p.nativeLifetime, p.poolLifetime, p.visibleLifetime,
+                s.born, s.adjusted, s.skipped, s.uploads, s.corrected, s.uploadSkipped,
+                s.rejected[0], s.rejected[1], s.rejected[2], s.rejected[3], s.rejected[4]);
+    }
     while (fl::g_glowVertexTraceLogged < (unsigned)fl::g_glowVertexTraceCount) {
         const unsigned i = fl::g_glowVertexTraceLogged++;
         const fl::GlowVertexTrace& r = fl::g_glowVertexTrace[i];
-        FL_INFO("光团上传[%u]:顶点=%u pool=%u bytes=%u reject=%02X first=%.5f last=%.5f birth=%.5f expiry=%.5f",
-                i, r.count, r.poolLife, r.writtenBytes, r.rejected, r.firstLife, r.lastLife, r.birth, r.expiry);
+        FL_INFO("光团上传[%u]:tpl=%08X 顶点=%u pool=%u bytes=%u reject=%02X first=%.5f last=%.5f birth=%.5f expiry=%.5f",
+                i, r.templateId, r.count, r.poolLife, r.writtenBytes, r.rejected, r.firstLife, r.lastLife, r.birth, r.expiry);
     }
     return 1000000 + ratio;
 }
@@ -4646,7 +4676,7 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabPsysStatus() {
 // Query outside the render hook: logging never runs in a construction callback.
 extern "C" __declspec(dllexport) int __stdcall FrameLabConstructionStatus() {
     if (!fl::g_installed) return 0;
-    FL_INFO("施工显示同域插值:安装 %d/2 处；进度调用 %ld，未激活 %ld，未来起点保护 %ld；共享 mode 1 未改，仍待手动验收",
+    FL_INFO("施工显示同域插值:安装 %d/6 处；进度调用 %ld，未激活 %ld，未来起点保护 %ld；共享 mode 1 未改",
             fl::g_constructionSites, fl::g_constructionCalls, fl::g_constructionInactive, fl::g_constructionClamps);
     FL_INFO("施工首次绘制:显示调用 %ld，已选中施工动画 %ld，同戳 %ld，初始动画补算 %ld，未激活/已完成拒绝 %ld；不提前换模型",
             fl::g_constructionPrepareCalls, fl::g_constructionMatched, fl::g_constructionSameStamp,
