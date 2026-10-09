@@ -209,7 +209,7 @@ static HWND      g_hBbDump    = NULL;   // 「立即保存现场」
 static HWND      g_hBbTest    = NULL;   // 「记录器自检」
 static HWND      g_hChassis   = NULL;   // 「修复载具颠簸」复选框(2026-09-21)
 static HWND      g_hScroll    = NULL;   // 「卷屏保持原版速度」复选框(2026-09-21,默认不勾)
-static HWND      g_hFx        = NULL;   // 「修复过快的视觉效果」复选框(2026-09-22,默认不勾)
+static HWND      g_hFx        = NULL;   // 「额外特效修复」复选框(默认不勾)
 static HFONT     g_hFont      = NULL;
 
 static volatile LONG g_busy   = 0;   // a job is running; disable the controls
@@ -1313,10 +1313,10 @@ static void JobMeasureLoop(DWORD pid, HANDLE gameProc, int targetFps, int maxCyc
         // These calls run on this worker and never log from a game draw hook.
         DWORD visual = 0, ps = 0;
         if (constructionStatus && RemoteCall(proc, constructionStatus, NULL, &visual, 30000))
-            LogF(L"      施工显示保护：%s（模型闪现仍需手测）", visual == 6 ? L"连续插值与首次模型准备两处已装，进度写日志" : L"未启用");
+            LogF(L"      施工显示保护：%s", visual == 6 ? L"进度插值与初始姿态处理已装；围墙闪现尚未解决" : L"未启用");
         if ((EffectiveGroups() & 0x4000000u) && psStatus && RemoteCall(proc, psStatus, NULL, &ps, 30000)) {
             if ((int)ps >= 1000000)
-                LogF(L"      粒子推进放行比例 %d/1000（90 帧约 333，60 帧约 500；光团熄灭仍待验证）", (int)ps - 1000000);
+                LogF(L"      粒子推进放行比例 %d/1000（90 帧约 333，60 帧约 500）", (int)ps - 1000000);
             else LogF(L"      粒子推进状态 %d", (int)ps);
         }
 
@@ -1414,7 +1414,7 @@ static bool RunJob(JobCtx ctx) {
              ? L"保持原版（键盘 / 边缘卷屏每秒距离不随帧率变；分组多出 0x800000；右键拖拽不在此列）"
              : L"随帧率变快（现状：60 帧约 2 倍、90 帧约 3 倍）");
     if (!g_groupsOverridden)
-        LogF(L"过快视觉效果修复 = %s", g_fxFix
+        LogF(L"额外特效修复 = %s", g_fxFix
              ? L"开（弹道流密度 + 粒子发射 + 光效 / 淡出 / 图标 + 战役过场运镜钉回原版；分组多出 0x1F400000）"
              : L"关（现状：弹道流、贴花淡出、拖尾滚动等在 60/90 帧下快 2/3 倍）");
 
@@ -1649,7 +1649,7 @@ static void CreateUi(HWND h) {
                                 312, 29, 290, 20, h, (HMENU)IDC_SCROLL_FIX, g_hInst, NULL);
     SendMessageW(g_hScroll, BM_SETCHECK, g_scrollFix ? BST_CHECKED : BST_UNCHECKED, 0);
     // 2026-09-22:过快视觉效果的打包开关,默认不勾。
-    g_hFx = CreateWindowExW(0, L"BUTTON", L"修复过快的特效与过场运镜（实验）",
+    g_hFx = CreateWindowExW(0, L"BUTTON", L"额外特效修复（含光效与过场运镜，实验）",
                             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                             312, 50, 290, 20, h, (HMENU)IDC_FX_FIX, g_hInst, NULL);
     SendMessageW(g_hFx, BM_SETCHECK, g_fxFix ? BST_CHECKED : BST_UNCHECKED, 0);
