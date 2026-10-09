@@ -13,23 +13,19 @@
 // old quad before the new one is drawn. Birth time must not be shifted.
 static const unsigned kFlGlowPoolLifetime = 16;
 static const float kFlGlowVisibleLifetime = 15.75f;
+// Retail GPUDrawModule.GeometryType = 2. The native table C19244[2] is 5:
+// CENTERED_QUAD includes its centre vertex, not just the four corners.
+static const unsigned kFlGlowVertexCount = 5;
 
-// Object -> Drawable model conditions are queued by the logic side. Between
-// logic boundaries a freshly placed object can already be unpacking while its
-// draw module still has the default (complete) model. Prepare only that pending
-// transition, in a local copy, with the same remove/add override order as the
-// native Drawable. Never edit the object, Drawable or the world's queue here.
 static const std::uint32_t kFlStructureUnpacking = 0x1000u;
-inline bool fl_pending_construction_flags(const std::uint32_t* pending,
-                                         const std::uint32_t* displayed,
-                                         const std::uint32_t* remove,
-                                         const std::uint32_t* add,
-                                         std::uint32_t* result) {
-    if (!(pending[0] & kFlStructureUnpacking) ||
-        (displayed[0] & kFlStructureUnpacking)) return false;
-    for (unsigned i = 0; i < 15; ++i)
-        result[i] = (pending[i] & ~remove[i]) | add[i];
-    return (result[0] & kFlStructureUnpacking) != 0;
+static const unsigned kFlMatchUnpacking = 7;
+// Native sub_90D620 / sub_8F48A0 starts MATCH_UNPACKING at frame 0, with
+// previousFrame = currentFrame - 0.00001f. sub_90ECF0 consumes that sentinel.
+// Model selection also stamps module+200 with the current time, which can
+// suppress the first render's calculation. Only prime this native initial
+// state (or a pending native model restart); do not select a different model.
+inline bool fl_initial_unpacking_track(float current, float previous) {
+    return current == 0.0f && previous == -0.00001f;
 }
 
 // Work in logic-frame units throughout; never subtract a display-frame count

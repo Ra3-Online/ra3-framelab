@@ -129,6 +129,7 @@ function Build-Dll {
         if (-not [IO.Path]::IsPathRooted($image)) { $image = Join-Path $root $image }
         if (-not (Test-Path -LiteralPath $image -PathType Leaf)) { throw 'FLAB_IMAGE was set but the game image does not exist.' }
         Invoke-BuildTool $python @('-B', (Join-Path $root 'tools\re\dryscan.py'), (Join-Path $root 'src\framelab.cpp'), $image) 'signatures.check.txt'
+        Invoke-BuildTool $python @('-B', (Join-Path $root 'tools\re\check_visual_contract.py'), $image) 'visual.native.contract.txt'
     } else {
         Write-Host 'Signature scan NOT RUN: set FLAB_IMAGE to your own supported RA3 1.12 .game image for offline signature validation.'
     }

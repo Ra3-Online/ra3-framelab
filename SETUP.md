@@ -4,7 +4,7 @@
 
 默认输出为仓库 `build`；`FLAB_BUILD_DIR` 可改输出位置。GUI 资源从本次输出中的 DLL 生成，避免嵌入其他目录的旧版本。Git Bash / MSYS 的 `tools/re/build_msvc.sh` 委托 PowerShell 构建入口；实际编译仍使用 Windows MSVC，不支持用 MinGW 替代裸函数钩子。
 
-离线自检不需要游戏。设置 `FLAB_IMAGE` 后可扫描自己持有的受支持 1.12 主程序；未提供镜像时跳过此项，不把跳过写成通过。GUI 普通运行不需要开发环境。
+构建和自检不需要游戏。设置 `FLAB_IMAGE` 时，构建还只读扫描自己持有的受支持 1.12 镜像，并检查原 GPU 几何表 / writer 布局、施工时戳与轨道初始化；不执行游戏。未提供镜像时明确跳过，不计为通过。独立检查为 `python -B tools/re/check_visual_contract.py "<自己的 .game 路径>"`；可加 `--glow-asset "<自己解出的 SovietPowerGlow.asset 路径>"` 检查零售资源几何类型，项目不提供或重分发该资源。GUI 普通运行不需要这些开发输入。
 
 开发探针用 `-GameRoot` / `FLAB_GAME_ROOT`，`-Image` / `FLAB_IMAGE`，`-SkuDef` / `FLAB_SKUDEF`，`-ReplayDir` / `FLAB_REPLAY_DIR` 配置游戏。SkuDef 自动发现只接受唯一匹配，存在多个时显式指定。回放必须传 `-Replay`，不会挑选最大文件或作者以前的回放。附加型探针必须传目标 PID。
 

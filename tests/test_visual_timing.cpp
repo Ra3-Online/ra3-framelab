@@ -110,10 +110,11 @@ static void* vertexStorage;
 static const void* vertexParticle;
 static float* vertexBuffer;
 static float nativeVertices[60];
+static unsigned nativeWritten = 50;
 static float* __fastcall mock_vertices(void* storage, void*, const void* particle, float* out) {
     ++vertexCalls; vertexStorage = storage; vertexParticle = particle; vertexBuffer = out;
     if (out) memcpy(out, nativeVertices, sizeof nativeVertices);
-    return out ? out + 40 : NULL;
+    return out ? out + nativeWritten : NULL;
 }
 static void test_vertices() {
     unsigned char tpl[260], system[12] = {}, storage[40] = {}, particle[88] = {};
@@ -121,21 +122,23 @@ static void test_vertices() {
     void* t = tpl; memcpy(system+8, &t, 4);
     void* ref[2] = {system, NULL}; void* handle = ref;
     memcpy(storage+4, &handle, 4);
-    put(storage,36,4); put(particle,40,16);
+    put(storage,36,5); put(particle,40,16);
     g_glowVerticesOrigFn = (void*)&mock_vertices;
     g_glowOn = true; g_psOn = true;
     g_glowVertexCalls = g_glowVertexAdjusted = g_glowVertexSkipped = 0;
+    g_glowVertexTraceCount = g_glowVertexTraceLogged = 0;
+    memset((void*)g_glowVertexRejected,0,sizeof g_glowVertexRejected);
     for (int i=0;i<60;++i) nativeVertices[i] = i * 0.125f;
-    for (int i=0;i<4;++i) nativeVertices[i*10+3] = 16.0f;
+    for (int i=0;i<5;++i) nativeVertices[i*10+3] = 16.0f;
     auto invoke = [&](bool adjust) {
         float out[60]; memcpy(out,nativeVertices,sizeof out); vertexCalls=0;
         unsigned char before[88]; memcpy(before,particle,sizeof before);
         float* result=fl_wrap_gpu_vertices(storage,NULL,particle,out);
         check(vertexCalls==1 && vertexStorage==storage && vertexParticle==particle &&
-              vertexBuffer==out && result==out+40, "actual upload preserves native call, args and end pointer");
+              vertexBuffer==out && result==out+nativeWritten, "actual upload preserves native call, args and end pointer");
         float expected[60]; memcpy(expected,nativeVertices,sizeof expected);
-        if(adjust) for(int i=0;i<4;++i) expected[i*10+3]=kFlGlowVisibleLifetime;
-        check(!memcmp(out,expected,sizeof out), "only four visible-life floats change; birth, velocity, position and tail survive");
+        if(adjust) for(int i=0;i<5;++i) expected[i*10+3]=kFlGlowVisibleLifetime;
+        check(!memcmp(out,expected,sizeof out), "only five visible-life floats change; centre, birth, velocity, position and tail survive");
         check(!memcmp(particle,before,sizeof before), "upload never changes native particle object");
     };
     for (int fps : {60,90}) { g_targetFps=fps; invoke(true); }
@@ -143,8 +146,10 @@ static void test_vertices() {
     for (int fps : {30,120}) {g_targetFps=fps;invoke(false);}
     g_targetFps=90;g_glowOn=false;invoke(false);g_glowOn=true;
     g_psOn=false;invoke(false);g_psOn=true;
-    for(unsigned count : {0u,1u,3u,5u,0xffffffffu}) {put(storage,36,count);invoke(false);}
-    put(storage,36,4);
+    for(unsigned count : {0u,1u,3u,4u,6u,0xffffffffu}) {put(storage,36,count);invoke(false);}
+    put(storage,36,5);
+    for(unsigned written : {0u,40u,49u,51u,60u}) {nativeWritten=written;invoke(false);}
+    nativeWritten=50;
     for(unsigned life : {0u,15u,17u,0xffffffffu}) {put(particle,40,life);invoke(false);}
     put(particle,40,16);
     for(unsigned off : {72u,80u,100u,104u,108u,112u,156u,160u,164u,168u,172u,176u,256u}) {
@@ -152,6 +157,10 @@ static void test_vertices() {
     }
     retail_template(tpl);
     nativeVertices[23]=15.0f;invoke(false);nativeVertices[23]=16.0f;
+    nativeVertices[43]=15.0f;invoke(false);nativeVertices[43]=16.0f;
+    check(g_glowVertexRejected[1]==6 && g_glowVertexRejected[2]==4 &&
+          g_glowVertexRejected[3]==5 && g_glowVertexRejected[4]==2,
+          "diagnostics distinguish count, native span, pool and fifth-vertex lifetime rejections");
     g_glowOn=false;g_psOn=false;g_glowVerticesOrigFn=NULL;
 }
 
@@ -243,106 +252,154 @@ static void test_construction() {
     g_constructionOrigFn=NULL;
 }
 
-static int modelCalls = 0, animateCalls = 0, modelSequence = 0;
-static void* modelSelf = NULL;
-static char modelForce = -1, modelLoad = -1;
-static std::uint32_t modelFlags[15];
-static char __fastcall mock_model(void* self, void*, const void* flags, char force, char load) {
-    ++modelCalls; modelSequence = (modelSequence << 8) | 1;
-    modelSelf = self; modelForce = force; modelLoad = load;
-    memcpy(modelFlags, flags, sizeof modelFlags);
-    // Native sub_90CE60 stores its input at (this - 24) + 400.
-    memcpy((unsigned char*)self + 376, flags, sizeof modelFlags);
-    return 19;
+static int animateCalls = 0, objectProgressCalls = 0;
+static const void* queriedObject = NULL;
+static char objectActive = 1;
+static float objectProgress = 0.002222222f;
+static char __fastcall mock_object_progress(const void* object, void*, float* out) {
+    ++objectProgressCalls; queriedObject = object; *out = objectProgress;
+    return objectActive;
 }
 static void __fastcall mock_animate(void* self, void*) {
-    ++animateCalls; modelSequence = (modelSequence << 8) | 2;
+    ++animateCalls;
     put((unsigned char*)self, 200, *g_constructionStamp);
+    ((unsigned char*)self)[592] = 0;
+    for (unsigned i=0;i<3;++i) {
+        const unsigned off=284+i*28;
+        if (fl_visual_word(self,off) && fl_visual_word(self,off+16)==7) {
+            const float current=*(float*)((unsigned char*)self+off+4);
+            memcpy((unsigned char*)self+off+8,&current,4);
+            const float next=objectProgress*29.0f;
+            memcpy((unsigned char*)self+off+4,&next,4);
+        }
+    }
 }
 static void test_construction_prepare() {
-    unsigned char module[660] = {}, drawable[816] = {}, object[1300] = {};
-    void* d = drawable; memcpy(module + 8, &d, 4);
-    void* o = object; memcpy(drawable + 312, &o, 4);
-    unsigned stamp = 42;
-    auto oldStamp = g_constructionStamp; g_constructionStamp = &stamp;
-    g_constructionModelFn = (void*)&mock_model;
-    g_constructionAnimateFn = (void*)&mock_animate;
-    g_constructionOn = true; g_constructionPrepared = g_constructionPrepareCalls = 0;
-    // Pending conditions include construction and unrelated bits in every word.
-    // Drawable overrides are distinct and must keep native (pending & ~remove)|add order.
-    for (unsigned i = 0; i < 15; ++i) {
-        put(object, 160 + i*4, 0x20001000u | (i << 16));
-        put(drawable, 672 + i*4, 0x20000000u);
-        put(drawable, 732 + i*4, 0x40000000u | i);
-    }
-    // The world's queue links are sentinels, never drained or rewritten.
-    put(object, 1260, 0xAA55AA55); put(object, 1264, 0x55AA55AA);
-    put(module, 200, stamp);
-    unsigned char beforeDrawable[816], beforeObject[1300];
-    memcpy(beforeDrawable, drawable, sizeof drawable); memcpy(beforeObject, object, sizeof object);
-    auto resetCalls = [&]() { modelCalls = animateCalls = modelSequence = 0; };
-    resetCalls(); fl_wrap_construction_prepare(module, NULL);
-    check(modelCalls == 1 && animateCalls == 1 && modelSequence == 0x102 &&
-          modelSelf == module + 24 && modelForce == 0 && modelLoad == 0,
-          "first same-stamp render chooses construction model before applying its initial pose");
-    bool flagsOK = true;
-    for (unsigned i = 0; i < 15; ++i)
-        flagsOK &= modelFlags[i] == ((fl_visual_word(object,160+i*4) &
-                                     ~fl_visual_word(drawable,672+i*4)) | fl_visual_word(drawable,732+i*4));
-    check(flagsOK && !memcmp(modelFlags,module+400,sizeof modelFlags),
-          "all pending conditions including wall-segment bits and Drawable overrides reach only the draw module");
+    unsigned char module[660]={},drawable[816]={},object[1300]={};
+    void* d=drawable;memcpy(module+8,&d,4);
+    void* o=object;memcpy(drawable+312,&o,4);
+    put(module,12,0x12345678);put(module,64,0x87654321);
+    unsigned stamp=42;
+    auto oldStamp=g_constructionStamp;g_constructionStamp=&stamp;
+    g_constructionObjectProgressFn=(void*)&mock_object_progress;
+    g_constructionAnimateFn=(void*)&mock_animate;
+    g_constructionOn=true;
+    g_constructionPrepared=g_constructionPrepareCalls=0;
+    g_constructionMatched=g_constructionSameStamp=g_constructionPrimeRefused=0;
+    g_constructionModelTraceCount=g_constructionModelTraceLogged=0;
+    memset(g_constructionModelRecent,0,sizeof g_constructionModelRecent);
+    memset(g_constructionLastDraw,0,sizeof g_constructionLastDraw);
+    put(object,160,kFlStructureUnpacking);put(module,400,kFlStructureUnpacking);
+    put(object,1260,0xAA55AA55);put(object,1264,0x55AA55AA);
+    put(module,200,stamp);
+    unsigned char beforeDrawable[816],beforeObject[1300];
+    memcpy(beforeDrawable,drawable,sizeof drawable);memcpy(beforeObject,object,sizeof object);
+    auto resetCalls=[]() {animateCalls=objectProgressCalls=0;queriedObject=NULL;};
+    auto initialTrack=[&](unsigned i) {
+        put(module,284+i*28,0x11111111);put(module,300+i*28,7);
+        const float current=0.0f,previous=-0.00001f;
+        memcpy(module+288+i*28,&current,4);memcpy(module+292+i*28,&previous,4);
+    };
+    put(object,160,0);put(module,400,0);
+    resetCalls();fl_wrap_construction_prepare(module,NULL);
+    check(animateCalls==0 && objectProgressCalls==0,
+          "default model is only observed, never switched or hidden");
+    put(object,160,kFlStructureUnpacking);put(module,400,kFlStructureUnpacking);
+    initialTrack(0);resetCalls();fl_wrap_construction_prepare(module,NULL);
+    check(animateCalls==1 && objectProgressCalls==1 && queriedObject==object &&
+          g_constructionPrepared==1 && *(float*)(module+288)>0.0f,
+          "selected construction model with same stamp consumes native initial-pose sentinel before draw");
     check(!memcmp(object,beforeObject,sizeof object) && !memcmp(drawable,beforeDrawable,sizeof drawable),
-          "actual preparation leaves world object, queue links and Drawable byte-identical");
-    resetCalls(); fl_wrap_construction_prepare(module, NULL);
-    check(modelCalls == 0 && animateCalls == 0 && g_constructionPrepared == 1,
-          "same pending transition prepares once and preserves the native same-stamp skip afterwards");
-    ++stamp; resetCalls(); fl_wrap_construction_prepare(module, NULL);
-    check(modelCalls == 0 && animateCalls == 1,
-          "later display stamp retains one native animation update without rebuilding the model");
-    put(module,400,0); put(drawable,672, kFlStructureUnpacking);
-    resetCalls(); fl_wrap_construction_prepare(module,NULL);
-    check(modelCalls==0 && animateCalls==0, "Drawable remove override prevents false construction transition");
-    put(drawable,672,0x20000000u); put(object,160,0);
-    resetCalls(); fl_wrap_construction_prepare(module,NULL);
-    check(modelCalls==0 && animateCalls==0, "non-construction object never triggers visual preparation");
-    put(object,160,kFlStructureUnpacking); g_constructionOn=false;
-    resetCalls(); fl_wrap_construction_prepare(module,NULL);
-    check(modelCalls==0 && animateCalls==0, "disabled wrapper retains native same-stamp behavior");
-    ++stamp; resetCalls(); fl_wrap_construction_prepare(module,NULL);
-    check(modelCalls==0 && animateCalls==1, "disabled wrapper retains native different-stamp call count");
-    g_constructionOn=true; o=NULL; memcpy(drawable+312,&o,4);
-    ++stamp; resetCalls(); fl_wrap_construction_prepare(module,NULL);
-    check(modelCalls==0 && animateCalls==1, "preview Drawable without a world owner forwards native animation only");
-    d=NULL; memcpy(module+8,&d,4);
-    resetCalls(); fl_wrap_construction_prepare(module,NULL);
-    check(modelCalls==0 && animateCalls==0, "null Drawable retains native same-stamp skip");
+          "priming leaves Object, world queue links and Drawable byte-identical without a model setter");
+    check(g_constructionModelTraceCount==1 && g_constructionModelTrace[0].initial==1 &&
+          g_constructionModelTrace[0].primed==1 && g_constructionModelTrace[0].current[0]==0.0f &&
+          g_constructionModelTrace[0].after[0]>0.0f,
+          "bounded diagnostics publish initial frames and post-update frames");
+    check(g_constructionModelTrace[0].priorFound==1 &&
+          g_constructionModelTrace[0].prior.displayedFlags==0 &&
+          g_constructionModelTrace[0].prior.objectFlags==0,
+          "diagnostics link a preceding default-model draw to the same owner and module");
+    resetCalls();fl_wrap_construction_prepare(module,NULL);
+    check(animateCalls==0 && objectProgressCalls==0 && g_constructionPrepared==1,
+          "consumed initial sentinel retains native subsequent same-stamp skip");
+    ++stamp;resetCalls();fl_wrap_construction_prepare(module,NULL);
+    check(animateCalls==1 && objectProgressCalls==0,
+          "different stamp still invokes native animation once without extra progress query");
+    for(unsigned track : {1u,2u}) {
+        initialTrack(track);resetCalls();fl_wrap_construction_prepare(module,NULL);
+        check(animateCalls==1 && objectProgressCalls==1,
+              "initial construction sentinel in a secondary track is also consumed once");
+    }
+    module[592]=1;resetCalls();fl_wrap_construction_prepare(module,NULL);
+    check(animateCalls==1 && module[592]==0,
+          "native pending model restart is consumed on same-stamp construction render");
+    initialTrack(0);objectActive=0;resetCalls();fl_wrap_construction_prepare(module,NULL);
+    check(animateCalls==0 && objectProgressCalls==1,
+          "inactive unpacking does not force native animation");
+    objectActive=1;objectProgress=1.0f;resetCalls();fl_wrap_construction_prepare(module,NULL);
+    check(animateCalls==0 && objectProgressCalls==1,
+          "completed unpacking does not trigger an extra state transition");
+    objectProgress=-0.5f;resetCalls();fl_wrap_construction_prepare(module,NULL);
+    check(animateCalls==0, "invalid visual progress is not eligible for priming");
+    objectProgress=0.002222222f;
+    module[168]=1;resetCalls();fl_wrap_construction_prepare(module,NULL);
+    check(animateCalls==0 && objectProgressCalls==0,
+          "frozen native animation is respected");
+    module[168]=0;
+    put(module,400,0);resetCalls();fl_wrap_construction_prepare(module,NULL);
+    check(animateCalls==0 && objectProgressCalls==0 && fl_visual_word(module,400)==0,
+          "pending Object condition never causes premature model selection");
+    put(module,400,kFlStructureUnpacking);
+    for(unsigned off : {12u,64u}) {
+        const unsigned saved=fl_visual_word(module,off);put(module,off,0);
+        resetCalls();fl_wrap_construction_prepare(module,NULL);
+        check(animateCalls==0 && objectProgressCalls==0,
+              "missing geometry or state retains native same-stamp behavior");
+        put(module,off,saved);
+    }
+    for(unsigned i=0;i<3;++i)put(module,300+i*28,1);
+    resetCalls();fl_wrap_construction_prepare(module,NULL);
+    check(animateCalls==0 && objectProgressCalls==0,
+          "looping animations never trigger construction priming");
+    initialTrack(0);g_constructionOn=false;
+    resetCalls();fl_wrap_construction_prepare(module,NULL);
+    check(animateCalls==0 && objectProgressCalls==0, "disabled wrapper preserves same-stamp skip");
+    ++stamp;resetCalls();fl_wrap_construction_prepare(module,NULL);
+    check(animateCalls==1 && objectProgressCalls==0, "disabled wrapper preserves different-stamp native call");
+    g_constructionOn=true;initialTrack(0);
+    o=NULL;memcpy(drawable+312,&o,4);
+    resetCalls();fl_wrap_construction_prepare(module,NULL);
+    check(animateCalls==0 && objectProgressCalls==0,
+          "preview without a world owner does not prime a construction pose");
+    d=NULL;memcpy(module+8,&d,4);
+    resetCalls();fl_wrap_construction_prepare(module,NULL);
+    check(animateCalls==0 && objectProgressCalls==0, "null Drawable preserves native same-stamp skip");
 
-    // Native render can carry a live x87 value across its animation call. Execute
-    // this compiled wrapper under that ABI and confirm stack/CW/value survive.
-    d=drawable; memcpy(module+8,&d,4); o=object; memcpy(drawable+312,&o,4);
+    d=drawable;memcpy(module+8,&d,4);o=object;memcpy(drawable+312,&o,4);
+    initialTrack(0);resetCalls();
     static const double input=1.234567890123;
     static volatile double output=0;
-    unsigned beforeStack=0, afterStack=0; unsigned short beforeCW=0, afterCW=0;
+    unsigned beforeStack=0,afterStack=0;unsigned short beforeCW=0,afterCW=0;
     void* p=module;
     __asm {
-        mov beforeStack, esp
+        mov beforeStack,esp
         fnstcw beforeCW
         fld input
-        mov ecx, p
-        xor edx, edx
+        mov ecx,p
+        xor edx,edx
         call fl_wrap_construction_prepare
         fstp output
         fnstcw afterCW
-        mov afterStack, esp
+        mov afterStack,esp
     }
-    if (beforeStack!=afterStack || beforeCW!=afterCW || input!=output)
-        std::printf("render ABI: stack %08X/%08X CW %04X/%04X value %.17g/%.17g\n",
-                    beforeStack,afterStack,beforeCW,afterCW,input,output);
-    check(beforeStack==afterStack && beforeCW==afterCW && input==output,
-          "compiled first-render wrapper preserves stack, x87 control word and live caller value");
-    g_constructionOn=false; g_constructionStamp=oldStamp;
-    g_constructionModelFn=g_constructionAnimateFn=NULL;
+    check(beforeStack==afterStack && beforeCW==afterCW && input==output && animateCalls==1,
+          "compiled priming path preserves stack, x87 control word and live caller value");
+    check(!memcmp(object,beforeObject,sizeof object) && !memcmp(drawable,beforeDrawable,sizeof drawable),
+          "all exercised paths preserve world and Drawable owned fixture bytes");
+    g_constructionOn=false;g_constructionStamp=oldStamp;
+    g_constructionObjectProgressFn=g_constructionAnimateFn=NULL;
 }
+
 int main() {
     test_glow();test_vertices();test_glow_seam();test_construction();test_construction_prepare();
     std::printf("visual timing: %d passed, %d failed\n",passed,failed);
