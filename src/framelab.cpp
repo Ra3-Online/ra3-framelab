@@ -45,7 +45,7 @@
 #include "visual_timing.h"
 
 // ───────────────────────────── 版本与状态码 ─────────────────────────────
-#define FL_VERSION "0.2.3-dev1-visual2"
+#define FL_VERSION "0.2.3-dev1-visual3"
 
 enum FlStatus {
     FL_OK = 0,
@@ -864,6 +864,10 @@ static const short kSigGpuGlowCtor[] = {
     0x8B,0x4C,0x24,0x3C,0x51,0x8D,0x53,0x04,0x52,0x8B,0xC8,
     0xE8,W,W,W,W,0xEB,0x02,0x33,0xC0,0x89,0x70,0x4C,0x89,0x78,0x50
 };
+// Native VB upload: storage in ECX, particle and vertex destination on stack.
+static const short kSigGpuGlowVertices[] = {
+    0x52,0x51,0x8B,0xCB,0xE8,W,W,W,W,0x8B,0x54,0x24,0x10,0x83,0xC6,0x04,0x3B,0xF5
+};
 
 // ── ★★★ 2026-09-26(用户 90 帧实机报告 #4):战役过场「运镜一下就过去了」—— 脚本镜头计时,**默认关** ─────
 //   用户原话:90 帧下过场镜头跑得飞快,提前到了地方等了一会飞机才过来(正常应镜头跟着飞机),约快 3 倍;
@@ -1207,21 +1211,47 @@ static const uintptr_t kEngineMsPerFrameFloatVa = 0x00CDBC54;
 //     若实测仍是 30 帧/秒,则我上面的推论就是错的,必须回头重查(所以必须先量、再改)。
 static const uintptr_t kDisplayClockVa = 0x00CDB750;
 
-// 2026-10-08: construction visual clock. Independently checked against the
-// supported retail binary; these are instruction bytes, not upstream code.
-// Both getter windows stay native, including fldcw in the first window.
-static const short kSigConstructionNow[] = {
-    0x8B,0x50,0x74,0xD9,0x6C,0x24,0x12,0xFF,0xD2,0x8B,0xF0,0x2B,0xF5,0x5D
+// Only sub_6FD550's display-mode call is redirected. The shared progress
+// function, its x87 control-word handling and all simulation callers stay native.
+#define W 0x100
+static const short kSigConstructionVisualCall[] = {
+    0x8B,0x4C,0x24,0x04,0x6A,0x00,0x51,0x8B,0xC8,0xE8,W,W,W,W,0xC2,0x04,0x00
 };
-static const short kSigConstructionHold[] = {
-    0x8B,0x42,0x74,0xFF,0xD0,0x2B,0xD8,0x03,0xF3,0x85,0xF6,0x89,0x74,0x24,0x24
+// sub_90F820's first visible model update, including the native stamp comparison.
+// Replace its 20-byte conditional call block, not the draw function's entry.
+static const short kSigConstructionModelPrepare[] = {
+    0xC6,0x86,0xCC,0x00,0x00,0x00,0x00,
+    0xA1,0x88,0x13,0xCE,0x00,0x3B,0x86,0xC8,0x00,0x00,0x00,
+    0x74,0x07,0x8B,0xCE,0xE8,W,W,W,W,0x83,0x7E,0x0C,0x00
 };
-static const short kSigConstructionElapsed[] = {
-    0x85,0xF6,0x89,0x74,0x24,0x24,0xDB,0x44,0x24,0x24,0x7D,0x06,0xD8,0x05,0x74,0x8F,0xBE,0x00
+static const short kSigConstructionModelReceiver[] = {
+    0x83,0xEC,0x7C,0x53,0x55,0x8B,0xE9,0x8B,0x5D,0xEC,
+    0x80,0xBB,0xD5,0x00,0x00,0x00,0x00,0x74,0x12,
+    0xA1,0x98,0x2F,0xCE,0x00,0x83,0xB8,0xE8,0x02,0x00,0x00,0x02
 };
+#undef W
 static int g_constructionSites = 0;
 static volatile long g_constructionClamps = 0;
-static void* g_constructionResume = NULL;
+static volatile long g_constructionCalls = 0, g_constructionInactive = 0;
+static bool g_constructionOn = false;
+static void* g_constructionOrigFn = NULL;
+static void* g_constructionModelFn = NULL;
+static void* g_constructionAnimateFn = NULL;
+static unsigned* g_constructionStamp = (unsigned*)0x00CE1388;
+static volatile long g_constructionPrepared = 0, g_constructionPrepareCalls = 0;
+// Slots are replaceable by owned offline fixtures; production uses native globals.
+static unsigned char** g_constructionLogicSlot = (unsigned char**)0x00CD8CE4;
+static unsigned char** g_constructionEngineSlot = (unsigned char**)0x00CE2F8C;
+struct ConstructionTrace {
+    uintptr_t module;
+    unsigned now, start, hold, duration;
+    float fraction, progress;
+    unsigned active, held;
+};
+static ConstructionTrace g_constructionTrace[64];
+static volatile long g_constructionTraceCount = 0;
+static unsigned g_constructionTraceLogged = 0;
+static uintptr_t g_constructionRecent[256];
 static int g_retailFps = 30;
 static int g_targetFps = 60;
 static int g_ratio = 4;            // r = 客户端帧率 ÷ 逻辑帧率
@@ -1349,9 +1379,12 @@ static bool           g_psOn     = false;   // 节拍门是否真的生效
 static volatile long  g_psCalls  = 0;       // 包装被进入的次数
 static volatile long  g_psFwd    = 0;       // 真的转发给引擎的次数(放行 ÷ 调用 应 ≈ 30 ÷ 目标帧率)
 static const uintptr_t kEngineGpuCtorVa = 0x006C1770;
+static const uintptr_t kEngineGpuVerticesVa = 0x006B99D0;
 static bool           g_glowOn = false;
 static void*          g_glowOrigFn = NULL; // retained for in-flight calls after uninstall
+static void*          g_glowVerticesOrigFn = NULL;
 static volatile long  g_glowSeen = 0, g_glowAdjusted = 0, g_glowSkipped = 0;
+static volatile long  g_glowVertexCalls = 0, g_glowVertexAdjusted = 0, g_glowVertexSkipped = 0;
 // 2026-09-26:过场运镜计时(见 FL_G_CAMERA)。被改指过来的 11 条换算指令直接读 g_camMs。
 static int            g_camMs    = 33;      // round(1000 ÷ 目标帧率),install() 里算
 static int            g_camSites = 0;       // 实际改指成功的处数(应为 16)
@@ -1847,6 +1880,11 @@ extern "C" void __fastcall fl_wrap_tracer(void* mgr, void* unused) {
 typedef void (__thiscall *FnPsysUpdate)(void* self);
 
 typedef void* (__thiscall *FnGpuCtor)(void*, void*, const FlGpuParticleParams*);
+static const void* fl_gpu_storage_template(void* storage) {
+    const void* ref = *(const void**)((const unsigned char*)storage + 4);
+    const void* system = ref ? *(const void**)ref : NULL;
+    return system ? *(const void**)((const unsigned char*)system + 8) : NULL;
+}
 extern "C" void* __fastcall fl_wrap_gpu_ctor(void* self, void* unused,
                                             void* handle, const FlGpuParticleParams* params) {
     (void)unused;
@@ -1859,11 +1897,11 @@ extern "C" void* __fastcall fl_wrap_gpu_ctor(void* self, void* unused,
         if (tpl && fl_visual_word(tpl, 256) == kFlSovietPowerGlowId) {
             ++g_glowSeen;
             if (fl_retail_power_glow(tpl, params->words[9])) {
-                // Emit countdown 15 takes 16 updates. Keep the final glow alive
-                // to the next emission on intermediate display frames. Do not
-                // change the caller's params, birth clock, emitter or RNG calls.
+                // Pool retention and visible life are a paired patch. Keeping
+                // 16 visible (visual2) overlapped old/new additive quads. The
+                // upload wrapper below clips only their float visible lifetime.
                 adjusted = *params;
-                adjusted.words[9] = 16;
+                adjusted.words[9] = kFlGlowPoolLifetime;
                 use = &adjusted;
                 ++g_glowAdjusted;
             } else {
@@ -1874,23 +1912,100 @@ extern "C" void* __fastcall fl_wrap_gpu_ctor(void* self, void* unused,
     return ((FnGpuCtor)g_glowOrigFn)(self, handle, use);
 }
 
-// At this native window ESI = elapsed; [esp+24h] still contains the mode.
-// Preserve all other registers, the native TEST flags and the original store.
-// The following native unsigned conversion is shared with mode 1, so changing
-// that conversion itself would also change simulation. Leave mode 1 untouched.
-__declspec(naked) void fl_construction_signed_elapsed() {
-    __asm {
-        cmp dword ptr [esp+24h], 0
-        jne keep_elapsed
-        test esi, esi
-        jns keep_elapsed
-        xor esi, esi
-        inc dword ptr [g_constructionClamps]
-    keep_elapsed:
-        test esi, esi
-        mov dword ptr [esp+24h], esi
-        jmp dword ptr [g_constructionResume]
+typedef float* (__thiscall *FnGpuVertices)(void*, const void*, float*);
+extern "C" float* __fastcall fl_wrap_gpu_vertices(void* storage, void* unused,
+                                                  const void* particle, float* vertices) {
+    (void)unused;
+    float* result = ((FnGpuVertices)g_glowVerticesOrigFn)(storage, particle, vertices);
+    if (g_glowOn && g_psOn && (g_targetFps == 60 || g_targetFps == 90) &&
+        storage && particle && vertices) {
+        const void* tpl = fl_gpu_storage_template(storage);
+        if (tpl && fl_visual_word(tpl, 256) == kFlSovietPowerGlowId) {
+            ++g_glowVertexCalls;
+            // Retail centered quads have four 40-byte records. Match the pool
+            // lifetime created by our paired constructor, not arbitrary mods.
+            bool eligible = fl_retail_power_glow(tpl, 15) &&
+                fl_visual_word(storage, 36) == 4 &&
+                fl_visual_word(particle, 40) == kFlGlowPoolLifetime;
+            if (eligible) for (int i = 0; i < 4; ++i)
+                eligible = eligible && vertices[i * 10 + 3] == (float)kFlGlowPoolLifetime;
+            if (eligible) {
+                for (int i = 0; i < 4; ++i) vertices[i * 10 + 3] = kFlGlowVisibleLifetime;
+                ++g_glowVertexAdjusted;
+            } else ++g_glowVertexSkipped;
+        }
     }
+    return result; // including the native end-of-buffer pointer / EAX
+}
+
+typedef char (__thiscall *FnConstructionProgress)(void*, float*, int);
+extern "C" char __fastcall fl_wrap_construction_progress(void* module, void* unused,
+                                                         float* out, int mode) {
+    (void)unused;
+    if (!g_constructionOn || mode != 0 || !module || !out)
+        return ((FnConstructionProgress)g_constructionOrigFn)(module, out, mode);
+    const unsigned char* logic = *g_constructionLogicSlot;
+    const unsigned char* engine = *g_constructionEngineSlot;
+    if (!logic || !engine)
+        return ((FnConstructionProgress)g_constructionOrigFn)(module, out, mode);
+    ++g_constructionCalls;
+    const unsigned char* bytes = (const unsigned char*)module;
+    const unsigned active = bytes[68], held = bytes[69];
+    const unsigned now = fl_visual_word(logic, 80);
+    const unsigned duration = fl_visual_word(module, 56), start = fl_visual_word(module, 60);
+    const unsigned hold = fl_visual_word(module, 64);
+    const float fraction = *(const float*)(engine + 96);
+    if (!active) { *out = 0.0f; ++g_constructionInactive; }
+    else {
+        *out = fl_construction_progress(now, start, hold, duration, fraction, held != 0);
+        if ((std::int32_t)((held ? hold : now) - start) < 0) ++g_constructionClamps;
+    }
+    // At most 64 first observations/transitions. No log, scan, allocation or
+    // VirtualQuery in this callback. RPC status writes new records later.
+    if (g_constructionTraceCount < 64) {
+        const uintptr_t key = (uintptr_t)module | (active ? 1u : 0u);
+        const unsigned slot = ((uintptr_t)module >> 4) & 255u;
+        if (g_constructionRecent[slot] != key) {
+            g_constructionRecent[slot] = key;
+            ConstructionTrace& r = g_constructionTrace[g_constructionTraceCount];
+            r.module = (uintptr_t)module; r.now = now; r.start = start; r.hold = hold;
+            r.duration = duration; r.fraction = fraction; r.progress = *out;
+            r.active = active; r.held = held;
+            // Publish only a complete row to the remote status-query thread.
+            InterlockedIncrement(&g_constructionTraceCount);
+        }
+    }
+    return active ? 1 : 0;
+}
+
+typedef char (__thiscall *FnConstructionModel)(void*, const void*, char, char);
+typedef void (__thiscall *FnConstructionAnimate)(void*);
+extern "C" void __fastcall fl_wrap_construction_prepare(void* module, void* unused) {
+    (void)unused;
+    bool prepared = false;
+    if (g_constructionOn) {
+        ++g_constructionPrepareCalls;
+        const unsigned char* drawable = *(const unsigned char**)((unsigned char*)module + 8);
+        const unsigned char* object = drawable ? *(const unsigned char**)(drawable + 312) : NULL;
+        if (object) {
+            std::uint32_t flags[15];
+            if (fl_pending_construction_flags((const std::uint32_t*)(object + 160),
+                    (const std::uint32_t*)((unsigned char*)module + 400),
+                    (const std::uint32_t*)(drawable + 672),
+                    (const std::uint32_t*)(drawable + 732), flags)) {
+                // This is the ScriptedModelDraw's own condition receiver. Do
+                // not call Object/Drawable setters or drain their logic queue.
+                ((FnConstructionModel)g_constructionModelFn)((unsigned char*)module + 24, flags, 0, 0);
+                prepared = true;
+                ++g_constructionPrepared;
+            }
+        }
+    }
+    // Native skips animation when creation and rendering share the same stamp.
+    // A newly chosen construction model must nevertheless receive its initial
+    // zero/fractional pose before its first geometry is submitted.
+    if (prepared || *g_constructionStamp != fl_visual_word(module, 200))
+        ((FnConstructionAnimate)g_constructionAnimateFn)(module);
 }
 
 extern "C" void __fastcall fl_wrap_psys(void* mgr, void* unused) {
@@ -3049,60 +3164,93 @@ static int install(int targetFps, bool measureOnly) {
         }
     }
 
-    // Candidate only with the 30-Hz PSYS gate and the 60/90 targets.
-    // Fail the transaction if the required native call cannot be verified.
+    // Paired pool/vertex candidate only with PSYS and the 60/90 targets.
+    // Verify BOTH native calls before patching either. Never install visual2's
+    // standalone lifetime change when the upload half cannot be confirmed.
     g_glowOn = false; g_glowSeen = 0; g_glowAdjusted = 0; g_glowSkipped = 0;
+    g_glowVertexCalls = 0; g_glowVertexAdjusted = 0; g_glowVertexSkipped = 0;
     if (ok && !measureOnly && (g_groups & FL_G_PSYS) &&
         (targetFps == 60 || targetFps == 90)) {
         Pattern pGlow = {"苏联光团 GPU 构造调用", kSigGpuGlowCtor,
                          (int)(sizeof kSigGpuGlowCtor / sizeof kSigGpuGlowCtor[0]), 0x006D2635};
+        Pattern pVertices = {"GPU 粒子顶点上传调用", kSigGpuGlowVertices,
+                             (int)(sizeof kSigGpuGlowVertices / sizeof kSigGpuGlowVertices[0]), 0x006C6C8D};
         unsigned char* hit = scan(pGlow);
-        ok = g_psOn && hit && hit != (unsigned char*)-1;
+        unsigned char* vertexHit = scan(pVertices);
+        ok = g_psOn && hit && hit != (unsigned char*)-1 &&
+            vertexHit && vertexHit != (unsigned char*)-1;
         if (ok) {
             unsigned char* call = hit + 11;
+            unsigned char* vertexCall = vertexHit + 4;
             void* original = call + 5 + *(int*)(call + 1);
-            ok = original == (void*)kEngineGpuCtorVa;
+            void* vertexOriginal = vertexCall + 5 + *(int*)(vertexCall + 1);
+            ok = original == (void*)kEngineGpuCtorVa && vertexOriginal == (void*)kEngineGpuVerticesVa;
             if (ok) {
                 unsigned char code[5] = {0xE8,0,0,0,0};
                 const int rel = (int)((unsigned char*)&fl_wrap_gpu_ctor - (call + 5));
                 memcpy(code + 1, &rel, sizeof rel);
                 g_glowOrigFn = original;
+                g_glowVerticesOrigFn = vertexOriginal;
                 g_glowOn = true;
-                ok = patch(call, code, sizeof code, "苏联光团寿命候选(仅零售模板 15→16)");
-                if (ok) FL_INFO("苏联光团候选已装 @%08X；仅 SovietPowerGlow/BD8CD4C6 与零售字段一致时寿命 15→16；出生时间、发射间隔和随机调用不改；需手动验收", (unsigned)(uintptr_t)call);
+                ok = patch(call, code, sizeof code, "苏联光团池存活保持(仅零售模板 15→16)");
+                const int vertexRel = (int)((unsigned char*)&fl_wrap_gpu_vertices - (vertexCall + 5));
+                memcpy(code + 1, &vertexRel, sizeof vertexRel);
+                if (ok) ok = patch(vertexCall, code, sizeof code, "苏联光团 GPU 可见寿命(16→15.75)");
+                if (ok) FL_INFO("苏联光团交接候选已装 @%08X / %08X；池存活 16、顶点可见寿命 15.75；只改零售四顶点光团，出生时间与发射/RNG 不改；需手动验收",
+                                (unsigned)(uintptr_t)call, (unsigned)(uintptr_t)vertexCall);
             }
         }
-        if (!ok) FL_ERR("苏联光团候选:PSYS 门或 GPU 构造调用未确认，拒绝安装并回滚");
+        if (!ok) FL_ERR("苏联光团交接候选:PSYS 门或 GPU 构造/上传调用未确认，拒绝安装并回滚");
     }
 
-    // Keep both native display-frame getters. visual1's logicFrame * ratio
-    // quantized construction animation to 15 Hz and failed manual validation.
-    // Check the whole native path before installing the mode-0 negative guard.
-    g_constructionSites = 0; g_constructionClamps = 0;
+    // Continuous display progress in a single logic-clock domain. This is one
+    // display-only call; no shared function entry, x87 window or mode-1 changes.
+    g_constructionSites = 0; g_constructionOn = false; g_constructionClamps = 0;
+    g_constructionCalls = 0; g_constructionInactive = 0;
+    g_constructionPrepared = 0; g_constructionPrepareCalls = 0;
+    g_constructionTraceCount = g_constructionTraceLogged = 0;
+    memset(g_constructionRecent, 0, sizeof g_constructionRecent);
     if (ok && !measureOnly && targetFps > g_retailFps &&
         (g_groups & FL_G_RATIO) && (g_groups & FL_G_DER_FPMS)) {
-        Pattern pNow = {"施工显示当前时钟", kSigConstructionNow,
-                        (int)(sizeof kSigConstructionNow / sizeof kSigConstructionNow[0]), 0x006F6DC6};
-        Pattern pHold = {"施工显示暂停时钟", kSigConstructionHold,
-                         (int)(sizeof kSigConstructionHold / sizeof kSigConstructionHold[0]), 0x006F6DF3};
-        Pattern pElapsed = {"施工显示负差值保护", kSigConstructionElapsed,
-                            (int)(sizeof kSigConstructionElapsed / sizeof kSigConstructionElapsed[0]), 0x006F6DFC};
-        unsigned char* now = scan(pNow);
-        unsigned char* hold = scan(pHold);
-        unsigned char* elapsed = scan(pElapsed);
-        ok = now && now != (unsigned char*)-1 && hold && hold != (unsigned char*)-1 &&
-             elapsed && elapsed != (unsigned char*)-1;
-        if (!ok) {
-            FL_ERR("施工显示计时:三处特征未全部确认，候选版拒绝安装并回滚");
-        } else {
-            unsigned char codeElapsed[6] = {0xE9,0,0,0,0,0x90};
-            const int rel = (int)((unsigned char*)&fl_construction_signed_elapsed - (elapsed + 5));
-            memcpy(codeElapsed + 1, &rel, 4);
-            g_constructionResume = elapsed + 6;
-            if (ok) ok = patch(elapsed, codeElapsed, 6, "施工显示负差值保护(仅 mode 0)");
+        Pattern pConstruction = {"施工显示进度专用调用", kSigConstructionVisualCall,
+                                 (int)(sizeof kSigConstructionVisualCall / sizeof kSigConstructionVisualCall[0]), 0x006FD58D};
+        Pattern pModel = {"首次绘制施工模型准备", kSigConstructionModelPrepare,
+                         (int)(sizeof kSigConstructionModelPrepare / sizeof kSigConstructionModelPrepare[0]), 0x0090F89C};
+        Pattern pReceiver = {"W3D 模型条件接收函数", kSigConstructionModelReceiver,
+                            (int)(sizeof kSigConstructionModelReceiver / sizeof kSigConstructionModelReceiver[0]), 0x0090CE60};
+        unsigned char* hit = scan(pConstruction);
+        unsigned char* model = scan(pModel);
+        unsigned char* receiver = scan(pReceiver);
+        ok = hit && hit != (unsigned char*)-1 && model && model != (unsigned char*)-1 &&
+             receiver && receiver != (unsigned char*)-1;
+        if (ok) {
+            unsigned char* call = hit + 9;
+            void* original = call + 5 + *(int*)(call + 1);
+            unsigned char* animateCall = model + 22;
+            void* animate = animateCall + 5 + *(int*)(animateCall + 1);
+            ok = original == (void*)0x006F6CB0 && animate == (void*)0x0090ECF0;
+            if (ok) {
+                unsigned char code[5] = {0xE8,0,0,0,0};
+                const int rel = (int)((unsigned char*)&fl_wrap_construction_progress - (call + 5));
+                memcpy(code + 1, &rel, 4);
+                g_constructionOrigFn = original;
+                g_constructionModelFn = receiver;
+                g_constructionAnimateFn = animate;
+                g_constructionOn = true;
+                ok = patch(call, code, sizeof code, "施工显示进度(逻辑时间 + 连续插值)");
+            }
             if (ok) ++g_constructionSites;
-            if (ok) FL_INFO("施工显示负差值保护已装:1 处；当前/暂停 getter 保留原生显示帧时钟，按目标 %d Hz 连续推进；mode 1 未改；模型闪现仍需验收", targetFps);
+            if (ok) {
+                unsigned char code[20]; memset(code, 0x90, sizeof code);
+                code[0] = 0x8B; code[1] = 0xCE; code[2] = 0xE8; // mov ecx,esi; call wrapper
+                const int rel = (int)((unsigned char*)&fl_wrap_construction_prepare - (model + 7 + 7));
+                memcpy(code + 3, &rel, 4);
+                ok = patch(model + 7, code, sizeof code, "首次绘制前选择施工模型并设初始姿态");
+            }
+            if (ok) ++g_constructionSites;
+            if (ok) FL_INFO("施工显示两处已装:逻辑时间 + 连续插值；首次绘制前直接更新 W3D 施工模型和姿态；世界模型队列/模拟进度未改；首 64 项进度由状态查询写日志；仍待手测");
         }
+        if (!ok) FL_ERR("施工显示专用调用未确认，候选版拒绝安装并回滚");
     }
 
     // ── ★★★ 战役过场运镜计时(默认关;2026-09-26)。16 处操作数改指,全中才装。──────────────────────
@@ -3398,6 +3546,7 @@ static int install(int targetFps, bool measureOnly) {
         const int bad = rollback();
         if (bad == 0) {
             g_constructionSites = 0;
+            g_constructionOn = false;
             g_glowOn = false;
             g_psSite = NULL; g_psOn = false;
             g_visPhaseOn = false;
@@ -3509,7 +3658,7 @@ static int uninstall() {
     g_scrollOn = false;
     g_trcSite = NULL; g_trcOn = false;
     g_psSite = NULL; g_psOn = false;
-    g_glowOn = false; g_constructionSites = 0;
+    g_glowOn = false; g_constructionSites = 0; g_constructionOn = false;
     g_camSites = 0; g_camOn = false;
     g_tintSites = 0; g_tintOn = false;
     g_visPhaseOn = false; g_simPinSites = 0; g_simGateSites = 0; g_simGateOn = false;
@@ -4102,17 +4251,28 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabPsysStatus() {
     const long c = fl::g_psCalls, f = fl::g_psFwd;
     const int ratio = c > 0 ? (int)((long long)f * 1000 / c) : 0;
     FL_INFO("粒子系统节拍门:调用 %ld 转发 %ld ⇒ 放行比例 %d/1000(90 帧应 ≈ 333,60 帧 ≈ 500)", c, f, ratio);
-    FL_INFO("苏联光团寿命候选:安装=%d，模板命中 %ld，15→16 修正 %ld，字段不符跳过 %ld；仅安装不能视为闪烁验收",
+    FL_INFO("苏联光团交接候选:安装=%d，构造命中 %ld，池存活修正 %ld，字段不符跳过 %ld；仅安装不能视为闪烁验收",
             fl::g_glowOn ? 1 : 0, fl::g_glowSeen, fl::g_glowAdjusted, fl::g_glowSkipped);
+    FL_INFO("苏联光团顶点:命中 %ld，四顶点可见寿命 15.75 修正 %ld，布局/字段不符跳过 %ld；出生时间保持原值",
+            fl::g_glowVertexCalls, fl::g_glowVertexAdjusted, fl::g_glowVertexSkipped);
     return 1000000 + ratio;
 }
 
 // Query outside the render hook: logging never runs in a construction callback.
 extern "C" __declspec(dllexport) int __stdcall FrameLabConstructionStatus() {
     if (!fl::g_installed) return 0;
-    FL_INFO("施工显示保护:安装 %d/1 处；负差值保护命中 %ld 次；保留原生显示时钟，未量化到逻辑帧；模型闪现尚待手动验收",
-            fl::g_constructionSites, fl::g_constructionClamps);
-    return fl::g_constructionSites == 1 ? 4 : 0;
+    FL_INFO("施工显示同域插值:安装 %d/2 处；进度调用 %ld，未激活 %ld，未来起点保护 %ld；共享 mode 1 未改，仍待手动验收",
+            fl::g_constructionSites, fl::g_constructionCalls, fl::g_constructionInactive, fl::g_constructionClamps);
+    FL_INFO("施工首次绘制:显示调用 %ld，待同步的施工模型提前准备 %ld；直接 W3D 条件接收，不冲刷世界队列、不隐藏首帧",
+            fl::g_constructionPrepareCalls, fl::g_constructionPrepared);
+    while (fl::g_constructionTraceLogged < (unsigned)fl::g_constructionTraceCount) {
+        const unsigned i = fl::g_constructionTraceLogged++;
+        const fl::ConstructionTrace& r = fl::g_constructionTrace[i];
+        FL_INFO("施工首次观测[%u]:模块=%08X active=%u held=%u logic=%u start=%u hold=%u duration=%u frac=%.6f progress=%.6f",
+                i, (unsigned)r.module, r.active, r.held, r.now, r.start, r.hold,
+                r.duration, r.fraction, r.progress);
+    }
+    return fl::g_constructionSites == 2 && fl::g_constructionOn ? 6 : 0;
 }
 
 // FrameLabScrollStatus():卷屏归一的状态。-2 = 两处补丁点没就位(特征没命中 / 常量不对);0 = 关;1 = 已生效。
