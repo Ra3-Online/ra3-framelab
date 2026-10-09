@@ -7,8 +7,8 @@ check_deps.py -- verify Ra3FpsTest.exe is actually portable.
 
 WHY THIS EXISTS
     The whole point of Ra3FpsTest.exe is that it gets carried to a machine that has
-    NOTHING installed except the game. Three ways that promise breaks silently, all of
-    which still produce an exe that builds, runs on THIS machine, and looks fine:
+    NOTHING installed except the game. Four ways that promise breaks silently, all of
+    which can still produce an exe that compiles successfully:
 
       1. A missing /MT.  cl.exe defaults to the dynamic CRT, so the exe quietly needs
          msvcp140.dll / vcruntime140.dll / ucrtbase.dll. On a clean machine it then fails
@@ -25,7 +25,11 @@ WHY THIS EXISTS
          an absolute build-directory path ending in "Ra3FpsTest.pdb". Harmless functionally, but the user's
          requirement was explicit: the tool must not carry this machine's paths.
 
-    So all three are checked here, and any of them FAILS the build.
+      4. An invalid startup manifest. rc.exe does not validate its XML; a double hyphen
+         in a comment can make Windows reject the exe before wWinMain. Parse the actual
+         RT_MANIFEST/1 and ask Windows to resolve it, without running the program.
+
+    All four are checked here, and any failure stops the Windows build/package.
 
 USAGE
     python check_deps.py <Ra3FpsTest.exe> <Ra3FrameLab.dll>
@@ -34,9 +38,11 @@ EXIT
     0 = portable, non-zero = at least one check failed (details on stdout)
 """
 
+import hashlib
 import os
 import struct
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 # Everything here ships with Windows itself. Anything else means a dependency.
@@ -54,6 +60,180 @@ SYSTEM_DLLS = {
 # rather than waved through.
 CRT_RED_FLAGS = ("ucrtbase.dll", "msvcp_win.dll")
 CRT_RED_PREFIX = "api-ms-win-crt"
+
+# tools/gui/gui_res.h and ra3fps_gui.rc use this numeric RT_RCDATA resource.
+IDR_FRAMELAB_DLL = 101
+RT_RCDATA = 10
+RT_MANIFEST = 24
+
+
+def embedded_resource(d, resource_type, resource_id):
+    """Extract one unambiguous, file-backed numeric resource without loading the PE."""
+    label = "resource %d/%d" % (resource_type, resource_id)
+    def checked(offset, size, limit=len(d)):
+        if offset < 0 or size < 0 or offset > limit or size > limit - offset:
+            raise ValueError("PE/resource range exceeds its file or directory bounds")
+        return offset
+
+    checked(0, 64)
+    if d[:2] != b"MZ":
+        raise ValueError("missing DOS signature")
+    pe = struct.unpack_from("<I", d, 0x3C)[0]
+    checked(pe, 24)
+    if pe < 64 or d[pe:pe + 4] != b"PE\0\0":
+        raise ValueError("missing PE signature")
+    nsec = struct.unpack_from("<H", d, pe + 6)[0]
+    optsz = struct.unpack_from("<H", d, pe + 20)[0]
+    opt = pe + 24
+    checked(opt, optsz)
+    if optsz < 2 or not 1 <= nsec <= 96:
+        raise ValueError("invalid PE section count or optional header")
+    magic = struct.unpack_from("<H", d, opt)[0]
+    if magic not in (0x10B, 0x20B):
+        raise ValueError("unsupported PE optional header")
+    dd = opt + (96 if magic == 0x10B else 112)
+    checked(dd - 4, 28, opt + optsz)
+    if struct.unpack_from("<I", d, dd - 4)[0] < 3:
+        raise ValueError("PE has no resource data directory")
+    section_table = opt + optsz
+    checked(section_table, nsec * 40)
+    header_size = struct.unpack_from("<I", d, opt + 60)[0]
+    if header_size < section_table + nsec * 40 or header_size > len(d):
+        raise ValueError("invalid PE SizeOfHeaders")
+    sections = []
+    for i in range(nsec):
+        vs, va, rs, raw = struct.unpack_from("<IIII", d, section_table + i * 40 + 8)
+        span = max(vs, rs)
+        if va + span > 0x100000000:
+            raise ValueError("PE section RVA overflow")
+        if rs:
+            checked(raw, rs)
+            if raw < header_size:
+                raise ValueError("PE section overlaps headers")
+        for old_va, old_span, old_raw, old_rs in sections:
+            if span and old_span and max(va, old_va) < min(va + span, old_va + old_span):
+                raise ValueError("overlapping PE section RVAs")
+            if rs and old_rs and max(raw, old_raw) < min(raw + rs, old_raw + old_rs):
+                raise ValueError("overlapping PE section file ranges")
+        sections.append((va, span, raw, rs))
+
+    def file_range(rva, size):
+        if size <= 0 or rva + size > 0x100000000:
+            raise ValueError("empty or overflowing resource RVA range")
+        matches = []
+        if rva < header_size and size <= header_size - rva:
+            matches.append(rva)
+        for va, span, raw, rs in sections:
+            if va <= rva < va + span:
+                if size > rs - (rva - va):
+                    raise ValueError("resource reaches an unbacked PE section tail")
+                matches.append(raw + rva - va)
+        if len(matches) != 1:
+            raise ValueError("resource RVA is missing or ambiguous")
+        return checked(matches[0], size)
+
+    resource_rva, resource_size = struct.unpack_from("<II", d, dd + 16)
+    base = file_range(resource_rva, resource_size)
+    metadata = []
+
+    def resource_range(rel, size):
+        checked(rel, size, resource_size)
+        start = base + rel
+        for old_start, old_end in metadata:
+            if max(start, old_start) < min(start + size, old_end):
+                raise ValueError("overlapping or cyclic resource metadata")
+        metadata.append((start, start + size))
+        return start
+
+    def directory(rel):
+        checked(rel, 16, resource_size)
+        named, ids = struct.unpack_from("<HH", d, base + rel + 12)
+        start = resource_range(rel, 16 + (named + ids) * 8)
+        entries = {}
+        for i in range(named + ids):
+            key, target = struct.unpack_from("<II", d, start + 16 + i * 8)
+            if bool(key & 0x80000000) != (i < named):
+                raise ValueError("resource named/ID entry counts disagree")
+            if key & 0x80000000:
+                name_rel = key & 0x7FFFFFFF
+                checked(name_rel, 2, resource_size)
+                count = struct.unpack_from("<H", d, base + name_rel)[0]
+                checked(name_rel + 2, count * 2, resource_size)
+                key = d[base + name_rel + 2:base + name_rel + 2 + count * 2].decode("utf-16-le")
+            elif key > 0xFFFF:
+                raise ValueError("resource numeric ID exceeds 16 bits")
+            if key in entries:
+                raise ValueError("duplicate resource entry")
+            entries[key] = target
+        return entries
+
+    def subdirectory(entries, key):
+        target = entries.get(key)
+        if target is None or not target & 0x80000000:
+            raise ValueError("missing %s directory" % label)
+        return directory(target & 0x7FFFFFFF)
+
+    names = subdirectory(directory(0), resource_type)
+    languages = subdirectory(names, resource_id)
+    if len(languages) != 1:
+        raise ValueError("%s must have exactly one language" % label)
+    language, target = next(iter(languages.items()))
+    if not isinstance(language, int) or target & 0x80000000:
+        raise ValueError("invalid %s language or data entry" % label)
+    entry = resource_range(target, 16)
+    data_rva, data_size, _, reserved = struct.unpack_from("<IIII", d, entry)
+    if reserved:
+        raise ValueError("nonzero resource data entry reserved field")
+    offset = file_range(data_rva, data_size)
+    if any(max(offset, start) < min(offset + data_size, end) for start, end in metadata):
+        raise ValueError("%s payload overlaps resource metadata" % label)
+    return d[offset:offset + data_size]
+
+
+def embedded_framelab_dll(d):
+    return embedded_resource(d, RT_RCDATA, IDR_FRAMELAB_DLL)
+
+
+def validate_manifest(d):
+    """Parse the actual startup manifest, including comments, before Windows sees it."""
+    root = ET.fromstring(embedded_resource(d, RT_MANIFEST, 1))
+    if root.tag != "{urn:schemas-microsoft-com:asm.v1}assembly":
+        raise ValueError("startup manifest root is not an asm.v1 assembly")
+    if root.get("manifestVersion") != "1.0":
+        raise ValueError("unsupported startup manifest version")
+    return root
+
+
+def validate_activation_context(exe_path):
+    """Ask Windows to resolve RT_MANIFEST/1; never execute the GUI or DLL."""
+    import ctypes
+    from ctypes import wintypes
+
+    class ACTCTXW(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.ULONG), ("dwFlags", wintypes.DWORD),
+            ("lpSource", wintypes.LPCWSTR), ("wProcessorArchitecture", wintypes.WORD),
+            ("wLangId", wintypes.WORD), ("lpAssemblyDirectory", wintypes.LPCWSTR),
+            ("lpResourceName", ctypes.c_void_p), ("lpApplicationName", wintypes.LPCWSTR),
+            ("hModule", wintypes.HMODULE),
+        ]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateActCtxW.argtypes = [ctypes.POINTER(ACTCTXW)]
+    kernel.CreateActCtxW.restype = wintypes.HANDLE
+    kernel.ReleaseActCtx.argtypes = [wintypes.HANDLE]
+    kernel.ReleaseActCtx.restype = None
+    context = ACTCTXW()
+    context.cbSize = ctypes.sizeof(context)
+    # Select the EXE's startup resource. Let Windows infer the architecture: forcing
+    # x86 here from 64-bit Python is rejected with ERROR_INVALID_PARAMETER.
+    context.dwFlags = 0x008  # ACTCTX_FLAG_RESOURCE_NAME_VALID
+    context.lpSource = str(Path(exe_path).resolve())
+    context.lpResourceName = 1  # MAKEINTRESOURCE(CREATEPROCESS_MANIFEST_RESOURCE_ID)
+    handle = kernel.CreateActCtxW(ctypes.byref(context))
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    kernel.ReleaseActCtx(handle)
 
 
 def pe_layout(d):
@@ -134,15 +314,32 @@ def main():
     else:
         print("OK   every import is a Windows component -- no runtime to install")
 
+    # rc.exe can embed malformed XML successfully. Check the final PE, not only its source.
+    try:
+        validate_manifest(exe)
+        print("OK   RT_MANIFEST/1 startup manifest is well-formed XML")
+        if sys.platform == "win32":
+            validate_activation_context(exe_path)
+            print("OK   Windows resolves the embedded startup activation context")
+        else:
+            print("SKIP Windows activation-context resolution (requires Windows)")
+    except (ValueError, struct.error, ET.ParseError, OSError) as error:
+        print("FAIL startup manifest/activation context: %s" % error)
+        failures.append("manifest")
+
     # --- 3. the patcher DLL must really be inside ---------------------------------------
-    # RCDATA is stored verbatim, so a slice from the middle of the DLL must appear in the
-    # exe. A slice, not the header: every PE shares the same DOS stub bytes.
-    mid = len(dll) // 2
-    probe = dll[mid:mid + 64]
-    if probe and probe in exe:
-        print("OK   patcher DLL payload found inside the exe (%d bytes embedded)" % len(dll))
-    else:
-        print("FAIL the patcher DLL is NOT embedded -- rc.exe did not pick up the RCDATA")
+    # Check the GUI's actual resource, not an incidental byte sequence elsewhere in the PE.
+    try:
+        payload = embedded_framelab_dll(exe)
+        payload_sha = hashlib.sha256(payload).hexdigest()
+        dll_sha = hashlib.sha256(dll).hexdigest()
+        if payload != dll or payload_sha != dll_sha:
+            raise ValueError("embedded DLL differs: resource %d bytes/%s, supplied %d bytes/%s"
+                             % (len(payload), payload_sha, len(dll), dll_sha))
+        print("OK   RCDATA/101 is the complete supplied DLL (%d bytes, SHA-256 %s)"
+              % (len(payload), payload_sha))
+    except (ValueError, struct.error) as error:
+        print("FAIL patcher DLL resource: %s" % error)
         failures.append("payload")
 
     # --- 4. no path from the build machine ----------------------------------------------

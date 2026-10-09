@@ -42,12 +42,15 @@ $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "common.ps1")
 $OutDir = Get-FlabRunDirectory $OutDir "build\desync_capture"
 
-# ------ sandbox compatibility: restore PATHEXT (same reason as determinism.ps1) ------
+# ------ temporary .EXE compatibility (same reason as determinism.ps1) ------
 # The sandbox narrows PATHEXT to ".CPL", which makes PowerShell treat every .exe as a
 # *document* => "Cannot run a document in the middle of a pipeline".
-if ($env:PATHEXT -notmatch '\.EXE') {
-    $env:PATHEXT = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.CPL"
-    Write-Host ("note: PATHEXT was missing .EXE; restored to " + $env:PATHEXT)
+$probeOriginalPathExt = [Environment]::GetEnvironmentVariable('PATHEXT', 'Process')
+try {
+if ([string]::IsNullOrWhiteSpace($probeOriginalPathExt)) {
+    $env:PATHEXT = '.COM;.EXE;.BAT;.CMD'
+} elseif (($probeOriginalPathExt -split ';' | ForEach-Object { $_.Trim() }) -notcontains '.EXE') {
+    $env:PATHEXT = $probeOriginalPathExt + ';.EXE'
 }
 
 $lab       = Split-Path $PSScriptRoot -Parent
@@ -260,3 +263,6 @@ try {
     Start-Sleep -Seconds 4
 }
 Remove-Item $playPath -Force -ErrorAction SilentlyContinue
+} finally {
+    [Environment]::SetEnvironmentVariable('PATHEXT', $probeOriginalPathExt, 'Process')
+}

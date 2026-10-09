@@ -65,6 +65,12 @@ int wmain(int argc, wchar_t** argv) {
         const int rcSelf = selftest();
         check((rcSelf & 1) != 0, "还原核验·诚实路径:改完再还原,逐字节回到原样", rcSelf);
         check((rcSelf & 2) != 0, "还原核验·故障注入:写入谎称成功时闸门当场报红", rcSelf);
+        check((rcSelf & 4) != 0, "补丁写后字节不符仍保留撤销记录并还原", rcSelf);
+        check((rcSelf & 8) != 0, "字节已改但写入报失败仍能还原", rcSelf);
+        check((rcSelf & 16) != 0, "指令缓存刷新报失败不会被接受为安装成功", rcSelf);
+        check((rcSelf & 32) != 0, "还原失败后拒绝再次安装", rcSelf);
+        check((rcSelf & 64) != 0, "还原失败保留记录,随后可重试还原", rcSelf);
+        check((rcSelf & 128) != 0, "页面保护恢复失败后恢复原字节与原保护", rcSelf);
     }
 
     // 时钟推进量累加器的离线自检(2026-09-17 动画定位会话,Claude)。

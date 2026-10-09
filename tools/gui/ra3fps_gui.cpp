@@ -46,6 +46,8 @@
 //    Ra3FpsTest.exe --auto "<game folder>" <fps> [cycles]
 //      Headless version of the same job, for scripted runs. Writes to stdout and to
 //      %TEMP%\Ra3FrameLab\gui-*.log. Exits 0 on success, 1 on failure.
+//    Ra3FpsTest.exe --check-conflicts "<game folder>"
+//      Read-only check for a known automatic FPS loader; never launches the game.
 //
 //  ============================================================================
 
@@ -106,7 +108,9 @@
 //   argued from the unit-consistency of sub_6F6CB0 plus the clockrate evidence, not from a
 //   direct reading of the counter. A/B masks if it ever needs re-testing:
 //     0x2CFFF = fixed (shipped)   0x2C1FF = triple OFF (batch-6 behaviour)
-static const unsigned kGroups = 0x2CFFFu;
+// Construction previews are a hot path. Animation diagnostics (0x4000) remain
+// available through RA3FL_GROUPS, but normal GUI runs no longer install them.
+static const unsigned kGroups = 0x28FFFu;
 
 // 2026-09-21 (chassis-suspension session): OPTIONAL override of the groups mask, read once from
 // the environment variable RA3FL_GROUPS (decimal or 0x-hex). Absent / empty / unparsable / 0
@@ -115,8 +119,8 @@ static const unsigned kGroups = 0x2CFFFu;
 // pose interpolation) are default-OFF until they are verified on a machine that really renders
 // 90 fps -- and on that machine this single exe is often the only tool at hand. With this the
 // A/B is one line in a console, no rebuild:
-//     set RA3FL_GROUPS=0x3ACFFF  &&  Ra3FpsTest.exe      (shipped set + probe + gate + interpolation)
-//     set RA3FL_GROUPS=0x1ACFFF  &&  Ra3FpsTest.exe      (shipped set + probe + gate, hold mode)
+//     set RA3FL_GROUPS=0x3A8FFF  &&  Ra3FpsTest.exe      (shipped set + gate + interpolation)
+//     set RA3FL_GROUPS=0x1A8FFF  &&  Ra3FpsTest.exe      (shipped set + gate, hold mode)
 //     set RA3FL_GROUPS=          &&  Ra3FpsTest.exe      (back to the shipped default)
 // The log states the effective mask AND whether it came from the override, so a log sent back
 // to us can never be mistaken for a default run.
@@ -205,7 +209,7 @@ static HWND      g_hBbDump    = NULL;   // 「立即保存现场」
 static HWND      g_hBbTest    = NULL;   // 「记录器自检」
 static HWND      g_hChassis   = NULL;   // 「修复载具颠簸」复选框(2026-09-21)
 static HWND      g_hScroll    = NULL;   // 「卷屏保持原版速度」复选框(2026-09-21,默认不勾)
-static HWND      g_hFx        = NULL;   // 「修复过快的视觉效果」复选框(2026-09-22,默认不勾)
+static HWND      g_hFx        = NULL;   // 「额外特效修复」复选框(默认不勾)
 static HFONT     g_hFont      = NULL;
 
 static volatile LONG g_busy   = 0;   // a job is running; disable the controls
@@ -518,6 +522,75 @@ static bool FindGame(const std::wstring& userDir, GameFind& g, std::wstring& err
     return true;
 }
 
+// A d3d9/dinput8 proxy alone can be a renderer or a capture tool. Only reject the
+// known FPS loader combination: a proxy referring to CnCFpsUnlocker.dll AND that
+// companion DLL beside the actual game executable. Inspect bytes; never load it.
+static bool RefersToFpsUnlocker(const std::vector<unsigned char>& bytes) {
+    const char name[] = "cncfpsunlocker.dll";
+    for (size_t stride = 1; stride <= 2; ++stride) {
+        const size_t needed = sizeof(name) * stride;  // includes the terminator
+        if (bytes.size() < needed) continue;
+        for (size_t start = 0; start <= bytes.size() - needed; ++start) {
+            bool match = true;
+            for (size_t j = 0; j < sizeof(name); ++j) {
+                unsigned char c = bytes[start + j * stride];
+                if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+                if (c != (unsigned char)name[j] ||
+                    (stride == 2 && bytes[start + j * stride + 1] != 0)) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return true;
+        }
+    }
+    return false;
+}
+
+static bool CheckFpsLoader(const GameFind& g) {
+    const std::wstring dir = ParentDir(g.exe);
+    const std::wstring companion = Join(dir, L"CnCFpsUnlocker.dll");
+    if (!FileExistsW(companion)) return true;
+    const wchar_t* proxies[] = { L"d3d9.dll", L"dinput8.dll" };
+    for (size_t i = 0; i < _countof(proxies); ++i) {
+        const std::wstring path = Join(dir, proxies[i]);
+        if (!FileExistsW(path)) continue;
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (file == INVALID_HANDLE_VALUE) {
+            LogF(L"[FAIL] 无法检查自动加载器：%s（错误 %lu）。", path.c_str(), GetLastError());
+            return false;
+        }
+        LARGE_INTEGER size;
+        const bool validSize = GetFileSizeEx(file, &size) != FALSE &&
+            size.QuadPart >= 0 && size.QuadPart <= 64LL * 1024 * 1024;
+        if (!validSize) {
+            CloseHandle(file);
+            LogF(L"[FAIL] 自动加载器文件大小无法检查或超过 64 MiB：%s", path.c_str());
+            return false;
+        }
+        std::vector<unsigned char> bytes((size_t)size.QuadPart);
+        DWORD read = 0;
+        const bool complete = bytes.empty() ||
+            (ReadFile(file, &bytes[0], (DWORD)bytes.size(), &read, NULL) && read == bytes.size());
+        CloseHandle(file);
+        if (!complete) {
+            LogF(L"[FAIL] 自动加载器读取不完整：%s", path.c_str());
+            return false;
+        }
+        if (RefersToFpsUnlocker(bytes)) {
+            LogLine(L"[FAIL] 检测到另一个帧率补丁的自动加载器；FrameLab 未启动游戏、未安装补丁。");
+            LogF(L"       代理：%s", path.c_str());
+            LogF(L"       帧率补丁：%s", companion.c_str());
+            LogLine(L"       两套帧率补丁不能叠加。请先退出游戏，在独立的原版游戏副本中运行 FrameLab，");
+            LogLine(L"       或按另一工具的卸载说明关闭其自动加载器。仅把其 fps 改为 30 仍会安装其他补丁。");
+            return false;
+        }
+    }
+    return true;
+}
+
 // ───────────────────────────── process helpers ─────────────────────────────
 
 struct ProcEntry { DWORD pid; std::wstring name; };
@@ -623,10 +696,10 @@ static const wchar_t* Explain(int rc) {
     case 11: return L"游戏主程序不是有效的 PE";
     case 20: return L"特征码没找到 —— 这个游戏不是 1.12 版（本补丁只支持 1.12）";
     case 21: return L"特征码命中多处，不敢下手";
-    case 22: return L"帧率全局量还不是 15/30（引擎还没初始化）";
+    case 22: return L"帧率基准未就绪或已被其他补丁改写；查看 DLL 日志中的原始值";
     case 23: return L"目标帧率不是 15 的整数倍，或超出支持范围";
     case 24: return L"内存状态与预期不符（引擎还没初始化完，或版本不对）";
-    case 30: return L"写内存失败（已回滚）";
+    case 30: return L"写入或还原核验失败，请查看日志；还原未完成时请重启游戏";
     case 31: return L"挂起其它线程失败";
     default: return L"未知错误";
     }
@@ -827,14 +900,6 @@ static bool JobPatch(DWORD& outPid, HANDLE& outProc, JobCtx& ctx) {
     outPid = 0;
     outProc = NULL;
 
-    // --- 1. refuse if a game is already up -------------------------------------------------
-    std::wstring who;
-    if (GameRunning(who)) {
-        LogF(L"[FAIL] 已经有一个红警3在运行：%s", who.c_str());
-        LogLine(L"       为避免误碰别人的对局，本工具不会去注入它。请先关闭游戏再试。");
-        return false;
-    }
-
     // --- 2. locate the game ---------------------------------------------------------------
     if (!DirExistsW(TrimSlash(ctx.dir))) {
         LogF(L"[FAIL] 目录不存在：%s", ctx.dir.c_str());
@@ -849,6 +914,16 @@ static bool JobPatch(DWORD& outPid, HANDLE& outProc, JobCtx& ctx) {
     if (VersionScore(FileName(g.exe)) != 1012) {
         LogLine(L"[WARN] 主程序文件名不像 1.12 版。本补丁的特征码是按 1.12 定位的，");
         LogLine(L"       其它版本会在下面报「特征码没找到」。");
+    }
+    if (!CheckFpsLoader(g)) return false;
+
+    // Check the selected files before the process guard so an old automatic FPS
+    // loader is reported even when its launcher is still running.
+    std::wstring who;
+    if (GameRunning(who)) {
+        LogF(L"[FAIL] 已经有一个红警3在运行：%s", who.c_str());
+        LogLine(L"       为避免误碰别人的对局，本工具不会去注入它。请先关闭游戏再试。");
+        return false;
     }
 
     // --- 3. extract our DLL ---------------------------------------------------------------
@@ -934,11 +1009,12 @@ static bool JobPatch(DWORD& outPid, HANDLE& outProc, JobCtx& ctx) {
                 break;
             }
             DWORD gr = 0;
-            if (RemoteCall(proc, setGroups, (void*)(uintptr_t)EffectiveGroups(), &gr, 60000)) {
+            if (RemoteCall(proc, setGroups, (void*)(uintptr_t)EffectiveGroups(), &gr, 60000) && gr == EffectiveGroups()) {
                 LogF(L"[OK]   改动分组 = 0x%04X（返回 %lu）%s", EffectiveGroups(), (unsigned long)gr,
-                     g_groupsOverridden ? L" ★由环境变量 RA3FL_GROUPS 覆盖，不是出厂默认 0x2CFFF" : L"");
+                     g_groupsOverridden ? L" ★由环境变量 RA3FL_GROUPS 覆盖，未采用界面选项组合" : L"");
             } else {
-                LogLine(L"[WARN] 设置改动分组失败，继续尝试启用。");
+                LogF(L"[FAIL] 设置改动分组失败或返回不符（请求0x%08X，返回0x%08X），本次启用停止。", EffectiveGroups(), gr);
+                break;
             }
         }
 
@@ -973,23 +1049,32 @@ static bool JobPatch(DWORD& outPid, HANDLE& outProc, JobCtx& ctx) {
                     LogLine(L"[WARN] 读不到载具颠簸修复的状态（DLL 太旧？）。");
                 }
             }
-            // 2026-09-28:迷雾可见性相位(随默认分组生效,修「敌方单位偶尔隐身」)+ 联机修正(0x20000000 / 0x40000000,
-            //   默认关,只能用 RA3FL_GROUPS 打开)—— 同样报「到底开没开成」。
+            // 高帧率修改共享 DER_FPS 时自动要求三处逻辑高度 pin；无需显式 SIMPIN 位。
+            // 60/90 自动要求三处相位边界门；状态只确认安装，不代替联机验证。
             if (ctx.fps > 30) {
                 void* simStatus = RemoteExport(pid, localBase, "FrameLabSimStatus");
                 DWORD ss3 = 0;
                 if (simStatus && RemoteCall(proc, simStatus, NULL, &ss3, 60000)) {
                     const int v = (int)ss3;
+                    if ((ctx.fps == 60 || ctx.fps == 90) && (v <= 0 || !(v & 4))) {
+                        installed = false;
+                        lastRc = 24;
+                        LogLine(L"[FAIL] 60/90 必需的三处相位边界门未确认安装，本次启用失败。请查看 DLL 日志。");
+                        break;
+                    }
                     if (v == -2) {
                         LogLine(L"[!!]   联机修正【没装上】（特征未命中？）—— 请把 logs 里的日志发给开发者。");
                     } else if (v > 0) {
-                        if (v & 1) LogLine(L"[OK]   迷雾可见性相位已改回原版（每逻辑帧刷新一次，修敌方单位偶尔「隐身」）。");
+                        if (v & 1) LogLine(L"[OK]   迷雾可见性相位补丁已安装；敌方可见性仍需按实际场景核对。");
                         else       LogLine(L"[!!]   迷雾可见性相位【没改成】—— 60/90 帧下敌方单位可能偶尔「隐身」。");
-                        if (v & 2) LogLine(L"[OK]   联机修正：高度斜坡已钉回原版（0x20000000）。");
-                        if (v & 4) LogLine(L"[OK]   联机修正：相位边界门已生效（0x40000000）。");
+                        if (v & 2) LogLine(L"[OK]   三处运动器高度时间尺度保持原版（高帧率默认组合自动安装）。");
+                        if (v & 4) LogLine(L"[OK]   三处相位边界门已安装并核验（60/90 自动必需）；有限联机测试见技术报告。");
                     }
                 } else {
-                    LogLine(L"[WARN] 读不到迷雾可见性 / 联机修正的状态（DLL 太旧？）。");
+                    LogLine(L"[FAIL] 读不到模拟修正安装状态，本次启用停止。请检查 DLL 版本与日志。");
+                    installed = false;
+                    lastRc = 24;
+                    break;
                 }
             }
             // 2026-09-28:单位闪烁 / 染色计时同样报「到底开没开成」。
@@ -1070,20 +1155,20 @@ static bool JobPatch(DWORD& outPid, HANDLE& outProc, JobCtx& ctx) {
             // 2026-09-22:用户实测「30 帧原版玩家 ＋ 90 帧补丁玩家」同场对战 → 不同步。
             //   锁步模型要求两端算出逐位相同的模拟状态。**原版本身允许两台机器渲染帧率不同**
             //   (慢机渲染 18 帧、快机 30 帧照样同步),所以「渲染变快」本身不应该导致不同步;
-            //   实测却不同步 ⇒ 补丁改的某个量被模拟侧读到了。是哪一个还没逐字段对账清楚,
-            //   所以这里只给保守建议,不把它说成「锁步的必然结果」(那是把未知说成已知)。
+            //   当前候选的无限岛 30/60/90 三开仍实际不同步，随包报告记录条件和首差。
+            //   历史与当前失败均保留，有限校验匹配不能作为完整联机验收。
             if (ctx.fps > 30) {
-                LogLine(L"[!!]   联机提醒：实测「30 帧原版玩家 ＋ 90 帧补丁玩家」同场对战 = 不同步。");
-                LogLine(L"       在查清原因之前，请只和【同样装了这个补丁、且目标帧率相同】的玩家联机；");
-                LogLine(L"       即便双方都装、帧率相同，也【从未测过】，不保证同步。");
-                LogLine(L"       单机 / 战役 / 遭遇战 / 自己看自己录的录像，都不受影响。");
+                LogLine(L"[研究] 当前候选仍有实际跨帧率不同步，30 / 60 / 90 联机尚未通过验收，实测条件见随包报告。");
+                LogLine(L"       使用默认配置核对报告中的组合；其它帧率、专家分组或 MOD 组合需要独立验证。");
+                LogLine(L"       请退出游戏后再切换补丁配置；运行中的卸载不是可靠的恢复流程。");
+                LogLine(L"       单机、战役和回放也请结合实际场景与日志判断。");
             }
             break;
         }
         if (Retryable(lastRc)) {
             ++attempt;
             if (attempt == 1 || attempt % 5 == 0) {
-                LogF(L"[WAIT] 引擎还没准备好（返回 %d，%s），继续等…（已等 %lu 秒）",
+                LogF(L"[WAIT] 安装前置条件尚未通过（返回 %d，%s），继续等…（已等 %lu 秒）",
                      lastRc, Explain(lastRc), (unsigned long)((GetTickCount() - t0) / 1000));
             }
             Sleep(1000);
@@ -1098,7 +1183,7 @@ static bool JobPatch(DWORD& outPid, HANDLE& outProc, JobCtx& ctx) {
         // printing "timed out" after 3 seconds was actively misleading.
         const unsigned long waited = (unsigned long)((GetTickCount() - t0) / 1000);
         if (lastRc < 0) {
-            LogF(L"[FAIL] 等了 %lu 秒还是没装上补丁（引擎一直没就绪）。", waited);
+            LogF(L"[FAIL] 等了 %lu 秒仍未完成补丁安装；查看前面的注入与启用日志。", waited);
         } else {
             LogF(L"[FAIL] 装补丁失败：最后返回 %d（%s），等了 %lu 秒。",
                  lastRc, Explain(lastRc), waited);
@@ -1133,6 +1218,8 @@ static void JobMeasureLoop(DWORD pid, HANDLE gameProc, int targetFps, int maxCyc
     void* fpswin   = RemoteExport(pid, localBase, "FrameLabFpsWindow");
     void* logicfps = RemoteExport(pid, localBase, "FrameLabLogicFps");
     void* readDw   = RemoteExport(pid, localBase, "FrameLabReadDword");
+    void* psStatus = RemoteExport(pid, localBase, "FrameLabPsysStatus");
+    void* constructionStatus = RemoteExport(pid, localBase, "FrameLabConstructionStatus");
     if (!fpswin || !logicfps || !readDw) { LogLine(L"[WARN] 取不到测量用的导出地址。"); return; }
 
     HANDLE proc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
@@ -1222,6 +1309,16 @@ static void JobMeasureLoop(DWORD pid, HANDLE gameProc, int targetFps, int maxCyc
         LogF(L"#%02d  渲染 %s fps ｜ 逻辑 %s Hz ｜ 每帧毫秒 %lu ｜ 逻辑帧率全局 %lu%s",
              cycle, sR, sL, (unsigned long)mspf, (unsigned long)lglob,
              (lowRender && !fg) ? L" ｜ 焦点不在游戏" : L"");
+        // Collect after startup too; the old one-off reading was always 0/0.
+        // These calls run on this worker and never log from a game draw hook.
+        DWORD visual = 0, ps = 0;
+        if (constructionStatus && RemoteCall(proc, constructionStatus, NULL, &visual, 30000))
+            LogF(L"      施工显示保护：%s", visual == 7 ? L"连续插值与围墙首显保护已装" : L"未启用");
+        if ((EffectiveGroups() & 0x4000000u) && psStatus && RemoteCall(proc, psStatus, NULL, &ps, 30000)) {
+            if ((int)ps >= 1000000)
+                LogF(L"      粒子推进放行比例 %d/1000（90 帧约 333，60 帧约 500）", (int)ps - 1000000);
+            else LogF(L"      粒子推进状态 %d", (int)ps);
+        }
 
         // 每轮扫一次报告目录。崩溃 / 不同步是**事后**才知道的,不能让用户自己去翻文件夹找 ——
         // 而且那份报告往往就是唯一能说明问题的东西。已经报过的不会重复报。
@@ -1306,8 +1403,8 @@ static void JobMeasureLoop(DWORD pid, HANDLE gameProc, int targetFps, int maxCyc
 // --auto usable from a script: an always-zero exit code would make a failing run look fine.
 static bool RunJob(JobCtx ctx) {
     LogF(L"===== 目标 %d 帧 ｜ 目录 %s =====", ctx.fps, ctx.dir.c_str());
-    LogF(L"补丁版本 %s ｜ 改动分组 0x%04X%s", L"0.2.0", EffectiveGroups(),
-         g_groupsOverridden ? L"（★环境变量 RA3FL_GROUPS 覆盖；出厂默认是 0x2CFFF）" : L"");
+    LogF(L"补丁版本 %s ｜ 改动分组 0x%04X%s", L"0.2.3-dev1-visual6", EffectiveGroups(),
+         g_groupsOverridden ? L"（★环境变量 RA3FL_GROUPS 覆盖；未采用界面选项组合）" : L"");
     if (!g_groupsOverridden)
         LogF(L"载具颠簸修复 = %s", g_chassisFix
              ? L"开（车身悬挂递推钉回每秒 30 步 + 位姿插值；分组多出 0x380000）"
@@ -1317,7 +1414,7 @@ static bool RunJob(JobCtx ctx) {
              ? L"保持原版（键盘 / 边缘卷屏每秒距离不随帧率变；分组多出 0x800000；右键拖拽不在此列）"
              : L"随帧率变快（现状：60 帧约 2 倍、90 帧约 3 倍）");
     if (!g_groupsOverridden)
-        LogF(L"过快视觉效果修复 = %s", g_fxFix
+        LogF(L"额外特效修复 = %s", g_fxFix
              ? L"开（弹道流密度 + 粒子发射 + 光效 / 淡出 / 图标 + 战役过场运镜钉回原版；分组多出 0x1F400000）"
              : L"关（现状：弹道流、贴花淡出、拖尾滚动等在 60/90 帧下快 2/3 倍）");
 
@@ -1537,9 +1634,9 @@ static void CreateUi(HWND h) {
                              WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST,
                              80, 15, 220, 220, h, (HMENU)IDC_FPS_COMBO, g_hInst, NULL);
     SendMessageW(g_hFps, CB_ADDSTRING, 0, (LPARAM)L"30 帧（原版速度基线，r = 2）");
-    SendMessageW(g_hFps, CB_ADDSTRING, 0, (LPARAM)L"60 帧（r = 4）");
-    SendMessageW(g_hFps, CB_ADDSTRING, 0, (LPARAM)L"90 帧（r = 6，需要 ≥90Hz 屏幕）");
-    SendMessageW(g_hFps, CB_SETCURSEL, 1, 0);   // default 60: correct on every machine
+    SendMessageW(g_hFps, CB_ADDSTRING, 0, (LPARAM)L"60 帧（r = 4，互联未验收）");
+    SendMessageW(g_hFps, CB_ADDSTRING, 0, (LPARAM)L"90 帧（研究候选，r = 6）");
+    SendMessageW(g_hFps, CB_SETCURSEL, 2, 0);   // research-r2 default; target and measured output remain distinct
 
     // 2026-09-21:载具颠簸修复的开关,放在帧数下拉框右边,默认勾上。取消勾选 = 与旧版逐位相同的出厂掩码(做 A/B 用)。
     g_hChassis = CreateWindowExW(0, L"BUTTON", L"修复载具上下颠簸（60/90 帧，实验）",
@@ -1552,7 +1649,7 @@ static void CreateUi(HWND h) {
                                 312, 29, 290, 20, h, (HMENU)IDC_SCROLL_FIX, g_hInst, NULL);
     SendMessageW(g_hScroll, BM_SETCHECK, g_scrollFix ? BST_CHECKED : BST_UNCHECKED, 0);
     // 2026-09-22:过快视觉效果的打包开关,默认不勾。
-    g_hFx = CreateWindowExW(0, L"BUTTON", L"修复过快的特效与过场运镜（实验）",
+    g_hFx = CreateWindowExW(0, L"BUTTON", L"额外特效修复（含光效与过场运镜，实验）",
                             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                             312, 50, 290, 20, h, (HMENU)IDC_FX_FIX, g_hInst, NULL);
     SendMessageW(g_hFx, BM_SETCHECK, g_fxFix ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -1730,6 +1827,26 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR /*lpCmdLine*/, int) {
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
 
+    if (argc >= 2 && _wcsicmp(argv[1], L"--check-conflicts") == 0) {
+        g_auto = true;
+        if (!GetStdHandle(STD_OUTPUT_HANDLE)) AttachConsole(ATTACH_PARENT_PROCESS);
+        OpenLogFile();
+        GameFind game;
+        std::wstring error;
+        int result = 2;
+        if (argc != 3) LogLine(L"用法：Ra3FpsTest.exe --check-conflicts \"<游戏目录>\"");
+        else if (!FindGame(argv[2], game, error)) LogF(L"[FAIL] %s", error.c_str());
+        else {
+            LogF(L"主程序     : %s", game.exe.c_str());
+            result = CheckFpsLoader(game) ? 0 : 1;
+            if (!result) LogLine(L"[OK] 未发现已知的 FPS 自动加载器组合；安装时仍会执行内存基准和特征校验。");
+        }
+        LocalFree(argv);
+        if (g_hLogFile != INVALID_HANDLE_VALUE) CloseHandle(g_hLogFile);
+        CoUninitialize();
+        return result;
+    }
+
     // ── self-test mode: Ra3FpsTest.exe --gui-autostart "<dir>" <fps> [cycles] ──
     // Builds the real GUI, pre-fills the real controls and clicks the real button. Does NOT
     // return here -- it falls through to the normal GUI path on purpose.
@@ -1783,7 +1900,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR /*lpCmdLine*/, int) {
     // 2026-09-22:高度 472 → 496,给第三个复选框腾出那 24 px(实测截图发现它压在「游戏目录」行上)。
     RECT rc = { 0, 0, 616, 496 };
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
-    g_hMain = CreateWindowExW(0, wc.lpszClassName, L"红警3 帧率测试工具（只改内存，不动游戏文件）",
+    g_hMain = CreateWindowExW(0, wc.lpszClassName, L"红警3 帧率测试工具 — 视觉候选 6",
                               WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
                               CW_USEDEFAULT, CW_USEDEFAULT,
                               rc.right - rc.left, rc.bottom - rc.top,

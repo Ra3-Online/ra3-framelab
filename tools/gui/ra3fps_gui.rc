@@ -23,10 +23,10 @@ IDR_FRAMELAB_DLL  RCDATA  "Ra3FrameLab.dll"
 
 // ID 1 = VS_VERSION_INFO, required by Windows file-version APIs.
 1 VERSIONINFO
- FILEVERSION     0,2,1,0
- PRODUCTVERSION  0,2,1,0
+ FILEVERSION     0,2,3,4
+ PRODUCTVERSION  0,2,3,4
  FILEFLAGSMASK   0x3fL
- FILEFLAGS       0x0L
+ FILEFLAGS       0x2L
  // Numeric literals instead of VOS_NT_WINDOWS32 / VFT_APP / VFT2_UNKNOWN: those names live in
  // winver.h, and rc.exe resolves them through INCLUDE. Spelling them out removes a way for the
  // build to depend on the environment it happens to run in.
@@ -41,11 +41,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Ra3 FrameLab"
             VALUE "FileDescription",  "Red Alert 3 frame-rate test tool (runtime memory patch)"
-            VALUE "FileVersion",      "0.2.1.0"
+            VALUE "FileVersion",      "0.2.3-dev1-visual6"
             VALUE "InternalName",     "Ra3FpsTest"
             VALUE "OriginalFilename", "Ra3FpsTest.exe"
             VALUE "ProductName",      "Ra3 FrameLab Test Tool"
-            VALUE "ProductVersion",   "0.2.1.0"
+            VALUE "ProductVersion",   "0.2.3-dev1-visual6"
             VALUE "LegalCopyright",   "Copyright (c) 2026 Ra3 FrameLab contributors."
             VALUE "Comments",         "Non-commercial use only. See LICENSE. Patches the running game in memory only. No game file is modified or replaced."
         END

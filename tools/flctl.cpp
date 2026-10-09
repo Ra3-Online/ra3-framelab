@@ -6,6 +6,7 @@
 //   flctl enable [帧率]     注入并启用(默认 60)
 //   flctl disable           还原所有改动(DLL 留在进程里)
 //   flctl status            查询当前状态(0 = 未启用,否则为当前目标帧率)
+//   flctl simstatus         查询模拟相位修正安装位(1=可见性,2=高度pin,4=边界门,8=原R4);不是联机安全验收
 //   flctl diag              把诊断快照写进 DLL 日志
 //   flctl unload            先还原再把 DLL 从游戏进程卸掉(换新版 DLL 时用)
 //   flctl measure           只量不改:装帧计数器但不改帧率(自动化验证的基线组)
@@ -182,6 +183,7 @@ int main(int argc, char** argv) {
     const char* exportName = "FrameLabStatus";
     void* arg = NULL;
     if (_stricmp(cmd, "enable") == 0) { exportName = "FrameLabEnable"; arg = (void*)(uintptr_t)fps; }
+    else if (_stricmp(cmd, "simstatus") == 0) exportName = "FrameLabSimStatus";
     else if (_stricmp(cmd, "dryrun") == 0) { exportName = "FrameLabDryRun"; arg = (void*)(uintptr_t)fps; }
     else if (_stricmp(cmd, "measure") == 0) exportName = "FrameLabMeasureOnly";
     // * measureex <groups>: "measure only" WITH an explicit groups mask. Needed because
@@ -332,7 +334,22 @@ int main(int argc, char** argv) {
     // 而且控制台代码页会把中文输出搞乱,拿中文当判据是给自己挖坑)。
     std::printf("RESULT=%ld\n", (long)(int)result);
     if (_stricmp(cmd, "enable") == 0) {
-        if (result == 0) std::printf("已启用。日志在 DLL 旁边的 logs\\ 目录里。\n");
+        if (result == 0) {
+            if (fps == 60 || fps == 90) {
+                void* localStatus = (void*)GetProcAddress(localBase, "FrameLabSimStatus");
+                void* remoteStatus = localStatus ? (void*)((unsigned char*)remoteBase +
+                    ((unsigned char*)localStatus - (unsigned char*)localBase)) : NULL;
+                DWORD sim = 0;
+                if (!remoteStatus || !call_remote(proc, remoteStatus, NULL, &sim) || (int)sim <= 0 || !(sim & 4)) {
+                    std::printf("必需的相位边界门未确认安装。请检查 DLL 版本和日志。\n");
+                    CloseHandle(proc);
+                    return 24;
+                }
+                std::printf("SIMSTATUS=%ld\n", (long)(int)sim);
+                std::printf("60/90 必需相位边界门已安装3/3；联机验证范围见技术报告。\n");
+            }
+            std::printf("已启用。日志在 DLL 旁边的 logs\\ 目录里。\n");
+        }
         else std::printf("未启用(错误码 %lu)。把 logs\\ 里的日志发回来就能定位。\n", result);
     } else if (_stricmp(cmd, "dryrun") == 0) {
         if (result == 0) std::printf("干扫通过:可以安装,游戏一个字节都没改。\n");

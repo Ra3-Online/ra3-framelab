@@ -1,4 +1,4 @@
-name: Windows portable build
+name: Windows research portable build
 
 on:
   push:
@@ -27,12 +27,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Python configuration test failed' }
           python -B .\tools\re\check_portable_source.py
           if ($LASTEXITCODE -ne 0) { throw 'Source portability audit failed' }
-      - name: Package binaries and corresponding source
+      - name: Package labeled research binaries and corresponding source
+        id: research_package
         shell: powershell
-        run: .\tools\package-release.ps1 -Version 0.2.1
+        run: |
+          $researchVersion = '0.2.3-dev1-visual6-' + $env:GITHUB_SHA.Substring(0, 12)
+          .\tools\package-release.ps1 -Version $researchVersion
+          "research_version=$researchVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: Ra3FrameLab-windows-x86
+          name: Ra3FrameLab-${{ steps.research_package.outputs.research_version }}-windows-x86
           path: |
             build/release/*.zip
             build/release/SHA256SUMS.txt

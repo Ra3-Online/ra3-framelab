@@ -42,9 +42,10 @@
 #include "schedule.h"
 #include "sim_gate.h"      // 2026-09-28:相位边界门 / 迷雾可见性相位的纯逻辑(与 test_schedule 共用)
 #include "chassis_gate.h"   // 2026-09-21:车身外观 30 Hz 节拍门的纯逻辑(与离线自检共用)
+#include "visual_timing.h"
 
 // ───────────────────────────── 版本与状态码 ─────────────────────────────
-#define FL_VERSION "0.2.1"
+#define FL_VERSION "0.2.3-dev1-visual6"
 
 enum FlStatus {
     FL_OK = 0,
@@ -57,7 +58,7 @@ enum FlStatus {
     FL_ERR_FPS_GLOBALS = 22,     // 帧率全局量的值不对(不是 15 / 30)
     FL_ERR_RATIO = 23,           // 目标帧率不是逻辑帧率的整数倍,或倍数超出支持范围
     FL_ERR_SIG_MISMATCH = 24,    // 特征命中了,但现场的值/操作数不是我们预期的那份构建
-    FL_ERR_WRITE = 30,           // 写内存失败(已回滚)
+    FL_ERR_WRITE = 30,           // 写入或还原核验失败;还原未完成时保留撤销表并拒绝新装
     FL_ERR_SUSPEND = 31,         // 挂起其它线程失败
     FL_ERR_BB_FILTER = 32,       // 黑匣子:良性异常码过滤失效(它把通知类异常也记成崩溃了)
 };
@@ -172,6 +173,13 @@ static void init(HMODULE self) {
 // 给黑匣子用:崩溃报告必须和主日志落在**同一个目录**里。让 bb 自己再算一遍路径的话,
 // 两处迟早会漂开(比如有人改了 RA3FL_LOG 只改了一边)⇒ 提供一个只读访问器。
 static const char* path() { return g_path; }
+
+// Acquire before suspending peers so a suspended logger cannot hold this lock.
+struct PatchLogLock {
+    bool held;
+    PatchLogLock() : held(g_ready) { if (held) EnterCriticalSection(&g_lock); }
+    ~PatchLogLock() { if (held) LeaveCriticalSection(&g_lock); }
+};
 }  // namespace log
 
 // 黑匣子(完整实现在文件末尾的 bb 命名空间)。这里先声明,因为逐帧钩子在文件中间就要用它,
@@ -182,6 +190,16 @@ namespace bb { void tick(void* frameObj); }
 //   (第一版直接在导出里写 bb::g_trkAddr,编译报 C2039「不是 bb 的成员」——
 //    那时 bb 里只有上面这一行前向声明)。返回 0 成功 / -1 地址被拒。
 namespace bb { int set_track_addr(unsigned addr); }
+
+// Serialize exported operations that share the patch table or preparation state.
+// This lock is acquired before any checks and before the logging/freezer locks.
+namespace api {
+static SRWLOCK g_patchLock = SRWLOCK_INIT;
+struct PatchGuard {
+    PatchGuard() { AcquireSRWLockExclusive(&g_patchLock); }
+    ~PatchGuard() { ReleaseSRWLockExclusive(&g_patchLock); }
+};
+}
 
 // ───────────────────────────── 内存工具 ─────────────────────────────
 namespace mem {
@@ -199,35 +217,43 @@ static bool read_ok(const void* addr, size_t n) {
     return true;
 }
 
+// Used only by the owned-memory self-test; never configured by the launcher.
+static int g_writeFault = 0;
 static bool write(void* addr, const void* data, size_t n) {
     DWORD oldProtect = 0;
     if (!VirtualProtect(addr, n, PAGE_EXECUTE_READWRITE, &oldProtect)) return false;
-    memcpy(addr, data, n);
-    FlushInstructionCache(GetCurrentProcess(), addr, n);
+    const int fault = g_writeFault;
+    g_writeFault = 0;
+    if (fault != 1) memcpy(addr, data, n);
+    const bool flushed = FlushInstructionCache(GetCurrentProcess(), addr, n) != FALSE;
     DWORD tmp = 0;
-    VirtualProtect(addr, n, oldProtect, &tmp);
-    return true;
+    const bool protectedAgain = fault != 4 && VirtualProtect(addr, n, oldProtect, &tmp) != FALSE;
+    return flushed && protectedAgain && fault != 2 && fault != 3;
 }
 
 // 除自己以外的线程全部挂起:改代码字节时别让别的线程正好执行到那里
 struct ThreadFreezer {
     HANDLE handles[256];
     int count;
-    ThreadFreezer() : count(0) {
+    bool ready;
+    ThreadFreezer() : count(0), ready(false) {
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if (snap == INVALID_HANDLE_VALUE) return;
         THREADENTRY32 te;
         te.dwSize = sizeof te;
         const DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+        bool complete = true;
         if (Thread32First(snap, &te)) {
             do {
                 if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
-                if (count >= 256) break;
+                if (count >= 256) { complete = false; break; }
                 HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
                 if (h && SuspendThread(h) != (DWORD)-1) handles[count++] = h;
-                else if (h) CloseHandle(h);
+                else { if (h) CloseHandle(h); complete = false; break; }
             } while (Thread32Next(snap, &te));
-        }
+            if (complete && GetLastError() != ERROR_NO_MORE_FILES) complete = false;
+        } else complete = false;
+        ready = complete;
         CloseHandle(snap);
     }
     ~ThreadFreezer() {
@@ -832,6 +858,17 @@ static const short kSigPsysUpdate[] = {                  // sub_5F43A0 开头,�
     0xBD,0x2F,0x00,0x00,0x00              // mov  ebp, 47
 };
 
+// Native GPU container creation: ECX=self, two stack args (handle, params),
+// return EAX. The refcounted handle contains another pointer to the system.
+static const short kSigGpuGlowCtor[] = {
+    0x8B,0x4C,0x24,0x3C,0x51,0x8D,0x53,0x04,0x52,0x8B,0xC8,
+    0xE8,W,W,W,W,0xEB,0x02,0x33,0xC0,0x89,0x70,0x4C,0x89,0x78,0x50
+};
+// Native VB upload: storage in ECX, particle and vertex destination on stack.
+static const short kSigGpuGlowVertices[] = {
+    0x52,0x51,0x8B,0xCB,0xE8,W,W,W,W,0x8B,0x54,0x24,0x10,0x83,0xC6,0x04,0x3B,0xF5
+};
+
 // ── ★★★ 2026-09-26(用户 90 帧实机报告 #4):战役过场「运镜一下就过去了」—— 脚本镜头计时,**默认关** ─────
 //   用户原话:90 帧下过场镜头跑得飞快,提前到了地方等了一会飞机才过来(正常应镜头跟着飞机),约快 3 倍;
 //   但有些过场(如苏联第一关开场)又是正常的。录像抽帧核对:镜头 ~3 秒扫完、4~8 秒原地等、8.3 秒飞机才到。
@@ -965,6 +1002,7 @@ static const short kSigTintHold10[] = {   // 命中 0x00525FE4(站点 0x00525FE4
 //   FL_G_SIMPIN:运动器切换的高度斜坡长度 = 本机 flt_CDBC50 × 0.5(sub_73ABC0 写、sub_715ED0 / sub_778AA0 按逻辑帧消费),
 //     而 FL_G_DERIVED2 把 flt_CDBC50 改成了目标帧率 ⇒ 不同帧率的机器同一逻辑帧算出的单位高度不同。把这三条 movss 的
 //     操作数改指补丁自己的常量 30.0f ⇒ 与原版逐位相同。
+//     高 FPS 改共享 DER_FPS 时这三处自动必需;SIMPIN 位保留给不改 DER_FPS 的显式实验请求。
 //   随 FL_G_RATIO 一起装(不占新位):sub_542DF0(GameClient::update)里决定「本帧刷不刷迷雾可见性 / 模型状态快照 / 残影」
 //     的那条 call sub_5FFAD0(phase == 6/r,R1 站点)—— 60 帧下它**永远不成立**(帧边界 {2,3,5,6} 里没有 1),
 //     90 帧下在阶段 1 之后成立(原版是阶段 3 之后)。它刷的是 Drawable+316 bit3「被迷雾遮住」,为真时模型走隐藏绘制 ——
@@ -1098,6 +1136,8 @@ struct Undo {
     void* address;
     unsigned char before[64];
     int size;
+    struct Protection { void* address; SIZE_T size; DWORD value; } protection[2];
+    int protectionCount;
 };
 
 static HMODULE g_self = NULL;
@@ -1170,6 +1210,117 @@ static const uintptr_t kEngineMsPerFrameFloatVa = 0x00CDBC54;
 //   ★ 这是整个「建筑动画」修复的前提数字:若实测 = 60 帧/秒,则 flt_CDBC5C 必须改;
 //     若实测仍是 30 帧/秒,则我上面的推论就是错的,必须回头重查(所以必须先量、再改)。
 static const uintptr_t kDisplayClockVa = 0x00CDB750;
+
+// Only sub_6FD550's display-mode call is redirected. The shared progress
+// function, its x87 control-word handling and all simulation callers stay native.
+#define W 0x100
+static const short kSigConstructionVisualCall[] = {
+    0x8B,0x4C,0x24,0x04,0x6A,0x00,0x51,0x8B,0xC8,0xE8,W,W,W,W,0xC2,0x04,0x00
+};
+// sub_90F820's first visible model update, including the native stamp comparison.
+// Replace its 20-byte conditional call block, not the draw function's entry.
+static const short kSigConstructionModelPrepare[] = {
+    0xC6,0x86,0xCC,0x00,0x00,0x00,0x00,
+    0xA1,0x88,0x13,0xCE,0x00,0x3B,0x86,0xC8,0x00,0x00,0x00,
+    0x74,0x07,0x8B,0xCE,0xE8,W,W,W,W,0x83,0x7E,0x0C,0x00
+};
+static const short kSigConstructionObjectProgress[] = {
+    0xB8,0x01,0x00,0x00,0x00,0x84,0x05,0xFC,0x5F,0xCE,0x00,
+    0x56,0x8B,0xF1,0x75,0x1B,0x8B,0x0D,0x38,0x73,0xD0,0x00,
+    0x09,0x05,0xFC,0x5F,0xCE,0x00,0x68,0x98,0xA5,0xBE,0x00,
+    0xE8,W,W,W,W,0xA3,0xF8,0x5F,0xCE,0x00,0xA1,0xF8,0x5F,0xCE,0x00,
+    0x50,0x8B,0xCE,0xE8,W,W,W,W,0x85,0xC0,0x5E,0x74,0x11,
+    0x8B,0x4C,0x24,0x04,0x6A,0x00,0x51,0x8B,0xC8
+};
+// Default model initialization runs before the world owner is bound. Keep its
+// geometry hidden until native model-condition delivery, without flushing that
+// simulation-sensitive queue early. Three calls and the MC entry retain native ABI.
+static const short kSigWallDefaultModel[] = { // 90D5E0, call at +8
+    0x8B,0xF8,0x57,0x6A,0x00,0x55,0x8B,0xCE,0xE8,W,W,W,W,
+    0x6A,0x00,0x6A,0x00,0x57,0x8B,0xCE,0xC6,0x86,0x14,0x02,0x00,0x00,0x00
+};
+static const short kSigWallSceneAdd[] = { // 90CDC2, call at +19
+    0x8B,0x0D,0x1C,0xB7,0xCD,0x00,0x8B,0x11,0x8B,0x82,0x90,0x00,0x00,0x00,
+    0x57,0xFF,0xD0,0x8B,0xC8,0xE8,W,W,W,W,0x8B,0xCD,0xE8,W,W,W,W,0x84,0xC0
+};
+static const short kSigWallNativeModel[] = { // 90CE60, five whole prologue bytes
+    0x83,0xEC,0x7C,0x53,0x55,0x8B,0xE9,0x8B,0x5D,0xEC,
+    0x80,0xBB,0xD5,0x00,0x00,0x00,0x00,0x74,0x12
+};
+static const short kSigWallRenderAlpha[] = { // 90FA54, call at +15
+    0x8B,0x4E,0x08,0xD9,0x81,0xBC,0x01,0x00,0x00,0x8B,0xCE,0xD9,0x5C,0x24,0x10,
+    0xE8,W,W,W,W,0xD9,0x44,0x24,0x10,0x32,0xDB,0xD8,0x4C,0x24,0x58,0xDE,0xC9
+};
+#undef W
+static int g_constructionSites = 0;
+static volatile long g_constructionClamps = 0;
+static volatile long g_constructionCalls = 0, g_constructionInactive = 0;
+static bool g_constructionOn = false;
+static void* g_constructionOrigFn = NULL;
+static void* g_constructionObjectProgressFn = NULL;
+static void* g_constructionAnimateFn = NULL;
+static unsigned* g_constructionStamp = (unsigned*)0x00CE1388;
+static volatile long g_constructionPrepared = 0, g_constructionPrepareCalls = 0;
+static volatile long g_constructionMatched = 0, g_constructionSameStamp = 0;
+static volatile long g_constructionPrimeRefused = 0;
+struct ConstructionLastDraw {
+    uintptr_t module, object;
+    unsigned stamp, lastStamp, objectFlags, displayedFlags, geometry, state, mode;
+    float current, previous;
+};
+struct ConstructionModelTrace {
+    uintptr_t module, object, geometry, state;
+    unsigned stamp, lastStamp, objectFlags, displayedFlags, restart, initial, primed, queried;
+    unsigned mode[3];
+    float current[3], previous[3], after[3], progress;
+    unsigned priorFound;
+    ConstructionLastDraw prior;
+};
+static ConstructionModelTrace g_constructionModelTrace[64];
+static volatile long g_constructionModelTraceCount = 0;
+static unsigned g_constructionModelTraceLogged = 0;
+static uintptr_t g_constructionModelRecent[256];
+static ConstructionLastDraw g_constructionLastDraw[256];
+// Slots are replaceable by owned offline fixtures; production uses native globals.
+static unsigned char** g_constructionLogicSlot = (unsigned char**)0x00CD8CE4;
+static unsigned char** g_constructionEngineSlot = (unsigned char**)0x00CE2F8C;
+struct ConstructionTrace {
+    uintptr_t module, object;
+    unsigned now, start, hold, duration;
+    float fraction, progress;
+    unsigned active, held;
+};
+static ConstructionTrace g_constructionTrace[64];
+static volatile long g_constructionTraceCount = 0;
+static unsigned g_constructionTraceLogged = 0;
+static uintptr_t g_constructionRecent[256];
+static void* g_wallModelFn = NULL;
+static void* g_wallSceneFn = NULL;
+static void* g_wallAlphaFn = NULL;
+static void* g_wallMcFn = NULL;
+static void* g_wallMcResume = NULL;
+struct WallFirstDisplay {
+    uintptr_t module, drawable, geometry;
+    unsigned drawableId, templateId;
+    unsigned observed; // one diagnostic row at the first held render
+};
+// No allocations, retained engine references, timers or deferred game calls.
+// A full probe window fails open. Entries are consumed by native MC delivery;
+// module reuse resets its entry in the native default-model initializer.
+static WallFirstDisplay g_wallFirstDisplay[512];
+static volatile long g_wallBorn = 0, g_wallSceneHidden = 0, g_wallRenderHeld = 0;
+static volatile long g_wallReleased = 0, g_wallOverflow = 0, g_wallPreview = 0;
+static volatile long g_wallStale = 0;
+static unsigned g_wallHolding = 0;
+struct WallDisplayTrace {
+    uintptr_t module, drawable, object, geometry, model, state;
+    unsigned event, templateId, drawableId, stamp, logicFrame, phase;
+    unsigned objectFlags, displayedFlags, drawableFlags, mode;
+    float current, alpha;
+};
+static WallDisplayTrace g_wallDisplayTrace[128];
+static volatile long g_wallTraceCount = 0;
+static unsigned g_wallTraceLogged = 0;
 static int g_retailFps = 30;
 static int g_targetFps = 60;
 static int g_ratio = 4;            // r = 客户端帧率 ÷ 逻辑帧率
@@ -1183,6 +1334,7 @@ static Undo g_undo[128];
 static const int kUndoMax = (int)(sizeof g_undo / sizeof g_undo[0]);
 static int g_undoCount = 0;
 static bool g_installed = false;
+static bool g_patchPoisoned = false; // Failed restore: keep the undo table and refuse another install.
 
 // 我们自己的常量:被游戏代码的操作数直接指过来(所以必须是进程内固定地址的全局)
 static float g_constRetailFramesPerMs = 0.03f;   // 30 * 0.001
@@ -1295,6 +1447,27 @@ static unsigned       g_psVFrame = 0xFFFFFFFFu;  // 上一次放行时的 30 Hz 
 static bool           g_psOn     = false;   // 节拍门是否真的生效
 static volatile long  g_psCalls  = 0;       // 包装被进入的次数
 static volatile long  g_psFwd    = 0;       // 真的转发给引擎的次数(放行 ÷ 调用 应 ≈ 30 ÷ 目标帧率)
+static const uintptr_t kEngineGpuCtorVa = 0x006C1770;
+static const uintptr_t kEngineGpuVerticesVa = 0x006B99D0;
+static bool           g_glowOn = false;
+static void*          g_glowOrigFn = NULL; // retained for in-flight calls after uninstall
+static void*          g_glowVerticesOrigFn = NULL;
+static volatile long  g_glowSeen = 0, g_glowAdjusted = 0, g_glowSkipped = 0;
+static volatile long  g_glowVertexCalls = 0, g_glowVertexAdjusted = 0, g_glowVertexSkipped = 0;
+static volatile long g_glowVertexRejected[5] = {};
+struct PowerGlowStats {
+    volatile long born, adjusted, skipped, uploads, corrected, uploadSkipped;
+    volatile long rejected[5];
+    unsigned traces;
+};
+static PowerGlowStats g_powerGlowStats[kFlPowerGlowProfiles] = {};
+struct GlowVertexTrace {
+    unsigned templateId, count, poolLife, writtenBytes, rejected;
+    float firstLife, lastLife, birth, expiry;
+};
+static GlowVertexTrace g_glowVertexTrace[kFlPowerGlowProfiles * 16];
+static volatile long g_glowVertexTraceCount = 0;
+static unsigned g_glowVertexTraceLogged = 0;
 // 2026-09-26:过场运镜计时(见 FL_G_CAMERA)。被改指过来的 11 条换算指令直接读 g_camMs。
 static int            g_camMs    = 33;      // round(1000 ÷ 目标帧率),install() 里算
 static int            g_camSites = 0;       // 实际改指成功的处数(应为 16)
@@ -1319,6 +1492,19 @@ static int            g_simPinSites  = 0;       // R-1 改指成功的处数(应
 static int            g_simGateSites = 0;       // 边界门改指成功的处数(应为 3)
 static bool           g_simGateOn    = false;
 static volatile long  g_simGateHeld  = 0;       // 边界门挡下的次数(只做记账)
+// 成功安装的需求快照；后续 SetGroups 或拒绝的 DryRun 不改这份合同。
+struct SimInstallContract {
+    int targetFps;
+    int ratio;
+    int retailFps;
+    unsigned requestedGroups;
+    bool measureOnly;
+    bool pinNeeded;
+    bool pinRequired;
+    bool gateNeeded;
+    bool gateRequired;
+};
+static SimInstallContract g_simInstalled = {};
 static int   g_scrollSites = 0;           // resolve 时定位并核对通过的补丁点个数(应为 2;不是 2 就一处都不登记)
 static bool  g_scrollOn    = false;       // 两处是否真的改指了(给 FrameLabScrollStatus 用)
 // 2026-09-22:弹道流节拍门(见 FL_G_TRACER)。只需要一个「上次转发时的 30 Hz 虚拟帧号」,不需要表 ——
@@ -1340,21 +1526,50 @@ static volatile long  g_chsNoSlot = 0;       // 表满退回直通的总次数(�
 
 static bool remember(void* address, int size) {
     if (g_undoCount >= kUndoMax) { FL_ERR("撤销表已满(%d 处)—— 拒绝继续改,否则回滚会残缺", kUndoMax); return false; }
-    if (size > 64) { FL_ERR("单次改动 %d 字节超过撤销表格子上限 64", size); return false; }
-    Undo& u = g_undo[g_undoCount++];
+    if (size <= 0 || size > 64 || !mem::read_ok(address, (size_t)size)) {
+        FL_ERR("补丁范围不可读或长度无效(%d)", size); return false;
+    }
+    Undo& u = g_undo[g_undoCount];
     u.address = address;
     u.size = size;
+    u.protectionCount = 0;
+    uintptr_t cursor = (uintptr_t)address, end = cursor + (size_t)size;
+    while (cursor < end) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (u.protectionCount == 2 || !VirtualQuery((void*)cursor, &mbi, sizeof mbi)) return false;
+        const uintptr_t regionEnd = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (regionEnd <= cursor) return false;
+        Undo::Protection& p = u.protection[u.protectionCount++];
+        p.address = (void*)cursor;
+        p.size = (SIZE_T)((regionEnd < end ? regionEnd : end) - cursor);
+        p.value = mbi.Protect;
+        cursor += p.size;
+    }
     memcpy(u.before, address, (size_t)size);
+    ++g_undoCount;
     return true;
 }
 
+static bool restore_protection(const Undo& u) {
+    bool ok = true;
+    for (int i = 0; i < u.protectionCount; ++i) {
+        const Undo::Protection& p = u.protection[i];
+        DWORD ignored = 0;
+        const bool restored = VirtualProtect(p.address, p.size, p.value, &ignored) != FALSE;
+        MEMORY_BASIC_INFORMATION mbi;
+        const bool verified = VirtualQuery(p.address, &mbi, sizeof mbi) != 0 && mbi.Protect == p.value;
+        ok = restored && verified && ok;
+    }
+    return ok;
+}
+
 static bool patch(void* address, const void* data, int size, const char* what) {
+    if (size <= 0 || size > 64 || !mem::read_ok(address, (size_t)size)) return false;
     char beforeHex[256], afterHex[256];
     log::hex(address, (size_t)(size > 24 ? 24 : size), beforeHex, sizeof beforeHex);
     if (!remember(address, size)) { FL_ERR("放弃改动 %s @ %08X", what, (unsigned)(uintptr_t)address); return false; }
     if (!mem::write(address, data, (size_t)size)) {
         FL_ERR("写入失败 %s @ %08X (%d 字节),已记录原字节,准备回滚", what, (unsigned)(uintptr_t)address, size);
-        --g_undoCount;
         return false;
     }
     log::hex(address, (size_t)(size > 24 ? 24 : size), afterHex, sizeof afterHex);
@@ -1364,10 +1579,12 @@ static bool patch(void* address, const void* data, int size, const char* what) {
     if (memcmp(address, data, (size_t)size) != 0) {
         FL_ERR("★写入未通过核验 %s @ %08X:写完之后字节仍不是我们要写的(现在 %s)—— 当作失败处理",
                what, (unsigned)(uintptr_t)address, afterHex);
-        --g_undoCount;   // 这条撤销记录作废,别让它参与回滚
         return false;
     }
     FL_INFO("已改并核验 %-24s @ %08X  %d 字节  改前 %s  改后 %s", what, (unsigned)(uintptr_t)address, size, beforeHex, afterHex);
+    if (!restore_protection(g_undo[g_undoCount - 1])) {
+        FL_ERR("补丁页面保护未恢复,保留撤销记录"); return false;
+    }
     return true;
 }
 
@@ -1384,7 +1601,8 @@ static int rollback() {
     for (int i = g_undoCount - 1; i >= 0; --i) {
         Undo& u = g_undo[i];
         const bool wrote = g_selfTestNoWrite ? true : mem::write(u.address, u.before, (size_t)u.size);
-        const bool same = wrote && mem::read_ok(u.address, (size_t)u.size) &&
+        const bool protection = restore_protection(u);
+        const bool same = wrote && protection && mem::read_ok(u.address, (size_t)u.size) &&
                           memcmp(u.address, u.before, (size_t)u.size) == 0;
         if (same) {
             ++ok;
@@ -1393,7 +1611,8 @@ static int rollback() {
             ++bad;
             char nowHex[256], wantHex[256];
             const size_t show = (size_t)(u.size > 24 ? 24 : u.size);
-            log::hex(u.address, show, nowHex, sizeof nowHex);
+            if (mem::read_ok(u.address, show)) log::hex(u.address, show, nowHex, sizeof nowHex);
+            else strcpy_s(nowHex, "<不可读>");
             log::hex(u.before, show, wantHex, sizeof wantHex);
             FL_ERR("★还原未通过核验 @ %08X:现在 %s | 应为 %s(%s)—— 进程状态可能不一致,建议重启游戏",
                    (unsigned)(uintptr_t)u.address, nowHex, wantHex,
@@ -1402,7 +1621,8 @@ static int rollback() {
     }
     if (bad == 0) FL_INFO("还原核验:%d/%d 处逐字节回到原样", ok, ok);
     else          FL_ERR("★还原核验:%d 处通过,**%d 处未通过** —— 请把本日志发回来,并重启游戏", ok, bad);
-    g_undoCount = 0;
+    g_patchPoisoned = bad != 0;
+    if (bad == 0) g_undoCount = 0;
     return bad;
 }
 
@@ -1741,6 +1961,385 @@ extern "C" void __fastcall fl_wrap_tracer(void* mgr, void* unused) {
 // 无栈参数 ⇒ 我们也无栈参数,调用约定对得上。与弹道流包装同一个形状:只读自己的全局 + 一次虚拟帧号计算,
 // 不分配、不用 SEH。节拍门不生效时每次都转发 ⇒ 行为逐位不变。
 typedef void (__thiscall *FnPsysUpdate)(void* self);
+
+typedef void* (__thiscall *FnGpuCtor)(void*, void*, const FlGpuParticleParams*);
+static const void* fl_gpu_storage_template(void* storage) {
+    const void* ref = *(const void**)((const unsigned char*)storage + 4);
+    const void* system = ref ? *(const void**)ref : NULL;
+    return system ? *(const void**)((const unsigned char*)system + 8) : NULL;
+}
+extern "C" void* __fastcall fl_wrap_gpu_ctor(void* self, void* unused,
+                                            void* handle, const FlGpuParticleParams* params) {
+    (void)unused;
+    FlGpuParticleParams adjusted;
+    const FlGpuParticleParams* use = params;
+    if (g_glowOn && g_psOn && (g_targetFps == 60 || g_targetFps == 90) && handle && params) {
+        const void* ref = *(const void**)handle;
+        const void* system = ref ? *(const void**)ref : NULL;
+        const void* tpl = system ? *(const void**)((const unsigned char*)system + 8) : NULL;
+        const FlPowerGlowProfile* profile = tpl ? fl_power_glow_profile(fl_visual_word(tpl, 256)) : NULL;
+        if (profile) {
+            ++g_glowSeen;
+            PowerGlowStats& stats = g_powerGlowStats[profile->index];
+            ++stats.born;
+            if (fl_retail_power_glow(tpl, params->words[9])) {
+                // Pool retention and visible life are a paired patch. Keeping
+                // 16 visible (visual2) overlapped old/new additive quads. The
+                // upload wrapper below clips only their float visible lifetime.
+                adjusted = *params;
+                adjusted.words[9] = profile->poolLifetime;
+                use = &adjusted;
+                ++g_glowAdjusted;
+                ++stats.adjusted;
+            } else {
+                ++g_glowSkipped;
+                ++stats.skipped;
+            }
+        }
+    }
+    return ((FnGpuCtor)g_glowOrigFn)(self, handle, use);
+}
+
+typedef float* (__thiscall *FnGpuVertices)(void*, const void*, float*);
+extern "C" float* __fastcall fl_wrap_gpu_vertices(void* storage, void* unused,
+                                                  const void* particle, float* vertices) {
+    (void)unused;
+    float* result = ((FnGpuVertices)g_glowVerticesOrigFn)(storage, particle, vertices);
+    if (g_glowOn && g_psOn && (g_targetFps == 60 || g_targetFps == 90) &&
+        storage && particle && vertices) {
+        const void* tpl = fl_gpu_storage_template(storage);
+        const FlPowerGlowProfile* profile = tpl ? fl_power_glow_profile(fl_visual_word(tpl, 256)) : NULL;
+        if (profile) {
+            ++g_glowVertexCalls;
+            PowerGlowStats& stats = g_powerGlowStats[profile->index];
+            ++stats.uploads;
+            const unsigned count = fl_visual_word(storage, 36);
+            const unsigned poolLife = fl_visual_word(particle, 40);
+            const unsigned written = (unsigned)((uintptr_t)result - (uintptr_t)vertices);
+            unsigned rejected = 0;
+            if (!fl_retail_power_glow(tpl, profile->nativeLifetime)) rejected |= 1;
+            if (count != kFlGlowVertexCount) rejected |= 2;
+            if (poolLife != profile->poolLifetime) rejected |= 4;
+            if (written != kFlGlowVertexCount * 40u) rejected |= 8;
+            // Confirm the native end pointer before reading or writing any of
+            // the five 40-byte records (including the centre vertex).
+            const bool spanOK = count == kFlGlowVertexCount && written == kFlGlowVertexCount * 40u;
+            if (spanOK) for (unsigned i = 0; i < kFlGlowVertexCount; ++i)
+                if (vertices[i * 10 + 3] != (float)profile->poolLifetime) rejected |= 16;
+            if (stats.traces < 16 && g_glowVertexTraceCount < (long)(kFlPowerGlowProfiles * 16)) {
+                GlowVertexTrace& r = g_glowVertexTrace[g_glowVertexTraceCount];
+                r.templateId = profile->id;
+                r.count = count; r.poolLife = poolLife; r.writtenBytes = written; r.rejected = rejected;
+                r.firstLife = spanOK ? vertices[3] : -1.0f;
+                r.lastLife = spanOK ? vertices[43] : -1.0f;
+                r.birth = spanOK ? vertices[7] : -1.0f;
+                r.expiry = *(const float*)((const unsigned char*)particle + 72);
+                ++stats.traces;
+                InterlockedIncrement(&g_glowVertexTraceCount);
+            }
+            if (!rejected) {
+                for (unsigned i = 0; i < kFlGlowVertexCount; ++i) vertices[i * 10 + 3] = profile->visibleLifetime;
+                ++g_glowVertexAdjusted;
+                ++stats.corrected;
+            } else {
+                ++g_glowVertexSkipped;
+                ++stats.uploadSkipped;
+                for (unsigned i = 0; i < 5; ++i) if (rejected & (1u << i)) {
+                    ++g_glowVertexRejected[i]; ++stats.rejected[i];
+                }
+            }
+        }
+    }
+    return result; // including the native end-of-buffer pointer / EAX
+}
+
+typedef char (__thiscall *FnConstructionProgress)(void*, float*, int);
+extern "C" char __fastcall fl_wrap_construction_progress(void* module, void* unused,
+                                                         float* out, int mode) {
+    (void)unused;
+    if (!g_constructionOn || mode != 0 || !module || !out)
+        return ((FnConstructionProgress)g_constructionOrigFn)(module, out, mode);
+    const unsigned char* logic = *g_constructionLogicSlot;
+    const unsigned char* engine = *g_constructionEngineSlot;
+    if (!logic || !engine)
+        return ((FnConstructionProgress)g_constructionOrigFn)(module, out, mode);
+    ++g_constructionCalls;
+    const unsigned char* bytes = (const unsigned char*)module;
+    const unsigned active = bytes[68], held = bytes[69];
+    const unsigned now = fl_visual_word(logic, 80);
+    const unsigned duration = fl_visual_word(module, 56), start = fl_visual_word(module, 60);
+    const unsigned hold = fl_visual_word(module, 64);
+    const float fraction = *(const float*)(engine + 96);
+    if (!active) { *out = 0.0f; ++g_constructionInactive; }
+    else {
+        *out = fl_construction_progress(now, start, hold, duration, fraction, held != 0);
+        if ((std::int32_t)((held ? hold : now) - start) < 0) ++g_constructionClamps;
+    }
+    // At most 64 first observations/transitions. No log, scan, allocation or
+    // VirtualQuery in this callback. RPC status writes new records later.
+    if (g_constructionTraceCount < 64) {
+        const uintptr_t key = (uintptr_t)module | (active ? 1u : 0u);
+        const unsigned slot = ((uintptr_t)module >> 4) & 255u;
+        if (g_constructionRecent[slot] != key) {
+            g_constructionRecent[slot] = key;
+            ConstructionTrace& r = g_constructionTrace[g_constructionTraceCount];
+            r.module = (uintptr_t)module; r.object = fl_visual_word(module, 8);
+            r.now = now; r.start = start; r.hold = hold;
+            r.duration = duration; r.fraction = fraction; r.progress = *out;
+            r.active = active; r.held = held;
+            // Publish only a complete row to the remote status-query thread.
+            InterlockedIncrement(&g_constructionTraceCount);
+        }
+    }
+    return active ? 1 : 0;
+}
+
+typedef char (__thiscall *FnConstructionObjectProgress)(const void*, float*);
+typedef void (__thiscall *FnConstructionAnimate)(void*);
+typedef char (__thiscall *FnWallModel)(void*, void*, char, void*);
+typedef void* (__thiscall *FnWallScene)(void*, void**);
+typedef double (__thiscall *FnWallAlpha)(void*);
+typedef char (__thiscall *FnWallMc)(void*, const void*, char, char);
+
+static bool fl_wall_enabled() {
+    return g_constructionOn && (g_targetFps == 60 || g_targetFps == 90);
+}
+static unsigned fl_wall_hash(uintptr_t module) {
+    return (unsigned)((module >> 4) ^ (module >> 12) ^ (module >> 20)) & 511u;
+}
+static WallFirstDisplay* fl_wall_find(void* module, const void* drawable) {
+    const unsigned start = fl_wall_hash((uintptr_t)module);
+    for (unsigned i = 0; i < 16; ++i) {
+        WallFirstDisplay& row = g_wallFirstDisplay[(start + i) & 511u];
+        if (row.module == (uintptr_t)module && row.drawable == (uintptr_t)drawable &&
+            drawable && row.drawableId == fl_visual_word(drawable, 608)) return &row;
+    }
+    return NULL;
+}
+static void fl_wall_trace(unsigned event, void* module, const WallFirstDisplay& held) {
+    if (g_wallTraceCount >= 128) return;
+    const unsigned char* m = (const unsigned char*)module;
+    const unsigned char* d = *(const unsigned char**)(m + 8);
+    const unsigned char* object = d ? *(const unsigned char**)(d + 312) : NULL;
+    const unsigned char* logic = *g_constructionLogicSlot;
+    const unsigned char* engine = *g_constructionEngineSlot;
+    WallDisplayTrace row = {};
+    row.module = (uintptr_t)module; row.drawable = (uintptr_t)d;
+    row.object = (uintptr_t)object; row.geometry = fl_visual_word(module, 12);
+    row.model = fl_visual_word(module, 60); row.state = fl_visual_word(module, 64);
+    row.event = event; row.templateId = held.templateId; row.drawableId = held.drawableId;
+    row.stamp = *g_constructionStamp;
+    row.logicFrame = logic ? fl_visual_word(logic, 80) : 0;
+    row.phase = engine ? fl_visual_word(engine, 88) : 0;
+    row.objectFlags = object ? fl_visual_word(object, 160) : 0;
+    row.displayedFlags = fl_visual_word(module, 400);
+    row.drawableFlags = d ? fl_visual_word(d, 340) & 0xffffu : 0;
+    if (fl_visual_word(module, 284)) {
+        row.mode = fl_visual_word(module, 300);
+        row.current = *(const float*)(m + 288);
+    }
+    if (row.geometry) row.alpha = *(const float*)((const unsigned char*)row.geometry + 96);
+    g_wallDisplayTrace[g_wallTraceCount] = row;
+    InterlockedIncrement(&g_wallTraceCount);
+}
+
+// This call belongs exclusively to sub_90D500's DEFAULT model setup. Native
+// Drawable creation has already stored its flags, but Object binding happens
+// later in sub_521DC0. Therefore a null owner here cannot identify a preview.
+extern "C" char __fastcall fl_wrap_wall_default(void* module, void* unused,
+                                                void* model, char force, void* state) {
+    (void)unused;
+    if (fl_wall_enabled() && module) {
+        const unsigned char* m = (const unsigned char*)module;
+        const unsigned char* d = *(const unsigned char**)(m + 8);
+        const unsigned char* tpl = d ? *(const unsigned char**)(d + 4) : NULL;
+        if (tpl && fl_live_wall_template(fl_visual_word(tpl, 4), fl_visual_word(tpl, 8))) {
+            const unsigned flags = fl_visual_word(d, 340) & 0xffffu;
+            if (flags & 8u) { ++g_wallPreview; } // native placement/ghost creation flag
+            else if (!fl_visual_word(module, 12) && !fl_visual_word(module, 60)) {
+                const unsigned start = fl_wall_hash((uintptr_t)module);
+                WallFirstDisplay* empty = NULL;
+                for (unsigned i = 0; i < 16; ++i) {
+                    WallFirstDisplay& row = g_wallFirstDisplay[(start + i) & 511u];
+                    if (row.module == (uintptr_t)module) { empty = &row; break; }
+                    if (!row.module && !empty) empty = &row;
+                }
+                if (empty) {
+                    if (!empty->module) ++g_wallHolding;
+                    *empty = {};
+                    empty->module = (uintptr_t)module; empty->drawable = (uintptr_t)d;
+                    empty->drawableId = fl_visual_word(d, 608);
+                    empty->templateId = fl_visual_word(tpl, 8);
+                    ++g_wallBorn;
+                    fl_wall_trace(1, module, *empty);
+                } else { ++g_wallOverflow; }
+            }
+        }
+    }
+    return ((FnWallModel)g_wallModelFn)(module, model, force, state);
+}
+
+// Native scene-add still runs exactly once with the same shared reference and
+// return value. Zero alpha prevents the default geometry's first publication;
+// the normal render-alpha path keeps it zero until native MC delivery finishes.
+extern "C" void* __fastcall fl_wrap_wall_scene(void* scene, void* unused, void** geometry) {
+    (void)unused;
+    if (fl_wall_enabled() && g_wallHolding && geometry && *geometry) {
+        unsigned char* module = (unsigned char*)geometry - 12;
+        const void* d = *(const void**)(module + 8);
+        WallFirstDisplay* held = fl_wall_find(module, d);
+        if (held) {
+            held->geometry = (uintptr_t)*geometry;
+            *(float*)((unsigned char*)*geometry + 96) = 0.0f;
+            ++g_wallSceneHidden;
+            fl_wall_trace(2, module, *held);
+        }
+    }
+    return ((FnWallScene)g_wallSceneFn)(scene, geometry);
+}
+
+extern "C" double __fastcall fl_wrap_wall_alpha(void* module, void* unused) {
+    (void)unused;
+    const double nativeAlpha = ((FnWallAlpha)g_wallAlphaFn)(module);
+    if (fl_wall_enabled() && g_wallHolding && module) {
+        const void* d = *(const void**)((const unsigned char*)module + 8);
+        const void* tpl = d ? *(const void**)((const unsigned char*)d + 4) : NULL;
+        if (!tpl || !fl_live_wall_template(fl_visual_word(tpl, 4), fl_visual_word(tpl, 8))) return nativeAlpha;
+        WallFirstDisplay* held = fl_wall_find(module, d);
+        if (held) {
+            if (held->geometry && held->geometry == fl_visual_word(module, 12)) {
+                ++g_wallRenderHeld;
+                if (!held->observed) { held->observed = 1; fl_wall_trace(3, module, *held); }
+                return 0.0;
+            }
+            // An unobserved geometry replacement or a stale generation must
+            // never suppress a different model. This is a fail-open cache.
+            ++g_wallStale; fl_wall_trace(5, module, *held); held->module = 0; --g_wallHolding;
+        }
+    }
+    return nativeAlpha;
+}
+
+// Verified native entry bytes: sub esp,7Ch; push ebx; push ebp. There are no
+// relative instructions in these five bytes. Jump indirectly to +5 without
+// clobbering any incoming register. The original body retains its ret 0Ch.
+extern "C" __declspec(naked) void fl_wall_mc_trampoline() {
+    __asm {
+        sub esp, 7Ch
+        push ebx
+        push ebp
+        jmp dword ptr [g_wallMcResume]
+    }
+}
+extern "C" char __fastcall fl_wrap_wall_mc(void* receiver, void* unused,
+                                           const void* flags, char force, char extra) {
+    (void)unused;
+    const char result = ((FnWallMc)g_wallMcFn)(receiver, flags, force, extra);
+    if (fl_wall_enabled() && g_wallHolding && receiver && flags) {
+        unsigned char* module = (unsigned char*)receiver - 24;
+        const void* d = *(const void**)(module + 8);
+        WallFirstDisplay* held = fl_wall_find(module, d);
+        // Native model AND animation initialization have returned before this
+        // guard is removed. A native early return does not consume the guard.
+        if (held && fl_visual_word(module, 64) &&
+            !memcmp(module + 400, flags, 60)) {
+            ++g_wallReleased; fl_wall_trace(4, module, *held); held->module = 0; --g_wallHolding;
+        }
+    }
+    return result;
+}
+
+extern "C" void __fastcall fl_wrap_construction_prepare(void* module, void* unused) {
+    (void)unused;
+    const unsigned stamp = *g_constructionStamp;
+    const unsigned lastStamp = fl_visual_word(module, 200);
+    bool prime = false, trace = false;
+    ConstructionModelTrace row; row.progress = -1.0f; row.queried = 0;
+    if (g_constructionOn) {
+        ++g_constructionPrepareCalls;
+        const unsigned char* drawable = *(const unsigned char**)((unsigned char*)module + 8);
+        const unsigned char* object = drawable ? *(const unsigned char**)(drawable + 312) : NULL;
+        const unsigned displayed = fl_visual_word(module, 400);
+        const unsigned pending = object ? fl_visual_word(object, 160) : 0;
+        const unsigned restart = ((const unsigned char*)module)[592];
+        bool matching = false, initial = false;
+        for (unsigned i = 0; i < 3; ++i) {
+            const unsigned offset = 284 + 28*i;
+            const bool match = fl_visual_word(module, offset) &&
+                               fl_visual_word(module, offset + 16) == kFlMatchUnpacking;
+            matching |= match;
+            initial |= match && fl_initial_unpacking_track(
+                *(const float*)((const unsigned char*)module + offset + 4),
+                *(const float*)((const unsigned char*)module + offset + 8));
+        }
+        if (matching && (displayed & kFlStructureUnpacking)) {
+            ++g_constructionMatched;
+            if (stamp == lastStamp) ++g_constructionSameStamp;
+            // Restrict the extra call to a selected, unfrozen construction
+            // animation still in its native initial/restart state. A progress
+            // query confirms unpacking is active and incomplete. Subsequent
+            // renders consume the sentinel and use the native stamp rule.
+            if (stamp == lastStamp && object && fl_visual_word(module, 12) &&
+                fl_visual_word(module, 64) && !((const unsigned char*)module)[168] &&
+                (initial || restart)) {
+                row.progress = -1.0f;
+                const char active = ((FnConstructionObjectProgress)g_constructionObjectProgressFn)(object, &row.progress);
+                row.queried = active ? 2u : 1u;
+                prime = active && row.progress >= 0.0f && row.progress < 1.0f;
+                if (prime) ++g_constructionPrepared;
+                else ++g_constructionPrimeRefused;
+            }
+        }
+        // Bounded state snapshots. Publish only after the native call below,
+        // and write them to disk solely from the remote status query.
+        if (g_constructionModelTraceCount < 64 &&
+            (matching || ((displayed | pending) & kFlStructureUnpacking))) {
+            const unsigned slot = ((uintptr_t)module >> 4) & 255u;
+            const uintptr_t key = (uintptr_t)module ^ (initial ? 1u : 0u) ^
+                (restart ? 2u : 0u) ^ (displayed & kFlStructureUnpacking) ^
+                ((pending & kFlStructureUnpacking) << 1);
+            if (g_constructionModelRecent[slot] != key) {
+                g_constructionModelRecent[slot] = key;
+                trace = true; row.module = (uintptr_t)module; row.object = (uintptr_t)object;
+                row.geometry = fl_visual_word(module, 12); row.state = fl_visual_word(module, 64);
+                row.stamp = stamp; row.lastStamp = lastStamp;
+                row.objectFlags = pending; row.displayedFlags = displayed;
+                row.restart = restart; row.initial = initial; row.primed = prime;
+                row.prior = g_constructionLastDraw[slot];
+                row.priorFound = row.prior.module == (uintptr_t)module && row.prior.object == (uintptr_t)object;
+                for (unsigned i = 0; i < 3; ++i) {
+                    row.mode[i] = fl_visual_word(module, 300 + i*28);
+                    row.current[i] = *(const float*)((const unsigned char*)module + 288 + i*28);
+                    row.previous[i] = *(const float*)((const unsigned char*)module + 292 + i*28);
+                }
+            }
+        }
+        // One fixed-size last-draw slot also observes the preceding default
+        // model. If a later construction transition matches the same module
+        // and owner, the trace can reveal a draw before activation. Collisions
+        // are explicit cache misses, never a condition for changing behaviour.
+        ConstructionLastDraw& last = g_constructionLastDraw[((uintptr_t)module >> 4) & 255u];
+        last.module = (uintptr_t)module; last.object = (uintptr_t)object;
+        last.stamp = stamp; last.objectFlags = pending;
+    }
+    if (prime || stamp != lastStamp)
+        ((FnConstructionAnimate)g_constructionAnimateFn)(module);
+    if (g_constructionOn) {
+        ConstructionLastDraw& last = g_constructionLastDraw[((uintptr_t)module >> 4) & 255u];
+        last.lastStamp = fl_visual_word(module, 200);
+        last.geometry = fl_visual_word(module, 12); last.state = fl_visual_word(module, 64);
+        last.displayedFlags = fl_visual_word(module, 400); last.mode = fl_visual_word(module, 300);
+        last.current = *(const float*)((const unsigned char*)module + 288);
+        last.previous = *(const float*)((const unsigned char*)module + 292);
+    }
+    if (trace) {
+        for (unsigned i = 0; i < 3; ++i)
+            row.after[i] = *(const float*)((const unsigned char*)module + 288 + i*28);
+        g_constructionModelTrace[g_constructionModelTraceCount] = row;
+        InterlockedIncrement(&g_constructionModelTraceCount);
+    }
+}
+
 extern "C" void __fastcall fl_wrap_psys(void* mgr, void* unused) {
     (void)unused;
     ++g_psCalls;
@@ -1856,7 +2455,7 @@ static void log_error_legend() {
     FL_INFO("            20=特征没找到(主程序不是我们支持的那份构建,或已被别的补丁改过)");
     FL_INFO("            21=特征命中多处(不敢下手) 22=帧率全局量异常 23=目标帧率不是逻辑帧率的整数倍");
     FL_INFO("            24=特征命中了但现场值不对(不是我们支持的那份构建)");
-    FL_INFO("            30=写内存失败(已整体回滚) 31=挂起线程失败");
+    FL_INFO("            30=写入或还原核验失败,须查看还原记录 31=挂起线程失败");
     FL_INFO("            请把本目录 logs 下的这个 .log 文件整份发回来,以上信息足以定位。");
 }
 
@@ -1879,6 +2478,13 @@ struct Sites {
     int redirectCount;
     unsigned char* perFrame;   // P3b 逐帧推进块
     unsigned char* frameUpdate; // P7 逐帧绘制更新调用点
+    unsigned char* simPin[3];  // 高度斜坡读者:干扫与安装共用核验结果
+    bool simPinNeeded;
+    bool simPinRequired;       // 高 FPS 改共享 DER_FPS 时自动必需,不依赖请求 mask 的 SIMPIN 位
+    unsigned char* simGate[3];
+    unsigned char simGateOriginal[3][16]; // 完整上下文；XfFlush 窗口包含 Destroy call
+    bool simGateNeeded;
+    bool simGateRequired;
 
     // 引擎在启动时算好的三个派生量(浮点帧率 / 每帧毫秒 / 每毫秒帧数):
     // 我们注入时它们早算完了,得按同样公式按新帧率写回去;顺便把算它们的那条 fild 也改指向。
@@ -1888,6 +2494,164 @@ struct Sites {
     // 2026-09-21:第四个派生量 0x00CDBD34(每显示帧秒数)的存量值。NULL = 没定位到 / 核对没过(只 WARN,不拒装)。
     float* spfTarget;
 };
+
+static const Pattern kSimPinPatterns[] = {
+    {"高度斜坡 初值(sub_73ABC0)", kSigSimPin0, (int)(sizeof kSigSimPin0 / sizeof kSigSimPin0[0]), 0x0073AC7C},
+    {"高度斜坡 消费(sub_715ED0)", kSigSimPin1, (int)(sizeof kSigSimPin1 / sizeof kSigSimPin1[0]), 0x00715FD9},
+    {"高度斜坡 消费(sub_778AA0)", kSigSimPin2, (int)(sizeof kSigSimPin2 / sizeof kSigSimPin2[0]), 0x00778B4B}
+};
+
+static const Pattern kSimGatePatterns[] = {
+    {"ModelCondition 同步调用点", kSigMcSyncCall, (int)(sizeof kSigMcSyncCall / sizeof kSigMcSyncCall[0]), 0x0062666B},
+    {"变换冲刷调用点", kSigXfFlushCall, (int)(sizeof kSigXfFlushCall / sizeof kSigXfFlushCall[0]), 0x006266F7},
+    {"销毁表调用点", kSigDestroyCall, (int)(sizeof kSigDestroyCall / sizeof kSigDestroyCall[0]), 0x006266FE}
+};
+
+static uintptr_t sim_gate_target(int index, bool installed) {
+    const uintptr_t original[3] = { kEngineMcSyncVa, kEngineXfFlushVa, kEngineDestroyVa };
+    const uintptr_t wrapper[3] = { (uintptr_t)&fl_wrap_mcsync, (uintptr_t)&fl_wrap_xfflush, (uintptr_t)&fl_wrap_destroy };
+    return installed ? wrapper[index] : original[index];
+}
+
+static void sim_gate_call_bytes(unsigned char* site, uintptr_t target, unsigned char code[5]) {
+    code[0] = 0xE8;
+    const int rel = (int)(target - ((uintptr_t)site + 5));
+    memcpy(code + 1, &rel, 4);
+}
+
+// 原窗口逐字节复核；写后在所有重叠窗口内替换计划中的 call 字节再比对。
+static bool verify_sim_gates(const Sites& s, bool installed) {
+    for (int i = 0; i < 3; ++i) {
+        const int length = kSimGatePatterns[i].length;
+        const unsigned char* site = s.simGate[i];
+        if (!site || site == (unsigned char*)-1 || length > (int)sizeof s.simGateOriginal[i] ||
+            !mem::read_ok(site, (size_t)length)) {
+            FL_ERR("相位边界门第 %d 处完整窗口不可读", i + 1);
+            return false;
+        }
+        unsigned char expected[16];
+        memcpy(expected, s.simGateOriginal[i], (size_t)length);
+        if (installed) {
+            for (int k = 0; k < 3; ++k) {
+                unsigned char code[5];
+                sim_gate_call_bytes(s.simGate[k], sim_gate_target(k, true), code);
+                for (int j = 0; j < 5; ++j) {
+                    const uintptr_t address = (uintptr_t)s.simGate[k] + j;
+                    if (address >= (uintptr_t)site && address - (uintptr_t)site < (uintptr_t)length)
+                        expected[address - (uintptr_t)site] = code[j];
+                }
+            }
+        }
+        for (int j = 0; j < length; ++j) {
+            if (((const volatile unsigned char*)site)[j] != expected[j]) {
+                FL_ERR("相位边界门第 %d 处%s完整窗口不符 @ %08X+%d", i + 1,
+                       installed ? "写后" : "安装前", (unsigned)(uintptr_t)site, j);
+                return false;
+            }
+        }
+        int rel = 0;
+        memcpy(&rel, site + 1, sizeof rel);
+        if (site[0] != 0xE8 || (uintptr_t)site + 5 + rel != sim_gate_target(i, installed)) {
+            FL_ERR("相位边界门第 %d 处 call 目标不符", i + 1);
+            return false;
+        }
+    }
+    return true;
+}
+
+static int resolve_sim_gates(int targetFps, int logicFps, Sites& s) {
+    memset(s.simGate, 0, sizeof s.simGate);
+    memset(s.simGateOriginal, 0, sizeof s.simGateOriginal);
+    const bool supported = g_retailFps == 30 && logicFps == 15 &&
+        ((targetFps == 60 && g_ratio == 4) || (targetFps == 90 && g_ratio == 6));
+    if ((targetFps == 60 || targetFps == 90) && !supported) {
+        FL_ERR("60/90要求原生客户端30/逻辑15和精确倍率,当前帧率基准已被修改;拒绝安装");
+        return FL_ERR_FPS_GLOBALS;
+    }
+    s.simGateRequired = supported;
+    const bool requested = targetFps > g_retailFps && (g_groups & FL_G_SIMGATE) != 0;
+    s.simGateNeeded = s.simGateRequired || requested;
+    if (!s.simGateNeeded) return FL_OK;
+    if (!supported) {
+        FL_ERR("相位边界门仅支持零售30/逻辑15的60或90目标；当前 %d/%d → %d(r=%d)，拒绝该请求",
+               g_retailFps, logicFps, targetFps, g_ratio);
+        return FL_ERR_RATIO;
+    }
+    FL_INFO("相位边界门:请求 mask=0x%08X，显式位=%s，60/90自动必需=%s；核验三处 call",
+            (unsigned)g_groups, requested ? "开" : "关", s.simGateRequired ? "是" : "否");
+    for (int i = 0; i < 3; ++i) {
+        const Pattern& p = kSimGatePatterns[i];
+        s.simGate[i] = scan(p);
+        if (!s.simGate[i]) return FL_ERR_SIG_MISS;
+        if (s.simGate[i] == (unsigned char*)-1) return FL_ERR_SIG_AMBIGUOUS;
+        if (p.length > (int)sizeof s.simGateOriginal[i] || !mem::read_ok(s.simGate[i], (size_t)p.length))
+            return FL_ERR_SIG_MISMATCH;
+        for (int j = 0; j < p.length; ++j)
+            if (p.bytes[j] <= 0xFF && s.simGate[i][j] != (unsigned char)p.bytes[j]) return FL_ERR_SIG_MISMATCH;
+        memcpy(s.simGateOriginal[i], s.simGate[i], (size_t)p.length);
+    }
+    if (!verify_sim_gates(s, false)) return FL_ERR_SIG_MISMATCH;
+    // XfFlush 的上下文必须确实覆盖同一 Destroy call，不能接受另一个独立命中。
+    if (s.simGate[1] + 7 != s.simGate[2]) {
+        FL_ERR("变换冲刷与销毁 call 的相邻关系不符");
+        return FL_ERR_SIG_MISMATCH;
+    }
+    return FL_OK;
+}
+
+// 只读核对完整签名(操作数单独核对),同一判据用于干扫、冻结后预检查和写后复读。
+static bool verify_sim_pins(const Sites& s, unsigned wantOperand) {
+    unsigned floatBits = 0;
+    unsigned char floatBytes[sizeof floatBits];
+    const volatile unsigned char* constant = (const volatile unsigned char*)&g_simFps30;
+    for (size_t i = 0; i < sizeof floatBytes; ++i) floatBytes[i] = constant[i];
+    memcpy(&floatBits, floatBytes, sizeof floatBits);  // volatile 复读,不让 const 常量折叠替代现场值
+    if (floatBits != 0x41F00000u) {
+        FL_ERR("高度斜坡常量不是逐位 30.0 —— 拒绝安装");
+        return false;
+    }
+    for (int i = 0; i < 3; ++i) {
+        const Pattern& p = kSimPinPatterns[i];
+        const unsigned char* site = s.simPin[i];
+        if (!site || site == (unsigned char*)-1 || !mem::read_ok(site, (size_t)p.length)) {
+            FL_ERR("高度斜坡第 %d 处不可读 —— 拒绝安装", i + 1);
+            return false;
+        }
+        for (int j = 0; j < p.length; ++j) {
+            if (j >= 4 && j < 8) continue;
+            if (site[j] != (unsigned char)p.bytes[j]) {
+                FL_ERR("高度斜坡第 %d 处完整签名不符 @ %08X+%d —— 拒绝安装",
+                       i + 1, (unsigned)(uintptr_t)site, j);
+                return false;
+            }
+        }
+        unsigned operand = 0;
+        memcpy(&operand, site + 4, sizeof operand);
+        if (operand != wantOperand) {
+            FL_ERR("高度斜坡第 %d 处操作数 %08X != %08X —— 拒绝安装", i + 1, operand, wantOperand);
+            return false;
+        }
+    }
+    return true;
+}
+
+static int resolve_sim_pins(int targetFps, Sites& s) {
+    memset(s.simPin, 0, sizeof s.simPin);
+    s.simPinRequired = targetFps > g_retailFps && (g_groups & FL_G_DER_FPS) != 0;
+    s.simPinNeeded = s.simPinRequired || (targetFps > g_retailFps && (g_groups & FL_G_SIMPIN) != 0);
+    if (!s.simPinNeeded) return FL_OK;
+    FL_INFO("高度斜坡三处钉回 30.0:请求 mask=0x%08X,自动必需=%s,显式 SIMPIN=%s(候选,未认证跨 FPS 同步)",
+            (unsigned)g_groups, s.simPinRequired ? "是(高 FPS 将改共享 DER_FPS)" : "否",
+            (g_groups & FL_G_SIMPIN) ? "开" : "关");
+    for (int i = 0; i < 3; ++i) {
+        s.simPin[i] = scan(kSimPinPatterns[i]);
+        if (!s.simPin[i]) return FL_ERR_SIG_MISS;
+        if (s.simPin[i] == (unsigned char*)-1) return FL_ERR_SIG_AMBIGUOUS;
+    }
+    if (!verify_sim_pins(s, (unsigned)kEngineFpsFloatVa)) return FL_ERR_SIG_MISMATCH;
+    FL_INFO("高度斜坡三处原签名与 CDBC50 操作数已全部核验(只读)");
+    return FL_OK;
+}
 
 static bool add_redirect(Sites& s, void** operand, const char* name, int group, void* newTarget = NULL) {
     if (s.redirectCount >= (int)(sizeof s.redirect / sizeof s.redirect[0])) {
@@ -1954,6 +2718,11 @@ static int resolve_and_verify(int targetFps, Sites& s) {
     }
     FL_INFO("目标:客户端 %d 帧,逻辑 %d 帧,r = %d(每 %d 个客户端帧跑满 6 个阶段)",
             targetFps, logicFps, g_ratio, g_ratio);
+
+    const int rcSimPin = resolve_sim_pins(targetFps, s);
+    if (rcSimPin != FL_OK) return rcSimPin;
+    const int rcSimGate = resolve_sim_gates(targetFps, logicFps, s);
+    if (rcSimGate != FL_OK) return rcSimGate;
 
     // ★改之前先核对这三处操作数现在指向什么:地址对不上或数值不对,说明我们认错了地方,宁可不装。
     {
@@ -2294,7 +3063,12 @@ static int resolve_and_verify(int targetFps, Sites& s) {
 // 干扫:把安装前的全部检查跑一遍,一个字节都不改。用户报错时先让他跑这个,日志直接指出断在哪一步。
 static int dry_run(int targetFps) {
     FL_INFO("──── 干扫开始(只检查,不改游戏任何字节)────");
-    Sites s;
+    if (g_installed) {
+        FL_WARN("已安装时不重新解析目标或比例；先关闭再干扫");
+        return FL_ERR_ALREADY;
+    }
+    if (g_patchPoisoned || g_undoCount != 0) return FL_ERR_WRITE;
+    Sites s = {};
     const int rc = resolve_and_verify(targetFps, s);
     if (rc == FL_OK) {
         FL_INFO("干扫通过:六处补丁点全部唯一命中且数值正确,可以安装 %d 帧", targetFps);
@@ -2315,6 +3089,13 @@ static int dry_run(int targetFps) {
 // ★为什么要拆出来:要拿同一把尺子去量**别人已经打过补丁的二进制**(比如社区的 60 帧成品),
 // 而那份二进制的粒子常量等数值已经被他改过,走完整校对会被拒装 ⇒ 就量不成了。
 static int resolve_perframe_only(Sites& s) {
+    memset(s.simPin, 0, sizeof s.simPin);
+    s.simPinNeeded = false;
+    s.simPinRequired = false;  // measure 维持零售帧率,不改 DER_FPS,无需高度读者重定向
+    memset(s.simGate, 0, sizeof s.simGate);
+    memset(s.simGateOriginal, 0, sizeof s.simGateOriginal);
+    s.simGateNeeded = false;
+    s.simGateRequired = false;
     if (!resolve_module()) { FL_ERR("拿不到主模块或不是 32 位 PE"); return FL_ERR_BAD_PE; }
     log_environment();
     Pattern pPerFrame = {"逐帧推进块", kSigPerFrame, (int)(sizeof kSigPerFrame / sizeof(short)), 0x00602851};
@@ -2337,8 +3118,11 @@ static int resolve_perframe_only(Sites& s) {
 }
 
 static int install(int targetFps, bool measureOnly) {
+    if (g_patchPoisoned || g_undoCount != 0) {
+        FL_ERR("存在未完成的还原,拒绝再次安装;请关闭补丁重试还原或重启游戏"); return FL_ERR_WRITE;
+    }
     if (g_installed) { FL_WARN("已经安装过了,忽略"); return FL_ERR_ALREADY; }
-    Sites s;
+    Sites s = {};
     const int rcPrepare = measureOnly ? resolve_perframe_only(s) : resolve_and_verify(targetFps, s);
     if (rcPrepare != FL_OK) { log_error_legend(); return rcPrepare; }
     targetFps = g_targetFps;   // resolve_and_verify 里做过归一化(<=0 视为 60),这里要拿归一化后的值
@@ -2361,7 +3145,17 @@ static int install(int targetFps, bool measureOnly) {
     g_scroll100 = 100.0f * (float)g_retailFps / (float)(targetFps > 0 ? targetFps : g_retailFps);
     g_scrollOn  = false;
 
+    log::PatchLogLock logLock;
     mem::ThreadFreezer freeze;   // 改代码期间别让别的线程跑到这些字节上
+    if (!freeze.ready) { FL_ERR("未能挂起完整线程快照,拒绝写补丁"); return FL_ERR_SUSPEND; }
+    if (s.simPinNeeded && !verify_sim_pins(s, (unsigned)kEngineFpsFloatVa)) {
+        FL_ERR("高度斜坡安装前复核失败 —— 尚未写任何游戏补丁");
+        return FL_ERR_SIG_MISMATCH;
+    }
+    if (s.simGateNeeded && !verify_sim_gates(s, false)) {
+        FL_ERR("相位边界门安装前复核失败；尚未写任何游戏补丁");
+        return FL_ERR_SIG_MISMATCH;
+    }
     FL_INFO("已挂起其它线程 %d 个,开始写补丁", freeze.count);
 
     bool ok = true;
@@ -2702,6 +3496,160 @@ static int install(int targetFps, bool measureOnly) {
         }
     }
 
+    // Paired pool/vertex candidate only with PSYS and the 60/90 targets.
+    // Verify BOTH native calls before patching either. Never install visual2's
+    // standalone lifetime change when the upload half cannot be confirmed.
+    g_glowOn = false; g_glowSeen = 0; g_glowAdjusted = 0; g_glowSkipped = 0;
+    g_glowVertexCalls = 0; g_glowVertexAdjusted = 0; g_glowVertexSkipped = 0;
+    memset((void*)g_glowVertexRejected, 0, sizeof g_glowVertexRejected);
+    memset((void*)g_powerGlowStats, 0, sizeof g_powerGlowStats);
+    g_glowVertexTraceCount = g_glowVertexTraceLogged = 0;
+    if (ok && !measureOnly && (g_groups & FL_G_PSYS) &&
+        (targetFps == 60 || targetFps == 90)) {
+        Pattern pGlow = {"建筑光团 GPU 构造调用", kSigGpuGlowCtor,
+                         (int)(sizeof kSigGpuGlowCtor / sizeof kSigGpuGlowCtor[0]), 0x006D2635};
+        Pattern pVertices = {"GPU 粒子顶点上传调用", kSigGpuGlowVertices,
+                             (int)(sizeof kSigGpuGlowVertices / sizeof kSigGpuGlowVertices[0]), 0x006C6C8D};
+        unsigned char* hit = scan(pGlow);
+        unsigned char* vertexHit = scan(pVertices);
+        ok = g_psOn && hit && hit != (unsigned char*)-1 &&
+            vertexHit && vertexHit != (unsigned char*)-1;
+        if (ok) {
+            unsigned char* call = hit + 11;
+            unsigned char* vertexCall = vertexHit + 4;
+            void* original = call + 5 + *(int*)(call + 1);
+            void* vertexOriginal = vertexCall + 5 + *(int*)(vertexCall + 1);
+            ok = original == (void*)kEngineGpuCtorVa && vertexOriginal == (void*)kEngineGpuVerticesVa;
+            if (ok) {
+                unsigned char code[5] = {0xE8,0,0,0,0};
+                const int rel = (int)((unsigned char*)&fl_wrap_gpu_ctor - (call + 5));
+                memcpy(code + 1, &rel, sizeof rel);
+                g_glowOrigFn = original;
+                g_glowVerticesOrigFn = vertexOriginal;
+                g_glowOn = true;
+                ok = patch(call, code, sizeof code, "建筑光团池存活保持(限定三个零售模板)");
+                const int vertexRel = (int)((unsigned char*)&fl_wrap_gpu_vertices - (vertexCall + 5));
+                memcpy(code + 1, &vertexRel, sizeof vertexRel);
+                if (ok) ok = patch(vertexCall, code, sizeof code, "建筑光团 GPU 可见寿命(池末步前裁剪)");
+                if (ok) FL_INFO("建筑光团交接已装 @%08X / %08X；苏联/帝国矿场 pool=16 visible=15.75，帝国电厂 pool=2 visible=1.75；仅三个零售五顶点模板；出生与发射/RNG 不改；需画面验收",
+                                (unsigned)(uintptr_t)call, (unsigned)(uintptr_t)vertexCall);
+            }
+        }
+        if (!ok) FL_ERR("建筑光团交接:PSYS 门或 GPU 构造/上传调用未确认，拒绝安装并回滚");
+    }
+
+    // Continuous display progress in a single logic-clock domain. This is one
+    // display-only call; no shared function entry, x87 window or mode-1 changes.
+    g_constructionSites = 0; g_constructionOn = false; g_constructionClamps = 0;
+    g_constructionCalls = 0; g_constructionInactive = 0;
+    g_constructionPrepared = 0; g_constructionPrepareCalls = 0;
+    g_constructionMatched = g_constructionSameStamp = g_constructionPrimeRefused = 0;
+    g_constructionModelTraceCount = g_constructionModelTraceLogged = 0;
+    memset(g_constructionModelRecent, 0, sizeof g_constructionModelRecent);
+    memset(g_constructionLastDraw, 0, sizeof g_constructionLastDraw);
+    g_constructionTraceCount = g_constructionTraceLogged = 0;
+    memset(g_constructionRecent, 0, sizeof g_constructionRecent);
+    memset(g_wallFirstDisplay, 0, sizeof g_wallFirstDisplay);
+    g_wallBorn = g_wallSceneHidden = g_wallRenderHeld = g_wallReleased = 0;
+    g_wallOverflow = g_wallPreview = g_wallStale = 0;
+    g_wallHolding = 0;
+    g_wallTraceCount = g_wallTraceLogged = 0;
+    if (ok && !measureOnly && targetFps > g_retailFps &&
+        (g_groups & FL_G_RATIO) && (g_groups & FL_G_DER_FPMS)) {
+        Pattern pConstruction = {"施工显示进度专用调用", kSigConstructionVisualCall,
+                                 (int)(sizeof kSigConstructionVisualCall / sizeof kSigConstructionVisualCall[0]), 0x006FD58D};
+        Pattern pModel = {"首次绘制施工动画初始化", kSigConstructionModelPrepare,
+                         (int)(sizeof kSigConstructionModelPrepare / sizeof kSigConstructionModelPrepare[0]), 0x0090F89C};
+        Pattern pObject = {"对象施工显示进度函数", kSigConstructionObjectProgress,
+                          (int)(sizeof kSigConstructionObjectProgress / sizeof kSigConstructionObjectProgress[0]), 0x006FD550};
+        Pattern pWallDefault = {"围墙默认模型创建调用", kSigWallDefaultModel,
+                          (int)(sizeof kSigWallDefaultModel / sizeof kSigWallDefaultModel[0]), 0x0090D5E0};
+        Pattern pWallScene = {"模型加入场景调用", kSigWallSceneAdd,
+                          (int)(sizeof kSigWallSceneAdd / sizeof kSigWallSceneAdd[0]), 0x0090CDC2};
+        Pattern pWallMc = {"原生模型状态接收函数", kSigWallNativeModel,
+                          (int)(sizeof kSigWallNativeModel / sizeof kSigWallNativeModel[0]), 0x0090CE60};
+        Pattern pWallAlpha = {"模型渲染透明度调用", kSigWallRenderAlpha,
+                          (int)(sizeof kSigWallRenderAlpha / sizeof kSigWallRenderAlpha[0]), 0x0090FA54};
+        unsigned char* hit = scan(pConstruction);
+        unsigned char* model = scan(pModel);
+        unsigned char* objectProgress = scan(pObject);
+        unsigned char* wallDefault = scan(pWallDefault);
+        unsigned char* wallScene = scan(pWallScene);
+        unsigned char* wallMc = scan(pWallMc);
+        unsigned char* wallAlpha = scan(pWallAlpha);
+        ok = hit && hit != (unsigned char*)-1 && model && model != (unsigned char*)-1 &&
+             objectProgress && objectProgress != (unsigned char*)-1 && objectProgress + 61 == hit &&
+             wallDefault && wallDefault != (unsigned char*)-1 &&
+             wallScene && wallScene != (unsigned char*)-1 &&
+             wallMc && wallMc != (unsigned char*)-1 && wallAlpha && wallAlpha != (unsigned char*)-1;
+        if (ok) {
+            unsigned char* call = hit + 9;
+            void* original = call + 5 + *(int*)(call + 1);
+            unsigned char* animateCall = model + 22;
+            void* animate = animateCall + 5 + *(int*)(animateCall + 1);
+            unsigned char* defaultCall = wallDefault + 8;
+            unsigned char* sceneCall = wallScene + 19;
+            unsigned char* alphaCall = wallAlpha + 15;
+            void* modelFn = defaultCall + 5 + *(int*)(defaultCall + 1);
+            void* sceneFn = sceneCall + 5 + *(int*)(sceneCall + 1);
+            void* alphaFn = alphaCall + 5 + *(int*)(alphaCall + 1);
+            ok = original == (void*)0x006F6CB0 && animate == (void*)0x0090ECF0 &&
+                 modelFn == (void*)0x0090C3A0 && sceneFn == (void*)0x009B2E50 &&
+                 alphaFn == (void*)0x008E9D10 && wallMc == (unsigned char*)0x0090CE60;
+            if (ok) {
+                unsigned char code[5] = {0xE8,0,0,0,0};
+                const int rel = (int)((unsigned char*)&fl_wrap_construction_progress - (call + 5));
+                memcpy(code + 1, &rel, 4);
+                g_constructionOrigFn = original;
+                g_constructionObjectProgressFn = objectProgress;
+                g_constructionAnimateFn = animate;
+                g_wallModelFn = modelFn; g_wallSceneFn = sceneFn; g_wallAlphaFn = alphaFn;
+                g_wallMcResume = wallMc + 5; g_wallMcFn = (void*)&fl_wall_mc_trampoline;
+                g_constructionOn = true;
+                ok = patch(call, code, sizeof code, "施工显示进度(逻辑时间 + 连续插值)");
+            }
+            if (ok) ++g_constructionSites;
+            if (ok) {
+                unsigned char code[20]; memset(code, 0x90, sizeof code);
+                code[0] = 0x8B; code[1] = 0xCE; code[2] = 0xE8; // mov ecx,esi; call wrapper
+                const int rel = (int)((unsigned char*)&fl_wrap_construction_prepare - (model + 7 + 7));
+                memcpy(code + 3, &rel, 4);
+                ok = patch(model + 7, code, sizeof code, "同戳施工模型初始动画补算");
+            }
+            if (ok) ++g_constructionSites;
+            if (ok) {
+                unsigned char code[5] = {0xE8,0,0,0,0};
+                int rel = (int)((unsigned char*)&fl_wrap_wall_default - (defaultCall + 5));
+                memcpy(code + 1, &rel, 4);
+                ok = patch(defaultCall, code, sizeof code, "围墙默认模型首显登记");
+            }
+            if (ok) ++g_constructionSites;
+            if (ok) {
+                unsigned char code[5] = {0xE8,0,0,0,0};
+                int rel = (int)((unsigned char*)&fl_wrap_wall_scene - (sceneCall + 5));
+                memcpy(code + 1, &rel, 4);
+                ok = patch(sceneCall, code, sizeof code, "围墙未初始化模型入场透明度");
+            }
+            if (ok) ++g_constructionSites;
+            if (ok) {
+                unsigned char code[5] = {0xE9,0,0,0,0};
+                int rel = (int)((unsigned char*)&fl_wrap_wall_mc - (wallMc + 5));
+                memcpy(code + 1, &rel, 4);
+                ok = patch(wallMc, code, sizeof code, "围墙原生模型状态完成后解除首显保护");
+            }
+            if (ok) ++g_constructionSites;
+            if (ok) {
+                unsigned char code[5] = {0xE8,0,0,0,0};
+                int rel = (int)((unsigned char*)&fl_wrap_wall_alpha - (alphaCall + 5));
+                memcpy(code + 1, &rel, 4);
+                ok = patch(alphaCall, code, sizeof code, "围墙首显等待原生模型与动画初始化");
+            }
+            if (ok) ++g_constructionSites;
+            if (ok) FL_INFO("施工显示六处已装:逻辑时间 + 连续插值、同戳初始动画处理、围墙默认模型首显保护；仅六种零售墙件，预览旗标 8 保持原生；等待原生模型状态通知完成才显示；需手动验收");
+        }
+        if (!ok) FL_ERR("施工显示专用调用未确认，候选版拒绝安装并回滚");
+    }
+
     // ── ★★★ 战役过场运镜计时(默认关;2026-09-26)。16 处操作数改指,全中才装。──────────────────────
     g_camOn = false; g_camSites = 0;
     if (ok && !measureOnly && (g_groups & FL_G_CAMERA)) {
@@ -2847,62 +3795,35 @@ static int install(int targetFps, bool measureOnly) {
         }
     }
 
-    // ── ★★★ FL_G_SIMPIN(默认关;2026-09-28):运动器高度斜坡的三处 flt_CDBC50 读者钉回 30.0 ─────────────
+    // 高 FPS 改共享 DER_FPS 时自动必需;显式 SIMPIN 仍保留,三处必须整套核验与安装。
     g_simPinSites = 0;
-    if (ok && !measureOnly && (g_groups & FL_G_SIMPIN) && targetFps > g_retailFps) {
-        Pattern pSimPin0 = {"高度斜坡 初值(sub_73ABC0)", kSigSimPin0, (int)(sizeof kSigSimPin0 / sizeof kSigSimPin0[0]), 0x0073AC7C};
-        Pattern pSimPin1 = {"高度斜坡 消费(sub_715ED0)", kSigSimPin1, (int)(sizeof kSigSimPin1 / sizeof kSigSimPin1[0]), 0x00715FD9};
-        Pattern pSimPin2 = {"高度斜坡 消费(sub_778AA0)", kSigSimPin2, (int)(sizeof kSigSimPin2 / sizeof kSigSimPin2[0]), 0x00778B4B};
-        unsigned char* pins[3] = { scan(pSimPin0), scan(pSimPin1), scan(pSimPin2) };
-        int nOk = 0;
-        for (int i = 0; i < 3; ++i)
-            if (pins[i] && pins[i] != (unsigned char*)-1 && *(unsigned*)(pins[i] + 4) == (unsigned)kEngineFpsFloatVa) ++nOk;
-        if (nOk != 3) {
-            FL_WARN("模拟侧常量钉住:3 处只核对上 %d 处 —— 一处都不改。", nOk);
-        } else {
-            const void* p = (const void*)&g_simFps30;
-            for (int i = 0; ok && i < 3; ++i) {
-                ok = patch(pins[i] + 4, &p, 4, "高度斜坡 flt_CDBC50 → 常量 30");
-                if (ok) ++g_simPinSites;
-            }
-            if (ok) FL_INFO("  模拟侧常量钉住已装:高度斜坡 3 处改读常量 30.0(与原版逐位相同)");
+    if (ok && !measureOnly && s.simPinNeeded) {
+        const void* p = (const void*)&g_simFps30;
+        for (int i = 0; ok && i < 3; ++i) {
+            ok = patch(s.simPin[i] + 4, &p, 4, "高度斜坡 flt_CDBC50 → 常量 30");
+            if (ok) ++g_simPinSites;
         }
+        if (ok) ok = g_simPinSites == 3 && verify_sim_pins(s, (unsigned)(uintptr_t)p);
+        if (ok) FL_INFO("  高度斜坡 3 处改读常量 30.0 并逐位复读:自动必需=%s,请求 SIMPIN=%s(跨 FPS 同步待实测)",
+                        s.simPinRequired ? "是" : "否", (g_groups & FL_G_SIMPIN) ? "开" : "关");
+        else FL_ERR("高度斜坡三处写后核验失败 —— 将整体回滚");
     }
 
-    // ── ★★★ FL_G_SIMGATE(默认关;2026-09-28):客户端帧开头的三件模拟工作按原版相位边界放行 ───────────────
+    // 规范60/90自动要求三处边界门，显式请求不能降级为缺少调用点仍成功。
     g_simGateSites = 0; g_simGateOn = false; g_simGateHeld = 0;
-    if (ok && !measureOnly && (g_groups & FL_G_SIMGATE) && targetFps > g_retailFps) {
-        if (!fl_sim_gate_exact(g_ratio)) {
-            FL_WARN("相位边界门:目标 %d 帧(r = %d)的客户端帧边界里没有阶段 3,做不到与原版逐位等价 —— 不装。联机请用 60 或 90 帧。",
-                    targetFps, g_ratio);
-        } else {
-            // 三处**先全部扫完再改**:XfFlushCall 的特征里含着 DestroyCall 那条 call 的原 rel32。
-            Pattern pMcSyncCall  = {"ModelCondition 同步调用点", kSigMcSyncCall, (int)(sizeof kSigMcSyncCall / sizeof kSigMcSyncCall[0]), 0x0062666B};
-            Pattern pXfFlushCall = {"变换冲刷调用点", kSigXfFlushCall, (int)(sizeof kSigXfFlushCall / sizeof kSigXfFlushCall[0]), 0x006266F7};
-            Pattern pDestroyCall = {"销毁表调用点", kSigDestroyCall, (int)(sizeof kSigDestroyCall / sizeof kSigDestroyCall[0]), 0x006266FE};
-            unsigned char* site[3] = { scan(pMcSyncCall), scan(pXfFlushCall), scan(pDestroyCall) };
-            const uintptr_t want[3] = { kEngineMcSyncVa, kEngineXfFlushVa, kEngineDestroyVa };
-            void* wrap[3] = { (void*)&fl_wrap_mcsync, (void*)&fl_wrap_xfflush, (void*)&fl_wrap_destroy };
-            int nOk = 0;
-            for (int i = 0; i < 3; ++i)
-                if (site[i] && site[i] != (unsigned char*)-1 && site[i][0] == 0xE8 &&
-                    (uintptr_t)(site[i] + 5 + *(int*)(site[i] + 1)) == want[i]) ++nOk;
-            if (nOk != 3) {
-                FL_WARN("相位边界门:3 处调用点只核对上 %d 处 —— 一处都不改。", nOk);
-            } else {
-                for (int i = 0; ok && i < 3; ++i) {
-                    unsigned char code[5];
-                    code[0] = 0xE8;
-                    const int rel = (int)((unsigned char*)wrap[i] - (site[i] + 5));
-                    memcpy(code + 1, &rel, 4);
-                    ok = patch(site[i], code, 5, "相位边界门(只改 call 目标)");
-                    if (ok) ++g_simGateSites;
-                }
-                g_simGateOn = ok && g_simGateSites == 3;
-                if (g_simGateOn)
-                    FL_INFO("  相位边界门已装:ModelCondition 同步 / 变换冲刷 只在阶段 3、6 之后,销毁表只在阶段 6 之后(r = %d)", g_ratio);
-            }
+    if (ok && !measureOnly && s.simGateNeeded) {
+        for (int i = 0; ok && i < 3; ++i) {
+            unsigned char code[5];
+            sim_gate_call_bytes(s.simGate[i], sim_gate_target(i, true), code);
+            ok = patch(s.simGate[i], code, 5, "相位边界门(只改 call 目标)");
+            if (ok) ++g_simGateSites;
         }
+        if (ok) ok = g_simGateSites == 3 && verify_sim_gates(s, true);
+        g_simGateOn = ok && g_simGateSites == 3;
+        if (g_simGateOn)
+            FL_INFO("  相位边界门三处写后已复读：自动必需=%s，阶段3/6冲刷与阶段6销毁(r=%d)；有限实测范围外仍待验证",
+                    s.simGateRequired ? "是" : "否", g_ratio);
+        else FL_ERR("相位边界门写后不完整；进入原安装失败处理");
     }
 
     // ── ★ 状态图标乒乓动画(默认关;2026-09-22)。一处 4 字节:除数 30 → 目标帧率。
@@ -3012,11 +3933,39 @@ static int install(int targetFps, bool measureOnly) {
         }
     }
 
+    if (ok && !measureOnly && s.simPinNeeded)
+        ok = g_simPinSites == 3 && verify_sim_pins(s, (unsigned)(uintptr_t)&g_simFps30);
+    if (ok && !measureOnly && s.simGateNeeded)
+        ok = g_simGateOn && g_simGateSites == 3 && verify_sim_gates(s, true);
+
     if (!ok) {
-        FL_ERR("安装失败,正在整体回滚(不留半套补丁)");
-        rollback();
+        FL_ERR("安装失败，尝试按撤销表还原；还原结果单独核验");
+        const int bad = rollback();
+        if (bad == 0) {
+            g_constructionSites = 0;
+            g_constructionOn = false;
+            g_glowOn = false;
+            g_psSite = NULL; g_psOn = false;
+            g_visPhaseOn = false;
+            g_simPinSites = 0;
+            g_simGateSites = 0;
+            g_simGateOn = false;
+            memset(&g_simInstalled, 0, sizeof g_simInstalled);
+        } else {
+            FL_ERR("仍有 %d 处还原失败；保留包装状态与撤销记录，拒绝再次安装", bad);
+        }
         return FL_ERR_WRITE;
     }
+    // measure-only不解析调度目标；0表示未设置，不能沿用之前干扫的目标。
+    g_simInstalled.targetFps = measureOnly ? 0 : targetFps;
+    g_simInstalled.ratio = measureOnly ? 0 : g_ratio;
+    g_simInstalled.retailFps = measureOnly ? 0 : g_retailFps;
+    g_simInstalled.requestedGroups = (unsigned)g_groups;
+    g_simInstalled.measureOnly = measureOnly;
+    g_simInstalled.pinNeeded = s.simPinNeeded;
+    g_simInstalled.pinRequired = s.simPinRequired;
+    g_simInstalled.gateNeeded = s.simGateNeeded;
+    g_simInstalled.gateRequired = s.simGateRequired;
     g_installed = true;
     g_frameCount = 0;
     FL_INFO("撤销表用量 %d / %d 处", g_undoCount, kUndoMax);
@@ -3091,10 +4040,14 @@ static int install(int targetFps, bool measureOnly) {
 }
 
 static int uninstall() {
-    if (!g_installed) return FL_ERR_NOT_INSTALLED;
+    if (!g_installed && g_undoCount == 0) return FL_ERR_NOT_INSTALLED;
+    log::PatchLogLock logLock;
     mem::ThreadFreezer freeze;
+    if (!freeze.ready) { FL_ERR("未能挂起完整线程快照,拒绝卸载写入"); return FL_ERR_SUSPEND; }
     FL_INFO("开始卸载,挂起其它线程 %d 个", freeze.count);
-    rollback();
+    if (rollback() != 0) {
+        FL_ERR("卸载还原失败,保留撤销记录和包装状态;请重启游戏"); return FL_ERR_WRITE;
+    }
     // 车身外观包装的 call 已被撤销表还原 ⇒ 登记也要清掉,否则 chassisrate 会把「已卸载」
     // 报成「装着但没数据」(「没装」与「没采到」必须是两句不同的话)。g_chsOrigFn 故意**不清**:
     // 万一有线程此刻正停在包装函数里,它醒来后还要用它转发一次。
@@ -3102,9 +4055,11 @@ static int uninstall() {
     g_scrollOn = false;
     g_trcSite = NULL; g_trcOn = false;
     g_psSite = NULL; g_psOn = false;
+    g_glowOn = false; g_constructionSites = 0; g_constructionOn = false;
     g_camSites = 0; g_camOn = false;
     g_tintSites = 0; g_tintOn = false;
     g_visPhaseOn = false; g_simPinSites = 0; g_simGateSites = 0; g_simGateOn = false;
+    memset(&g_simInstalled, 0, sizeof g_simInstalled);
     g_installed = false;
     FL_INFO("已卸载,全部字节还原");
     return FL_OK;
@@ -3113,7 +4068,11 @@ static int uninstall() {
 
 // ───────────────────────────── 导出接口 ─────────────────────────────
 extern "C" __declspec(dllexport) int __stdcall FrameLabEnable(int targetFps) {
+    api::PatchGuard transaction;
     FL_INFO("收到启用请求,目标帧率 %d", targetFps);
+    if (fl::g_patchPoisoned) return FL_ERR_WRITE;
+    if (fl::g_installed) return FL_ERR_ALREADY;
+    if (fl::g_undoCount != 0) return FL_ERR_WRITE;
     fl::g_measureOnly = false;
     const int rc = fl::install(targetFps, false);
     FL_INFO("启用结果 = %d", rc);
@@ -3129,6 +4088,10 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabEnable(int targetFps) {
 // ★为什么必须有它:新判据(逐字节 memcmp)如果从没红过,我就不知道它有没有资格当判据 ——
 //   而这里注入的正是它要防的那个病:**写入报告成功,字节却没变**。
 extern "C" __declspec(dllexport) int __stdcall FrameLabSelfTestRollback() {
+    api::PatchGuard transaction;
+    if (fl::g_installed || fl::g_undoCount != 0 || fl::g_patchPoisoned) {
+        FL_ERR("还原自检仅允许在没有游戏补丁或待还原记录时运行"); return 0;
+    }
     static unsigned char target[16];
     unsigned char original[16], modified[16];
     memset(original, 0xA5, sizeof original);
@@ -3136,8 +4099,6 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabSelfTestRollback() {
     memcpy(target, original, sizeof target);
 
     int result = 0;
-    const int savedUndo = fl::g_undoCount;
-    fl::g_undoCount = 0;
 
     // ① 诚实路径:改掉再还原,核验应当通过,且字节确实回到 0xA5
     if (fl::patch(target, modified, (int)sizeof modified, "自检·诚实路径")) {
@@ -3146,20 +4107,39 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabSelfTestRollback() {
         else FL_ERR("自检①失败:bad=%d,字节%s回到原样", bad,
                     memcmp(target, original, sizeof target) == 0 ? "" : "未");
     }
+    if (fl::g_undoCount != 0 && fl::rollback() != 0) return result;
 
     // ② 故障注入:让写入**谎称成功**(模拟"动作报成功但字节没变")—— 闸门必须当场报红
-    fl::g_undoCount = 0;
     memcpy(target, original, sizeof target);
     if (fl::patch(target, modified, (int)sizeof modified, "自检·故障注入")) {
         fl::g_selfTestNoWrite = true;
         const int bad = fl::rollback();
         fl::g_selfTestNoWrite = false;
-        if (bad == 1) result |= 2;
+        if (bad == 1 && fl::g_undoCount == 1 && fl::g_patchPoisoned) result |= 2;
         else FL_ERR("★自检②:注入了故障但闸门**没红**(bad=%d)—— 这道闸门不合格", bad);
-        memcpy(target, original, sizeof target);   // 自己收拾干净
+        if (fl::install(60, false) == FL_ERR_WRITE) result |= 0x20;
+        if (fl::rollback() == 0 && fl::g_undoCount == 0 && !fl::g_patchPoisoned &&
+            memcmp(target, original, sizeof target) == 0) result |= 0x40;
     }
+    if (fl::g_undoCount != 0 && fl::rollback() != 0) return result;
 
-    fl::g_undoCount = savedUndo;
+    // Exercise the same patch/undo path on owned data, including a write that
+    // changed bytes before reporting failure and a protection restore failure.
+    for (int fault = 1; fault <= 4; ++fault) {
+        MEMORY_BASIC_INFORMATION beforeProtect, afterProtect;
+        if (!VirtualQuery(target, &beforeProtect, sizeof beforeProtect)) break;
+        mem::g_writeFault = fault;
+        const bool patched = fl::patch(target, modified, (int)sizeof modified, "自检·写入故障");
+        const bool retained = !patched && fl::g_undoCount == 1;
+        const int bad = fl::rollback();
+        const bool restored = bad == 0 && fl::g_undoCount == 0 && !fl::g_patchPoisoned &&
+            memcmp(target, original, sizeof target) == 0 &&
+            VirtualQuery(target, &afterProtect, sizeof afterProtect) != 0 &&
+            afterProtect.Protect == beforeProtect.Protect;
+        if (retained && restored) result |= fault == 1 ? 4 : fault == 2 ? 8 : fault == 3 ? 16 : 128;
+        if (bad != 0) break;
+    }
+    mem::g_writeFault = 0;
     FL_INFO("还原核验闸门自检:诚实路径=%s 故障注入=%s",
             (result & 1) ? "通过" : "★失败", (result & 2) ? "抓到了" : "★没抓到");
     return result;
@@ -3183,6 +4163,10 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabSelfTestRollback() {
 //
 // 返回位掩码:bit(r-2) 置 1 = 该 r 通过;bit5(0x20) = 自检资格成立。全通过 = 0x3F。
 extern "C" __declspec(dllexport) int __stdcall FrameLabSelfTestClock() {
+    api::PatchGuard transaction;
+    if (fl::g_installed || fl::g_undoCount != 0 || fl::g_patchPoisoned) {
+        FL_ERR("时钟自检仅允许在补丁未安装且无待还原记录时运行"); return 0;
+    }
     const int savedAcc   = fl::g_clockAcc;
     const int savedWant  = fl::g_clockWant;
     const int savedMs    = fl::g_msPerFrame;
@@ -3233,6 +4217,11 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabSelfTestClock() {
 }
 
 extern "C" __declspec(dllexport) int __stdcall FrameLabSetGroups(int mask) {
+    api::PatchGuard transaction;
+    if (fl::g_installed || fl::g_patchPoisoned || fl::g_undoCount != 0) {
+        FL_WARN("补丁已安装或待还原,保留当前分组0x%X;分组必须在启用前设置", fl::g_groups);
+        return fl::g_groups;
+    }
     fl::g_groups = (mask <= 0) ? FL_G_ALL : (mask & FL_G_EVERYTHING);
     FL_INFO("改动分组掩码设为 0x%04X", fl::g_groups);
     FL_INFO("  算r=%s 除帧率=%s 未确认两处=%s 批次=%s 系数=%s 粒子=%s 视觉步长=%s 逐帧=%s",
@@ -3300,13 +4289,13 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabSetGroups(int mask) {
             (fl::g_groups & FL_G_TRACER)
                 ? "(生成密度 / 伸展 / 移动钉回每秒 30 步 —— 开火不再像机关枪;未经实机验证)"
                 : "(默认:弹道流每秒生成条数是原版的 2/3 倍)");
-    FL_INFO("  模拟侧常量钉住(高度斜坡)=%s%s",
+    FL_INFO("  显式 SIMPIN(高度斜坡)请求=%s%s",
             (fl::g_groups & FL_G_SIMPIN) ? "开" : "关",
-            (fl::g_groups & FL_G_SIMPIN) ? "(联机安全修正 R-1;未经实机验证)" : "(默认:高度斜坡长度随本机帧率,联机会分歧)");
-    FL_INFO("  相位边界门=%s%s",
+            (fl::g_groups & FL_G_SIMPIN) ? "(高于零售帧率时要求三处核验并钉回 30.0;同步待实测)"
+                                      : "(高 FPS 改共享 DER_FPS 时仍自动要求三处钉回 30.0;无需设置此位)");
+    FL_INFO("  相位边界门显式请求=%s%s",
             (fl::g_groups & FL_G_SIMGATE) ? "开" : "关",
-            (fl::g_groups & FL_G_SIMGATE) ? "(联机安全修正 R-2/R-3/R-6a;只在 60 / 90 帧生效;未经实机验证)"
-                                          : "(默认:销毁表 / 变换冲刷 / ModelCondition 同步随 r 换位置,联机会分歧)");
+            "(规范零售30/逻辑15的60/90自动要求三处核验与安装，不依赖此位；装齐不代表所有对局同步已验证)");
     FL_INFO("  单位闪烁 / 染色计时=%s%s",
             (fl::g_groups & FL_G_TINT) ? "开" : "关",
             (fl::g_groups & FL_G_TINT)
@@ -3357,7 +4346,11 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabSetGroups(int mask) {
 }
 
 extern "C" __declspec(dllexport) int __stdcall FrameLabMeasureOnly() {
+    api::PatchGuard transaction;
     FL_INFO("收到「只量不改」请求(基线组)");
+    if (fl::g_patchPoisoned) return FL_ERR_WRITE;
+    if (fl::g_installed) return FL_ERR_ALREADY;
+    if (fl::g_undoCount != 0) return FL_ERR_WRITE;
     fl::g_measureOnly = true;
     const int rc = fl::install(0, true);
     FL_INFO("只量不改结果 = %d", rc);
@@ -3372,7 +4365,11 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabMeasureOnly() {
 // 这个入口一次把两件事做完:设 measureOnly、设 groups、再 install。
 // groups 里目前只期望 FL_G_ANIMPROBE(只读尺子,不改任何数据)。
 extern "C" __declspec(dllexport) int __stdcall FrameLabMeasureOnlyEx(int groups) {
+    api::PatchGuard transaction;
     FL_INFO("收到「只量不改」请求(groups=0x%X)", (unsigned)groups);
+    if (fl::g_patchPoisoned) return FL_ERR_WRITE;
+    if (fl::g_installed) return FL_ERR_ALREADY;
+    if (fl::g_undoCount != 0) return FL_ERR_WRITE;
     fl::g_measureOnly = true;
     if (groups) fl::g_groups = (unsigned)groups;
     const int rc = fl::install(0, true);
@@ -3607,20 +4604,22 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabTracerStatus() {
     return 1000000 + ratio;
 }
 
-// FrameLabSimStatus():2026-09-28 可见性 / 联机修正的状态。0 = 没装;否则按位:1 = 迷雾可见性相位已改回原版语义,
-//   2 = 高度斜坡已钉住(3/3),4 = 相位边界门已装(3/3),8 = R4 保持原版。-2 = 请求了 SIMPIN / SIMGATE 却没装上
-//   (SIMGATE 在 45 / 75 帧下按设计拒装,不算失败)。
+// 只报告实际安装位：1可见性相位、2高度3/3、4边界门3/3、8保持R4。
+// 0未安装；-2需要的修正未装齐或还原不完整。需求来自成功安装快照，不再读可变groups。
 extern "C" __declspec(dllexport) int __stdcall FrameLabSimStatus() {
+    api::PatchGuard transaction;
+    if (fl::g_patchPoisoned) return -2;
     if (!fl::g_installed) return 0;
     int v = 8;
     if (fl::g_visPhaseOn) v |= 1;
     if (fl::g_simPinSites == 3) v |= 2;
-    if (fl::g_simGateOn) v |= 4;
-    const bool above = !fl::g_measureOnly && fl::g_targetFps > fl::g_retailFps;   // 只量不改按设计不装这些
-    const bool wantPin  = above && (fl::g_groups & FL_G_SIMPIN) != 0;
-    const bool wantGate = above && (fl::g_groups & FL_G_SIMGATE) != 0 && fl_sim_gate_exact(fl::g_ratio);
-    if ((wantPin && !(v & 2)) || (wantGate && !(v & 4))) return -2;
-    FL_INFO("可见性 / 联机修正状态 0x%X(边界门挡下 %ld 次)", v, fl::g_simGateHeld);
+    if (fl::g_simGateOn && fl::g_simGateSites == 3) v |= 4;
+    const fl::SimInstallContract& c = fl::g_simInstalled;
+    FL_INFO("模拟修正状态0x%X：安装请求mask=0x%08X，零售%d/目标%d/r%d，measure=%s；高度needed/required=%d/%d installed=%d/3；边界门needed/required=%d/%d installed=%d/3(挡下%ld次)",
+            v, c.requestedGroups, c.retailFps, c.targetFps, c.ratio, c.measureOnly ? "是" : "否",
+            c.pinNeeded, c.pinRequired, fl::g_simPinSites, c.gateNeeded, c.gateRequired,
+            fl::g_simGateSites, fl::g_simGateHeld);
+    if ((c.pinNeeded && !(v & 2)) || (c.gateNeeded && !(v & 4))) return -2;
     return v;
 }
 
@@ -3649,7 +4648,73 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabPsysStatus() {
     const long c = fl::g_psCalls, f = fl::g_psFwd;
     const int ratio = c > 0 ? (int)((long long)f * 1000 / c) : 0;
     FL_INFO("粒子系统节拍门:调用 %ld 转发 %ld ⇒ 放行比例 %d/1000(90 帧应 ≈ 333,60 帧 ≈ 500)", c, f, ratio);
+    FL_INFO("建筑光团交接:安装=%d，构造命中 %ld，池存活修正 %ld，字段不符跳过 %ld；仅安装不能视为闪烁验收",
+            fl::g_glowOn ? 1 : 0, fl::g_glowSeen, fl::g_glowAdjusted, fl::g_glowSkipped);
+    FL_INFO("建筑光团顶点:命中 %ld，五顶点修正 %ld，布局/字段不符跳过 %ld；出生时间保持原值",
+            fl::g_glowVertexCalls, fl::g_glowVertexAdjusted, fl::g_glowVertexSkipped);
+    FL_INFO("建筑光团拒绝原因:模板 %ld，顶点数量 %ld，池寿命 %ld，写入范围 %ld，顶点寿命 %ld（可同时命中）",
+            fl::g_glowVertexRejected[0], fl::g_glowVertexRejected[1], fl::g_glowVertexRejected[2],
+            fl::g_glowVertexRejected[3], fl::g_glowVertexRejected[4]);
+    static const char* const names[kFlPowerGlowProfiles] = {"苏联光团", "帝国矿场光团", "帝国电厂灯光"};
+    for (unsigned i = 0; i < kFlPowerGlowProfiles; ++i) {
+        const FlPowerGlowProfile& p = kFlPowerGlows[i];
+        const fl::PowerGlowStats& s = fl::g_powerGlowStats[i];
+        FL_INFO("GLOW tpl=%08X %s:原寿命=%u pool=%u visible=%.2f 构造=%ld 修正=%ld 跳过=%ld 上传=%ld 修正=%ld 跳过=%ld 拒绝=%ld/%ld/%ld/%ld/%ld",
+                p.id, names[i], p.nativeLifetime, p.poolLifetime, p.visibleLifetime,
+                s.born, s.adjusted, s.skipped, s.uploads, s.corrected, s.uploadSkipped,
+                s.rejected[0], s.rejected[1], s.rejected[2], s.rejected[3], s.rejected[4]);
+    }
+    while (fl::g_glowVertexTraceLogged < (unsigned)fl::g_glowVertexTraceCount) {
+        const unsigned i = fl::g_glowVertexTraceLogged++;
+        const fl::GlowVertexTrace& r = fl::g_glowVertexTrace[i];
+        FL_INFO("光团上传[%u]:tpl=%08X 顶点=%u pool=%u bytes=%u reject=%02X first=%.5f last=%.5f birth=%.5f expiry=%.5f",
+                i, r.templateId, r.count, r.poolLife, r.writtenBytes, r.rejected, r.firstLife, r.lastLife, r.birth, r.expiry);
+    }
     return 1000000 + ratio;
+}
+
+// Query outside the render hook: logging never runs in a construction callback.
+extern "C" __declspec(dllexport) int __stdcall FrameLabConstructionStatus() {
+    if (!fl::g_installed) return 0;
+    FL_INFO("施工显示同域插值:安装 %d/6 处；进度调用 %ld，未激活 %ld，未来起点保护 %ld；共享 mode 1 未改",
+            fl::g_constructionSites, fl::g_constructionCalls, fl::g_constructionInactive, fl::g_constructionClamps);
+    FL_INFO("施工首次绘制:显示调用 %ld，已选中施工动画 %ld，同戳 %ld，初始动画补算 %ld，未激活/已完成拒绝 %ld；不提前换模型",
+            fl::g_constructionPrepareCalls, fl::g_constructionMatched, fl::g_constructionSameStamp,
+            fl::g_constructionPrepared, fl::g_constructionPrimeRefused);
+    while (fl::g_constructionModelTraceLogged < (unsigned)fl::g_constructionModelTraceCount) {
+        const unsigned i = fl::g_constructionModelTraceLogged++;
+        const fl::ConstructionModelTrace& r = fl::g_constructionModelTrace[i];
+        FL_INFO("施工模型[%u]:module=%08X object=%08X geometry=%08X state=%08X stamp=%u last=%u objectMC=%08X drawMC=%08X restart=%u initial=%u prime=%u query=%u progress=%.6f",
+                i, (unsigned)r.module, (unsigned)r.object, (unsigned)r.geometry, (unsigned)r.state,
+                r.stamp, r.lastStamp, r.objectFlags, r.displayedFlags, r.restart, r.initial, r.primed, r.queried, r.progress);
+        FL_INFO("施工轨道[%u]:mode=%u/%u/%u current=%.6f/%.6f/%.6f previous=%.6f/%.6f/%.6f after=%.6f/%.6f/%.6f",
+                i, r.mode[0], r.mode[1], r.mode[2], r.current[0], r.current[1], r.current[2],
+                r.previous[0], r.previous[1], r.previous[2], r.after[0], r.after[1], r.after[2]);
+        if (r.priorFound) FL_INFO("施工前次绘制[%u]:stamp=%u last=%u objectMC=%08X drawMC=%08X geometry=%08X state=%08X mode=%u frame=%.6f prev=%.6f",
+                i, r.prior.stamp, r.prior.lastStamp, r.prior.objectFlags, r.prior.displayedFlags,
+                r.prior.geometry, r.prior.state, r.prior.mode, r.prior.current, r.prior.previous);
+        else FL_INFO("施工前次绘制[%u]:没有相同模块和对象的缓存记录", i);
+    }
+    while (fl::g_constructionTraceLogged < (unsigned)fl::g_constructionTraceCount) {
+        const unsigned i = fl::g_constructionTraceLogged++;
+        const fl::ConstructionTrace& r = fl::g_constructionTrace[i];
+        FL_INFO("施工首次观测[%u]:模块=%08X object=%08X active=%u held=%u logic=%u start=%u hold=%u duration=%u frac=%.6f progress=%.6f",
+                i, (unsigned)r.module, (unsigned)r.object, r.active, r.held, r.now, r.start, r.hold,
+                r.duration, r.fraction, r.progress);
+    }
+    FL_INFO("WALL 首显保护:登记 %ld，入场透明 %ld，绘制等待 %ld，原生状态完成 %ld，预览放行 %ld，容量跳过 %ld，代际失配 %ld，待初始化 %u",
+            fl::g_wallBorn, fl::g_wallSceneHidden, fl::g_wallRenderHeld, fl::g_wallReleased,
+            fl::g_wallPreview, fl::g_wallOverflow, fl::g_wallStale, fl::g_wallHolding);
+    while (fl::g_wallTraceLogged < (unsigned)fl::g_wallTraceCount) {
+        const unsigned i = fl::g_wallTraceLogged++;
+        const fl::WallDisplayTrace& r = fl::g_wallDisplayTrace[i];
+        FL_INFO("WALL r%u event=%u tpl=%08X drawId=%u module=%08X drawable=%08X object=%08X geom=%08X model=%08X state=%08X stamp=%u logic=%u phase=%u objMC=%08X drawMC=%08X drawFlags=%04X mode=%u frame=%.5f alpha=%.3f",
+                i, r.event, r.templateId, r.drawableId, (unsigned)r.module, (unsigned)r.drawable,
+                (unsigned)r.object, (unsigned)r.geometry, (unsigned)r.model, (unsigned)r.state,
+                r.stamp, r.logicFrame, r.phase, r.objectFlags, r.displayedFlags, r.drawableFlags,
+                r.mode, r.current, r.alpha);
+    }
+    return fl::g_constructionSites == 6 && fl::g_constructionOn ? 7 : 0;
 }
 
 // FrameLabScrollStatus():卷屏归一的状态。-2 = 两处补丁点没就位(特征没命中 / 常量不对);0 = 关;1 = 已生效。
@@ -3854,6 +4919,7 @@ static bool chs_selftest_lerp(int fps, const float* ref, int* advOut, int* endsO
 }
 
 extern "C" __declspec(dllexport) int __stdcall FrameLabSelfTestChassis() {
+    api::PatchGuard transaction;
     static float ref[CHS_TEST_FRAMES], got[CHS_TEST_FRAMES];
     long holds = 0; int maxRun = 0, dbl = 0, mism = 0;
     int mask = 0;
@@ -4776,6 +5842,7 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabDesyncRestore() {
 // 干扫:排障第一步。不改游戏任何字节,只把「能不能装、卡在哪一步」写进日志。
 // 日期:2026-09-16  初始研究实现
 extern "C" __declspec(dllexport) int __stdcall FrameLabDryRun(int targetFps) {
+    api::PatchGuard transaction;
     FL_INFO("收到干扫请求,目标帧率 %d", targetFps);
     const int rc = fl::dry_run(targetFps);
     FL_INFO("干扫结果 = %d", rc);
@@ -4783,6 +5850,7 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabDryRun(int targetFps) {
 }
 
 extern "C" __declspec(dllexport) int __stdcall FrameLabDisable() {
+    api::PatchGuard transaction;
     FL_INFO("收到关闭请求");
     const int rc = fl::uninstall();
     FL_INFO("关闭结果 = %d", rc);
@@ -4790,6 +5858,7 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabDisable() {
 }
 
 extern "C" __declspec(dllexport) int __stdcall FrameLabStatus() {
+    api::PatchGuard transaction;
     return fl::g_installed ? fl::g_targetFps : 0;
 }
 
@@ -4799,6 +5868,7 @@ extern "C" __declspec(dllexport) const char* __stdcall FrameLabVersion() {
 
 // 出问题时让用户点一下:把当前实况(帧率全局量、派生量、各补丁点当前字节)全打进日志再上传
 extern "C" __declspec(dllexport) int __stdcall FrameLabDumpDiagnostics() {
+    api::PatchGuard transaction;
     FL_INFO("──── 诊断快照 ────");
     if (!fl::g_base && !fl::resolve_module()) { FL_ERR("拿不到主模块"); return FL_ERR_NO_MODULE; }
     fl::log_environment();
@@ -4807,12 +5877,14 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabDumpDiagnostics() {
         FL_INFO("状态:已安装,目标帧率 %d,r = %d,记录在案的改动 %d 处",
                 fl::g_targetFps, fl::g_ratio, fl::g_undoCount);
     else
-        FL_INFO("状态:未安装(游戏仍是原版帧率),记录在案的改动 %d 处", fl::g_undoCount);
+        FL_INFO("状态:未提交安装,待还原记录 %d 处,还原失败状态=%d", fl::g_undoCount, fl::g_patchPoisoned);
     if (fl::g_fpsClient && mem::read_ok(fl::g_fpsClient, 4))
         FL_INFO("当前客户端帧率全局量 = %d(原版 %d)", *fl::g_fpsClient, fl::g_retailFps);
     for (int i = 0; i < fl::g_undoCount; ++i) {
         char now[256], before[256];
-        log::hex(fl::g_undo[i].address, (size_t)(fl::g_undo[i].size > 24 ? 24 : fl::g_undo[i].size), now, sizeof now);
+        const size_t show = (size_t)(fl::g_undo[i].size > 24 ? 24 : fl::g_undo[i].size);
+        if (mem::read_ok(fl::g_undo[i].address, show)) log::hex(fl::g_undo[i].address, show, now, sizeof now);
+        else strcpy_s(now, "<不可读>");
         log::hex(fl::g_undo[i].before, (size_t)(fl::g_undo[i].size > 24 ? 24 : fl::g_undo[i].size), before, sizeof before);
         FL_INFO("改动 %d @ %08X:现在 %s | 原始 %s", i, (unsigned)(uintptr_t)fl::g_undo[i].address, now, before);
     }

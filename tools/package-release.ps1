@@ -1,15 +1,28 @@
-# Create a portable x86 release and a curated source archive; nothing is uploaded.
+# Package this research tree as a labeled candidate; nothing is uploaded.
 # Run tools/build.ps1 -Target all -RunTests first, or supply -Rebuild.
 [CmdletBinding()]
 param(
     [ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+(?:[-.][A-Za-z0-9.-]+)?$')]
-    [string]$Version = '0.2.1',
+    [string]$Version = '0.2.3-dev1-visual6',
     [string]$BuildDir = $env:FLAB_BUILD_DIR,
     [string]$PackageDir,
     [switch]$Rebuild
 )
 $ErrorActionPreference = 'Stop'
+# The published 0.2.1 name is reserved for the unchanged main/tag baseline.
+# Future numeric releases remain available after their source and binary versions are updated.
+$numericVersion = [regex]::Match($Version, '^[0-9]+\.[0-9]+\.[0-9]+').Value
+if ($numericVersion -eq '0.2.1' -and $Version -notmatch '^0\.2\.1-research-[A-Za-z0-9][A-Za-z0-9.-]*$') {
+    throw 'This research tree cannot package the published 0.2.1 label. Use 0.2.1-research-r1 (or another research suffix); build the unchanged main/tag for public 0.2.1.'
+}
+
 $root = [IO.Path]::GetFullPath((Split-Path $PSScriptRoot -Parent))
+$versionMatch = [regex]::Match([IO.File]::ReadAllText((Join-Path $root 'src\framelab.cpp'), [Text.Encoding]::UTF8), '(?m)^#define FL_VERSION "([^"]+)"')
+if (-not $versionMatch.Success) { throw 'Cannot read the source DLL version.' }
+$coreVersion = $versionMatch.Groups[1].Value
+if ($Version -ne $coreVersion -and -not $Version.StartsWith($coreVersion + '-', [StringComparison]::Ordinal)) {
+    throw "Release $Version must use source version $coreVersion, optionally followed by a build suffix."
+}
 if ([string]::IsNullOrWhiteSpace($BuildDir)) { $BuildDir = Join-Path $root 'build' }
 if (-not [IO.Path]::IsPathRooted($BuildDir)) { $BuildDir = Join-Path $root $BuildDir }
 $build = [IO.Path]::GetFullPath($BuildDir)
@@ -19,17 +32,18 @@ $packages = [IO.Path]::GetFullPath($PackageDir)
 New-Item -ItemType Directory -Force -Path $packages | Out-Null
 if ($Rebuild) { & (Join-Path $PSScriptRoot 'build.ps1') -Target all -BuildDir $build -RunTests }
 
-$binaryNames = @('Ra3FpsTest.exe', 'Ra3FrameLab.dll', 'flctl.exe', 'test_schedule.exe', 'test_loader.exe')
-$documents = @('README.md', 'LICENSE', 'NOTICE.md', 'CHANGELOG.md', 'SETUP.md', 'docs\TECHNICAL.md')
+$binaryNames = @('Ra3FpsTest.exe', 'Ra3FrameLab.dll', 'flctl.exe', 'test_schedule.exe', 'test_visual_timing.exe', 'test_loader.exe', 'test_sim_contract.exe')
+$documents = @('README.md', 'LICENSE', 'NOTICE.md', 'CHANGELOG.md', 'SETUP.md', 'docs\TECHNICAL.md', 'docs\EFFECTS_INVESTIGATION.md')
+$researchDocument = 'docs\CROSSFPS_RESEARCH.md'
+if (Test-Path -LiteralPath (Join-Path $root $researchDocument) -PathType Leaf) { $documents += $researchDocument }
 foreach ($name in $binaryNames) {
     if (-not (Test-Path -LiteralPath (Join-Path $build $name) -PathType Leaf)) { throw "Missing build artifact: $name. Build -Target all first." }
 }
 foreach ($name in $documents) {
     if (-not (Test-Path -LiteralPath (Join-Path $root $name) -PathType Leaf)) { throw "Missing release document: $name" }
 }
-$numericVersion = [regex]::Match($Version, '^[0-9]+\.[0-9]+\.[0-9]+').Value
 $guiVersion = (Get-Item -LiteralPath (Join-Path $build 'Ra3FpsTest.exe')).VersionInfo.ProductVersion
-if ($guiVersion -ne ($numericVersion + '.0')) { throw "GUI product version $guiVersion does not match release $Version." }
+if ($guiVersion -ne $coreVersion) { throw "GUI product version $guiVersion does not match source version $coreVersion." }
 
 # A release may be packaged from an existing build; validate its actual payload again.
 $python = $null
@@ -51,15 +65,25 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Release export validation failed.' }
     & $python -B (Join-Path $root 'tools\re\check_deps.py') (Join-Path $build 'Ra3FpsTest.exe') (Join-Path $build 'Ra3FrameLab.dll')
     if ($LASTEXITCODE -ne 0) { throw 'Release portability validation failed.' }
+    # The DLL product version is shared by GUI-only fixes. Exercise the actual
+    # GUI so an older same-version EXE cannot be mislabeled as this candidate.
+    & $python -B (Join-Path $root 'tools\re\test_gui_conflicts.py') (Join-Path $build 'Ra3FpsTest.exe')
+    if ($LASTEXITCODE -ne 0) { throw 'Release GUI conflict checks failed.' }
     Push-Location -LiteralPath $build
     try {
         $loaderOutput = @(& (Join-Path $build 'test_loader.exe') (Join-Path $build 'Ra3FrameLab.dll') 2>&1)
         if ($LASTEXITCODE -ne 0) { throw 'Release DLL offline self-test failed.' }
-        $versionPattern = '(?m)^\s*[^=\r\n]*=\s*' + [regex]::Escape($numericVersion) + '\s*$'
+        $versionPattern = '(?m)^\s*[^=\r\n]*=\s*' + [regex]::Escape($coreVersion) + '\s*$'
         if (($loaderOutput -join "`n") -notmatch $versionPattern) { throw 'Release DLL version does not match the requested release.' }
         New-Item -ItemType Directory -Force -Path (Join-Path $build 'logs') | Out-Null
         [IO.File]::WriteAllLines((Join-Path $build 'logs\release-loader.check.txt'), [string[]]$loaderOutput, (New-Object Text.UTF8Encoding($true)))
-        Write-Host "Release GUI/DLL version: $numericVersion; offline DLL self-test passed."
+        foreach ($testName in @('test_schedule.exe', 'test_visual_timing.exe', 'test_sim_contract.exe')) {
+            $testOutput = @(& (Join-Path $build $testName) 2>&1)
+            $testExit = $LASTEXITCODE
+            [IO.File]::WriteAllLines((Join-Path $build ('logs\release-' + $testName + '.check.txt')), [string[]]$testOutput, (New-Object Text.UTF8Encoding($true)))
+            if ($testExit -ne 0) { throw "Release offline test failed: $testName (exit $testExit; output saved in build logs)." }
+        }
+        Write-Host "Release GUI/DLL version: $coreVersion; all four offline tests passed."
     } finally { Pop-Location }
 } finally {
     $env:PYTHONIOENCODING = $previousPythonEncoding

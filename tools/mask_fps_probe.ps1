@@ -36,9 +36,13 @@ param(
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "common.ps1")
 
-if ($env:PATHEXT -notmatch '\.EXE') {
-    $env:PATHEXT = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.CPL"
-    Write-Host ("note: PATHEXT was missing .EXE; restored to " + $env:PATHEXT)
+# Preserve caller extensions and restore process environment even on early failure.
+$probeOriginalPathExt = [Environment]::GetEnvironmentVariable('PATHEXT', 'Process')
+try {
+if ([string]::IsNullOrWhiteSpace($probeOriginalPathExt)) {
+    $env:PATHEXT = '.COM;.EXE;.BAT;.CMD'
+} elseif (($probeOriginalPathExt -split ';' | ForEach-Object { $_.Trim() }) -notcontains '.EXE') {
+    $env:PATHEXT = $probeOriginalPathExt + ';.EXE'
 }
 
 $lab       = Split-Path $PSScriptRoot -Parent
@@ -149,3 +153,6 @@ $results | Format-Table -AutoSize
 Write-Host "READ IT LIKE THIS: only masks whose render fps actually reached the target can be used"
 Write-Host "to say anything about what happens AT that frame rate. The rest are inconsistent configs."
 Remove-Item $playPath -Force -ErrorAction SilentlyContinue
+} finally {
+    [Environment]::SetEnvironmentVariable('PATHEXT', $probeOriginalPathExt, 'Process')
+}

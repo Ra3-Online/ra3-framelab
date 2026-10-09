@@ -3,7 +3,7 @@
 # Keep this script ASCII so Windows PowerShell 5.1 reads it without a BOM.
 [CmdletBinding()]
 param(
-    [ValidateSet('test', 'loader', 'ctl', 'dll', 'gui', 'all')]
+    [ValidateSet('test', 'loader', 'contract', 'ctl', 'dll', 'gui', 'gui-only', 'all')]
     [string]$Target = 'all',
     [string]$BuildDir = $env:FLAB_BUILD_DIR,
     [switch]$RunTests
@@ -73,7 +73,7 @@ function Import-VsEnvironment([string]$DevCmd) {
     }
     $process.Dispose()
     if ($env:VSCMD_ARG_TGT_ARCH -ne 'x86') { throw 'The discovered MSVC environment is not targeting x86.' }
-    foreach ($name in @('cl.exe', 'link.exe', 'rc.exe')) {
+    foreach ($name in @('cl.exe', 'link.exe', 'rc.exe', 'mt.exe')) {
         if (-not (Get-Command $name -ErrorAction SilentlyContinue)) { throw "Missing tool in the selected environment: $name" }
     }
     Write-Host "MSVC $env:VCToolsVersion, Windows SDK $env:WindowsSDKVersion, target x86"
@@ -129,6 +129,7 @@ function Build-Dll {
         if (-not [IO.Path]::IsPathRooted($image)) { $image = Join-Path $root $image }
         if (-not (Test-Path -LiteralPath $image -PathType Leaf)) { throw 'FLAB_IMAGE was set but the game image does not exist.' }
         Invoke-BuildTool $python @('-B', (Join-Path $root 'tools\re\dryscan.py'), (Join-Path $root 'src\framelab.cpp'), $image) 'signatures.check.txt'
+        Invoke-BuildTool $python @('-B', (Join-Path $root 'tools\re\check_visual_contract.py'), $image) 'visual.native.contract.txt'
     } else {
         Write-Host 'Signature scan NOT RUN: set FLAB_IMAGE to your own supported RA3 1.12 .game image for offline signature validation.'
     }
@@ -142,6 +143,8 @@ function Build-Gui {
         Copy-Item -LiteralPath (Join-Path $root ("tools\gui\$name")) -Destination (Join-Path $stage $name) -Force
     }
     Copy-Item -LiteralPath (Join-Path $out 'Ra3FrameLab.dll') -Destination (Join-Path $stage 'Ra3FrameLab.dll') -Force
+    # rc.exe embeds arbitrary bytes; a successful resource build does not validate XML.
+    Invoke-BuildTool 'mt.exe' @('/nologo', '/validate_manifest', '/manifest', (Join-Path $stage 'ra3fps_gui.manifest')) 'gui.manifest.txt'
     $resource = Join-Path $out 'ra3fps_gui.res'
     Push-Location -LiteralPath $stage
     try { Invoke-BuildTool 'rc.exe' @('/nologo', '/c65001', '/fo', $resource, 'ra3fps_gui.rc') 'gui.resources.txt' $resource }
@@ -158,19 +161,30 @@ try {
     Set-BuildEnvironment 'PYTHONUTF8' '1'
     Set-BuildEnvironment 'PYTHONDONTWRITEBYTECODE' '1'
     Import-VsEnvironment (Find-VsDevCmd)
-    $python = if ($Target -in @('dll', 'gui', 'all')) { Find-Python } else { $null }
+    $python = if ($Target -in @('dll', 'gui', 'gui-only', 'all')) { Find-Python } else { $null }
     Push-Location -LiteralPath $out
     try {
         if ($Target -in @('test', 'all')) { Build-Executable 'test_schedule.exe' (Join-Path $root 'tests\test_schedule.cpp') }
+        if ($Target -in @('test', 'all')) { Build-Executable 'test_visual_timing.exe' (Join-Path $root 'tests\test_visual_timing.cpp') }
         if ($Target -in @('loader', 'all')) { Build-Executable 'test_loader.exe' (Join-Path $root 'tests\test_loader.cpp') }
+        if ($Target -in @('contract', 'all')) {
+            # Only this test owns a bounded, non-executable IMAGE data fixture.
+            # Its canonical fake page is checked inside that declared array before use.
+            Build-Executable 'test_sim_contract.exe' (Join-Path $root 'tests\test_sim_contract.cpp') @('/BASE:0x00400000', '/DYNAMICBASE:NO', '/SECTION:.flfix,RW', '/MANIFEST:EMBED', "/MANIFESTUAC:level='asInvoker' uiAccess='false'")
+        }
         if ($Target -in @('ctl', 'all')) { Build-Executable 'flctl.exe' (Join-Path $root 'tools\flctl.cpp') @('advapi32.lib') }
         if ($Target -in @('dll', 'gui', 'all')) { Build-Dll }
-        if ($Target -in @('gui', 'all')) { Build-Gui }
+        # gui-only preserves a previously verified DLL's exact bytes in $out.
+        if ($Target -in @('gui', 'gui-only', 'all')) { Build-Gui }
         if ($RunTests) {
-            foreach ($name in @('test_schedule.exe', 'test_loader.exe')) {
+            $testNames = if ($Target -eq 'gui-only') { @() } else { @('test_schedule.exe', 'test_visual_timing.exe', 'test_loader.exe', 'test_sim_contract.exe') }
+            foreach ($name in $testNames) {
                 $test = Join-Path $out $name
                 if (-not (Test-Path -LiteralPath $test -PathType Leaf)) { throw "-RunTests requires $name; build -Target all first." }
                 Invoke-BuildTool $test @() ($name + '.run.txt')
+            }
+            if ($Target -in @('gui', 'gui-only', 'all')) {
+                Invoke-BuildTool $python @('-B', (Join-Path $root 'tools\re\test_gui_conflicts.py'), (Join-Path $out 'Ra3FpsTest.exe')) 'gui.conflicts.check.txt'
             }
         }
     } finally { Pop-Location }
