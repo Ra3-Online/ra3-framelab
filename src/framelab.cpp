@@ -45,7 +45,7 @@
 #include "visual_timing.h"
 
 // ───────────────────────────── 版本与状态码 ─────────────────────────────
-#define FL_VERSION "0.2.3-dev1-visual4"
+#define FL_VERSION "0.2.3-dev1-visual5"
 
 enum FlStatus {
     FL_OK = 0,
@@ -1232,6 +1232,25 @@ static const short kSigConstructionObjectProgress[] = {
     0x50,0x8B,0xCE,0xE8,W,W,W,W,0x85,0xC0,0x5E,0x74,0x11,
     0x8B,0x4C,0x24,0x04,0x6A,0x00,0x51,0x8B,0xC8
 };
+// Default model initialization runs before the world owner is bound. Keep its
+// geometry hidden until native model-condition delivery, without flushing that
+// simulation-sensitive queue early. Three calls and the MC entry retain native ABI.
+static const short kSigWallDefaultModel[] = { // 90D5E0, call at +8
+    0x8B,0xF8,0x57,0x6A,0x00,0x55,0x8B,0xCE,0xE8,W,W,W,W,
+    0x6A,0x00,0x6A,0x00,0x57,0x8B,0xCE,0xC6,0x86,0x14,0x02,0x00,0x00,0x00
+};
+static const short kSigWallSceneAdd[] = { // 90CDC2, call at +19
+    0x8B,0x0D,0x1C,0xB7,0xCD,0x00,0x8B,0x11,0x8B,0x82,0x90,0x00,0x00,0x00,
+    0x57,0xFF,0xD0,0x8B,0xC8,0xE8,W,W,W,W,0x8B,0xCD,0xE8,W,W,W,W,0x84,0xC0
+};
+static const short kSigWallNativeModel[] = { // 90CE60, five whole prologue bytes
+    0x83,0xEC,0x7C,0x53,0x55,0x8B,0xE9,0x8B,0x5D,0xEC,
+    0x80,0xBB,0xD5,0x00,0x00,0x00,0x00,0x74,0x12
+};
+static const short kSigWallRenderAlpha[] = { // 90FA54, call at +15
+    0x8B,0x4E,0x08,0xD9,0x81,0xBC,0x01,0x00,0x00,0x8B,0xCE,0xD9,0x5C,0x24,0x10,
+    0xE8,W,W,W,W,0xD9,0x44,0x24,0x10,0x32,0xDB,0xD8,0x4C,0x24,0x58,0xDE,0xC9
+};
 #undef W
 static int g_constructionSites = 0;
 static volatile long g_constructionClamps = 0;
@@ -1275,6 +1294,33 @@ static ConstructionTrace g_constructionTrace[64];
 static volatile long g_constructionTraceCount = 0;
 static unsigned g_constructionTraceLogged = 0;
 static uintptr_t g_constructionRecent[256];
+static void* g_wallModelFn = NULL;
+static void* g_wallSceneFn = NULL;
+static void* g_wallAlphaFn = NULL;
+static void* g_wallMcFn = NULL;
+static void* g_wallMcResume = NULL;
+struct WallFirstDisplay {
+    uintptr_t module, drawable, geometry;
+    unsigned drawableId, templateId;
+    unsigned observed; // one diagnostic row at the first held render
+};
+// No allocations, retained engine references, timers or deferred game calls.
+// A full probe window fails open. Entries are consumed by native MC delivery;
+// module reuse resets its entry in the native default-model initializer.
+static WallFirstDisplay g_wallFirstDisplay[512];
+static volatile long g_wallBorn = 0, g_wallSceneHidden = 0, g_wallRenderHeld = 0;
+static volatile long g_wallReleased = 0, g_wallOverflow = 0, g_wallPreview = 0;
+static volatile long g_wallStale = 0;
+static unsigned g_wallHolding = 0;
+struct WallDisplayTrace {
+    uintptr_t module, drawable, object, geometry, model, state;
+    unsigned event, templateId, drawableId, stamp, logicFrame, phase;
+    unsigned objectFlags, displayedFlags, drawableFlags, mode;
+    float current, alpha;
+};
+static WallDisplayTrace g_wallDisplayTrace[128];
+static volatile long g_wallTraceCount = 0;
+static unsigned g_wallTraceLogged = 0;
 static int g_retailFps = 30;
 static int g_targetFps = 60;
 static int g_ratio = 4;            // r = 客户端帧率 ÷ 逻辑帧率
@@ -2030,6 +2076,159 @@ extern "C" char __fastcall fl_wrap_construction_progress(void* module, void* unu
 
 typedef char (__thiscall *FnConstructionObjectProgress)(const void*, float*);
 typedef void (__thiscall *FnConstructionAnimate)(void*);
+typedef char (__thiscall *FnWallModel)(void*, void*, char, void*);
+typedef void* (__thiscall *FnWallScene)(void*, void**);
+typedef double (__thiscall *FnWallAlpha)(void*);
+typedef char (__thiscall *FnWallMc)(void*, const void*, char, char);
+
+static bool fl_wall_enabled() {
+    return g_constructionOn && (g_targetFps == 60 || g_targetFps == 90);
+}
+static unsigned fl_wall_hash(uintptr_t module) {
+    return (unsigned)((module >> 4) ^ (module >> 12) ^ (module >> 20)) & 511u;
+}
+static WallFirstDisplay* fl_wall_find(void* module, const void* drawable) {
+    const unsigned start = fl_wall_hash((uintptr_t)module);
+    for (unsigned i = 0; i < 16; ++i) {
+        WallFirstDisplay& row = g_wallFirstDisplay[(start + i) & 511u];
+        if (row.module == (uintptr_t)module && row.drawable == (uintptr_t)drawable &&
+            drawable && row.drawableId == fl_visual_word(drawable, 608)) return &row;
+    }
+    return NULL;
+}
+static void fl_wall_trace(unsigned event, void* module, const WallFirstDisplay& held) {
+    if (g_wallTraceCount >= 128) return;
+    const unsigned char* m = (const unsigned char*)module;
+    const unsigned char* d = *(const unsigned char**)(m + 8);
+    const unsigned char* object = d ? *(const unsigned char**)(d + 312) : NULL;
+    const unsigned char* logic = *g_constructionLogicSlot;
+    const unsigned char* engine = *g_constructionEngineSlot;
+    WallDisplayTrace row = {};
+    row.module = (uintptr_t)module; row.drawable = (uintptr_t)d;
+    row.object = (uintptr_t)object; row.geometry = fl_visual_word(module, 12);
+    row.model = fl_visual_word(module, 60); row.state = fl_visual_word(module, 64);
+    row.event = event; row.templateId = held.templateId; row.drawableId = held.drawableId;
+    row.stamp = *g_constructionStamp;
+    row.logicFrame = logic ? fl_visual_word(logic, 80) : 0;
+    row.phase = engine ? fl_visual_word(engine, 88) : 0;
+    row.objectFlags = object ? fl_visual_word(object, 160) : 0;
+    row.displayedFlags = fl_visual_word(module, 400);
+    row.drawableFlags = d ? fl_visual_word(d, 340) & 0xffffu : 0;
+    if (fl_visual_word(module, 284)) {
+        row.mode = fl_visual_word(module, 300);
+        row.current = *(const float*)(m + 288);
+    }
+    if (row.geometry) row.alpha = *(const float*)((const unsigned char*)row.geometry + 96);
+    g_wallDisplayTrace[g_wallTraceCount] = row;
+    InterlockedIncrement(&g_wallTraceCount);
+}
+
+// This call belongs exclusively to sub_90D500's DEFAULT model setup. Native
+// Drawable creation has already stored its flags, but Object binding happens
+// later in sub_521DC0. Therefore a null owner here cannot identify a preview.
+extern "C" char __fastcall fl_wrap_wall_default(void* module, void* unused,
+                                                void* model, char force, void* state) {
+    (void)unused;
+    if (fl_wall_enabled() && module) {
+        const unsigned char* m = (const unsigned char*)module;
+        const unsigned char* d = *(const unsigned char**)(m + 8);
+        const unsigned char* tpl = d ? *(const unsigned char**)(d + 4) : NULL;
+        if (tpl && fl_live_wall_template(fl_visual_word(tpl, 4), fl_visual_word(tpl, 8))) {
+            const unsigned flags = fl_visual_word(d, 340) & 0xffffu;
+            if (flags & 8u) { ++g_wallPreview; } // native placement/ghost creation flag
+            else if (!fl_visual_word(module, 12) && !fl_visual_word(module, 60)) {
+                const unsigned start = fl_wall_hash((uintptr_t)module);
+                WallFirstDisplay* empty = NULL;
+                for (unsigned i = 0; i < 16; ++i) {
+                    WallFirstDisplay& row = g_wallFirstDisplay[(start + i) & 511u];
+                    if (row.module == (uintptr_t)module) { empty = &row; break; }
+                    if (!row.module && !empty) empty = &row;
+                }
+                if (empty) {
+                    if (!empty->module) ++g_wallHolding;
+                    *empty = {};
+                    empty->module = (uintptr_t)module; empty->drawable = (uintptr_t)d;
+                    empty->drawableId = fl_visual_word(d, 608);
+                    empty->templateId = fl_visual_word(tpl, 8);
+                    ++g_wallBorn;
+                    fl_wall_trace(1, module, *empty);
+                } else { ++g_wallOverflow; }
+            }
+        }
+    }
+    return ((FnWallModel)g_wallModelFn)(module, model, force, state);
+}
+
+// Native scene-add still runs exactly once with the same shared reference and
+// return value. Zero alpha prevents the default geometry's first publication;
+// the normal render-alpha path keeps it zero until native MC delivery finishes.
+extern "C" void* __fastcall fl_wrap_wall_scene(void* scene, void* unused, void** geometry) {
+    (void)unused;
+    if (fl_wall_enabled() && g_wallHolding && geometry && *geometry) {
+        unsigned char* module = (unsigned char*)geometry - 12;
+        const void* d = *(const void**)(module + 8);
+        WallFirstDisplay* held = fl_wall_find(module, d);
+        if (held) {
+            held->geometry = (uintptr_t)*geometry;
+            *(float*)((unsigned char*)*geometry + 96) = 0.0f;
+            ++g_wallSceneHidden;
+            fl_wall_trace(2, module, *held);
+        }
+    }
+    return ((FnWallScene)g_wallSceneFn)(scene, geometry);
+}
+
+extern "C" double __fastcall fl_wrap_wall_alpha(void* module, void* unused) {
+    (void)unused;
+    const double nativeAlpha = ((FnWallAlpha)g_wallAlphaFn)(module);
+    if (fl_wall_enabled() && g_wallHolding && module) {
+        const void* d = *(const void**)((const unsigned char*)module + 8);
+        const void* tpl = d ? *(const void**)((const unsigned char*)d + 4) : NULL;
+        if (!tpl || !fl_live_wall_template(fl_visual_word(tpl, 4), fl_visual_word(tpl, 8))) return nativeAlpha;
+        WallFirstDisplay* held = fl_wall_find(module, d);
+        if (held) {
+            if (held->geometry && held->geometry == fl_visual_word(module, 12)) {
+                ++g_wallRenderHeld;
+                if (!held->observed) { held->observed = 1; fl_wall_trace(3, module, *held); }
+                return 0.0;
+            }
+            // An unobserved geometry replacement or a stale generation must
+            // never suppress a different model. This is a fail-open cache.
+            ++g_wallStale; fl_wall_trace(5, module, *held); held->module = 0; --g_wallHolding;
+        }
+    }
+    return nativeAlpha;
+}
+
+// Verified native entry bytes: sub esp,7Ch; push ebx; push ebp. There are no
+// relative instructions in these five bytes. Jump indirectly to +5 without
+// clobbering any incoming register. The original body retains its ret 0Ch.
+extern "C" __declspec(naked) void fl_wall_mc_trampoline() {
+    __asm {
+        sub esp, 7Ch
+        push ebx
+        push ebp
+        jmp dword ptr [g_wallMcResume]
+    }
+}
+extern "C" char __fastcall fl_wrap_wall_mc(void* receiver, void* unused,
+                                           const void* flags, char force, char extra) {
+    (void)unused;
+    const char result = ((FnWallMc)g_wallMcFn)(receiver, flags, force, extra);
+    if (fl_wall_enabled() && g_wallHolding && receiver && flags) {
+        unsigned char* module = (unsigned char*)receiver - 24;
+        const void* d = *(const void**)(module + 8);
+        WallFirstDisplay* held = fl_wall_find(module, d);
+        // Native model AND animation initialization have returned before this
+        // guard is removed. A native early return does not consume the guard.
+        if (held && fl_visual_word(module, 64) &&
+            !memcmp(module + 400, flags, 60)) {
+            ++g_wallReleased; fl_wall_trace(4, module, *held); held->module = 0; --g_wallHolding;
+        }
+    }
+    return result;
+}
+
 extern "C" void __fastcall fl_wrap_construction_prepare(void* module, void* unused) {
     (void)unused;
     const unsigned stamp = *g_constructionStamp;
@@ -3329,6 +3528,11 @@ static int install(int targetFps, bool measureOnly) {
     memset(g_constructionLastDraw, 0, sizeof g_constructionLastDraw);
     g_constructionTraceCount = g_constructionTraceLogged = 0;
     memset(g_constructionRecent, 0, sizeof g_constructionRecent);
+    memset(g_wallFirstDisplay, 0, sizeof g_wallFirstDisplay);
+    g_wallBorn = g_wallSceneHidden = g_wallRenderHeld = g_wallReleased = 0;
+    g_wallOverflow = g_wallPreview = g_wallStale = 0;
+    g_wallHolding = 0;
+    g_wallTraceCount = g_wallTraceLogged = 0;
     if (ok && !measureOnly && targetFps > g_retailFps &&
         (g_groups & FL_G_RATIO) && (g_groups & FL_G_DER_FPMS)) {
         Pattern pConstruction = {"施工显示进度专用调用", kSigConstructionVisualCall,
@@ -3337,17 +3541,40 @@ static int install(int targetFps, bool measureOnly) {
                          (int)(sizeof kSigConstructionModelPrepare / sizeof kSigConstructionModelPrepare[0]), 0x0090F89C};
         Pattern pObject = {"对象施工显示进度函数", kSigConstructionObjectProgress,
                           (int)(sizeof kSigConstructionObjectProgress / sizeof kSigConstructionObjectProgress[0]), 0x006FD550};
+        Pattern pWallDefault = {"围墙默认模型创建调用", kSigWallDefaultModel,
+                          (int)(sizeof kSigWallDefaultModel / sizeof kSigWallDefaultModel[0]), 0x0090D5E0};
+        Pattern pWallScene = {"模型加入场景调用", kSigWallSceneAdd,
+                          (int)(sizeof kSigWallSceneAdd / sizeof kSigWallSceneAdd[0]), 0x0090CDC2};
+        Pattern pWallMc = {"原生模型状态接收函数", kSigWallNativeModel,
+                          (int)(sizeof kSigWallNativeModel / sizeof kSigWallNativeModel[0]), 0x0090CE60};
+        Pattern pWallAlpha = {"模型渲染透明度调用", kSigWallRenderAlpha,
+                          (int)(sizeof kSigWallRenderAlpha / sizeof kSigWallRenderAlpha[0]), 0x0090FA54};
         unsigned char* hit = scan(pConstruction);
         unsigned char* model = scan(pModel);
         unsigned char* objectProgress = scan(pObject);
+        unsigned char* wallDefault = scan(pWallDefault);
+        unsigned char* wallScene = scan(pWallScene);
+        unsigned char* wallMc = scan(pWallMc);
+        unsigned char* wallAlpha = scan(pWallAlpha);
         ok = hit && hit != (unsigned char*)-1 && model && model != (unsigned char*)-1 &&
-             objectProgress && objectProgress != (unsigned char*)-1 && objectProgress + 61 == hit;
+             objectProgress && objectProgress != (unsigned char*)-1 && objectProgress + 61 == hit &&
+             wallDefault && wallDefault != (unsigned char*)-1 &&
+             wallScene && wallScene != (unsigned char*)-1 &&
+             wallMc && wallMc != (unsigned char*)-1 && wallAlpha && wallAlpha != (unsigned char*)-1;
         if (ok) {
             unsigned char* call = hit + 9;
             void* original = call + 5 + *(int*)(call + 1);
             unsigned char* animateCall = model + 22;
             void* animate = animateCall + 5 + *(int*)(animateCall + 1);
-            ok = original == (void*)0x006F6CB0 && animate == (void*)0x0090ECF0;
+            unsigned char* defaultCall = wallDefault + 8;
+            unsigned char* sceneCall = wallScene + 19;
+            unsigned char* alphaCall = wallAlpha + 15;
+            void* modelFn = defaultCall + 5 + *(int*)(defaultCall + 1);
+            void* sceneFn = sceneCall + 5 + *(int*)(sceneCall + 1);
+            void* alphaFn = alphaCall + 5 + *(int*)(alphaCall + 1);
+            ok = original == (void*)0x006F6CB0 && animate == (void*)0x0090ECF0 &&
+                 modelFn == (void*)0x0090C3A0 && sceneFn == (void*)0x009B2E50 &&
+                 alphaFn == (void*)0x008E9D10 && wallMc == (unsigned char*)0x0090CE60;
             if (ok) {
                 unsigned char code[5] = {0xE8,0,0,0,0};
                 const int rel = (int)((unsigned char*)&fl_wrap_construction_progress - (call + 5));
@@ -3355,6 +3582,8 @@ static int install(int targetFps, bool measureOnly) {
                 g_constructionOrigFn = original;
                 g_constructionObjectProgressFn = objectProgress;
                 g_constructionAnimateFn = animate;
+                g_wallModelFn = modelFn; g_wallSceneFn = sceneFn; g_wallAlphaFn = alphaFn;
+                g_wallMcResume = wallMc + 5; g_wallMcFn = (void*)&fl_wall_mc_trampoline;
                 g_constructionOn = true;
                 ok = patch(call, code, sizeof code, "施工显示进度(逻辑时间 + 连续插值)");
             }
@@ -3367,7 +3596,35 @@ static int install(int targetFps, bool measureOnly) {
                 ok = patch(model + 7, code, sizeof code, "同戳施工模型初始动画补算");
             }
             if (ok) ++g_constructionSites;
-            if (ok) FL_INFO("施工显示两处已装:逻辑时间 + 连续插值；已选中 MATCH_UNPACKING 的同戳初始动画补算；不提前换模型；首 64 项进度/模型状态由查询写日志；仍待手测");
+            if (ok) {
+                unsigned char code[5] = {0xE8,0,0,0,0};
+                int rel = (int)((unsigned char*)&fl_wrap_wall_default - (defaultCall + 5));
+                memcpy(code + 1, &rel, 4);
+                ok = patch(defaultCall, code, sizeof code, "围墙默认模型首显登记");
+            }
+            if (ok) ++g_constructionSites;
+            if (ok) {
+                unsigned char code[5] = {0xE8,0,0,0,0};
+                int rel = (int)((unsigned char*)&fl_wrap_wall_scene - (sceneCall + 5));
+                memcpy(code + 1, &rel, 4);
+                ok = patch(sceneCall, code, sizeof code, "围墙未初始化模型入场透明度");
+            }
+            if (ok) ++g_constructionSites;
+            if (ok) {
+                unsigned char code[5] = {0xE9,0,0,0,0};
+                int rel = (int)((unsigned char*)&fl_wrap_wall_mc - (wallMc + 5));
+                memcpy(code + 1, &rel, 4);
+                ok = patch(wallMc, code, sizeof code, "围墙原生模型状态完成后解除首显保护");
+            }
+            if (ok) ++g_constructionSites;
+            if (ok) {
+                unsigned char code[5] = {0xE8,0,0,0,0};
+                int rel = (int)((unsigned char*)&fl_wrap_wall_alpha - (alphaCall + 5));
+                memcpy(code + 1, &rel, 4);
+                ok = patch(alphaCall, code, sizeof code, "围墙首显等待原生模型与动画初始化");
+            }
+            if (ok) ++g_constructionSites;
+            if (ok) FL_INFO("施工显示六处已装:逻辑时间 + 连续插值、同戳初始动画处理、围墙默认模型首显保护；仅六种零售墙件，预览旗标 8 保持原生；等待原生模型状态通知完成才显示；需手动验收");
         }
         if (!ok) FL_ERR("施工显示专用调用未确认，候选版拒绝安装并回滚");
     }
@@ -4415,7 +4672,19 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabConstructionStatus() {
                 i, (unsigned)r.module, (unsigned)r.object, r.active, r.held, r.now, r.start, r.hold,
                 r.duration, r.fraction, r.progress);
     }
-    return fl::g_constructionSites == 2 && fl::g_constructionOn ? 6 : 0;
+    FL_INFO("WALL 首显保护:登记 %ld，入场透明 %ld，绘制等待 %ld，原生状态完成 %ld，预览放行 %ld，容量跳过 %ld，代际失配 %ld，待初始化 %u",
+            fl::g_wallBorn, fl::g_wallSceneHidden, fl::g_wallRenderHeld, fl::g_wallReleased,
+            fl::g_wallPreview, fl::g_wallOverflow, fl::g_wallStale, fl::g_wallHolding);
+    while (fl::g_wallTraceLogged < (unsigned)fl::g_wallTraceCount) {
+        const unsigned i = fl::g_wallTraceLogged++;
+        const fl::WallDisplayTrace& r = fl::g_wallDisplayTrace[i];
+        FL_INFO("WALL r%u event=%u tpl=%08X drawId=%u module=%08X drawable=%08X object=%08X geom=%08X model=%08X state=%08X stamp=%u logic=%u phase=%u objMC=%08X drawMC=%08X drawFlags=%04X mode=%u frame=%.5f alpha=%.3f",
+                i, r.event, r.templateId, r.drawableId, (unsigned)r.module, (unsigned)r.drawable,
+                (unsigned)r.object, (unsigned)r.geometry, (unsigned)r.model, (unsigned)r.state,
+                r.stamp, r.logicFrame, r.phase, r.objectFlags, r.displayedFlags, r.drawableFlags,
+                r.mode, r.current, r.alpha);
+    }
+    return fl::g_constructionSites == 6 && fl::g_constructionOn ? 7 : 0;
 }
 
 // FrameLabScrollStatus():卷屏归一的状态。-2 = 两处补丁点没就位(特征没命中 / 常量不对);0 = 关;1 = 已生效。

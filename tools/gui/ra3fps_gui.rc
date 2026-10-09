@@ -41,11 +41,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Ra3 FrameLab"
             VALUE "FileDescription",  "Red Alert 3 frame-rate test tool (runtime memory patch)"
-            VALUE "FileVersion",      "0.2.3-dev1-visual4"
+            VALUE "FileVersion",      "0.2.3-dev1-visual5"
             VALUE "InternalName",     "Ra3FpsTest"
             VALUE "OriginalFilename", "Ra3FpsTest.exe"
             VALUE "ProductName",      "Ra3 FrameLab Test Tool"
-            VALUE "ProductVersion",   "0.2.3-dev1-visual4"
+            VALUE "ProductVersion",   "0.2.3-dev1-visual5"
             VALUE "LegalCopyright",   "Copyright (c) 2026 Ra3 FrameLab contributors."
             VALUE "Comments",         "Non-commercial use only. See LICENSE. Patches the running game in memory only. No game file is modified or replaced."
         END

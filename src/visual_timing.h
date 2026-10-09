@@ -19,6 +19,21 @@ static const unsigned kFlGlowVertexCount = 5;
 
 static const std::uint32_t kFlStructureUnpacking = 0x1000u;
 static const unsigned kFlMatchUnpacking = 7;
+// Retail asset IDs, not installation paths. Only the six live wall pieces are
+// eligible; debris, collapse objects and other structures keep native alpha.
+inline bool fl_live_wall_template(std::uint32_t type, std::uint32_t instance) {
+    if (type != 0x942FFF2Du) return false; // GameObject
+    switch (instance) {
+    case 0x296799CFu: // AlliedWallPiece
+    case 0x09435832u: // AlliedWallSegmentPiece
+    case 0xF8C50039u: // JapanWallPiece
+    case 0xBF93CE00u: // JapanWallSegmentPiece
+    case 0xA82CF003u: // SovietWallPiece
+    case 0x0895CAE6u: // SovietWallSegmentPiece
+        return true;
+    default: return false;
+    }
+}
 // Native sub_90D620 / sub_8F48A0 starts MATCH_UNPACKING at frame 0, with
 // previousFrame = currentFrame - 0.00001f. sub_90ECF0 consumes that sentinel.
 // Model selection also stamps module+200 with the current time, which can

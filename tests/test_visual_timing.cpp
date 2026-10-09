@@ -400,8 +400,270 @@ static void test_construction_prepare() {
     g_constructionObjectProgressFn=g_constructionAnimateFn=NULL;
 }
 
+static unsigned char* wallMockGeometry = NULL;
+static void* wallMockScene = NULL;
+static void* wallMockModel = NULL;
+static void* wallMockState = NULL;
+static void* wallMockSelf = NULL;
+static const void* wallMockFlags = NULL;
+static unsigned wallModelCalls = 0, wallSceneCalls = 0, wallAlphaCalls = 0, wallMcCalls = 0;
+static char wallMockForce = 0, wallMockExtra = 0;
+static bool wallDeliverMc = true;
+static bool wallEarlyAlphaHidden = false;
+static unsigned char* wallMcNewGeometry = NULL;
+static void* __fastcall mock_wall_scene(void* scene, void*, void** geometry) {
+    ++wallSceneCalls;
+    wallEarlyAlphaHidden = *(float*)((unsigned char*)*geometry + 96) == 0.0f;
+    return scene;
+}
+static char __fastcall mock_wall_model(void* self, void*, void* model, char force, void* state) {
+    ++wallModelCalls; wallMockSelf = self; wallMockModel = model;
+    wallMockForce = force; wallMockState = state;
+    put((unsigned char*)self, 12, (unsigned)(uintptr_t)wallMockGeometry);
+    put((unsigned char*)self, 60, (unsigned)(uintptr_t)model);
+    fl_wrap_wall_scene(wallMockScene, NULL, (void**)((unsigned char*)self + 12));
+    return 0x61;
+}
+static double __fastcall mock_wall_alpha(void*, void*) {
+    ++wallAlphaCalls; return 0.375;
+}
+static char __fastcall mock_wall_mc(void* receiver, void*, const void* flags, char force, char extra) {
+    ++wallMcCalls; wallMockSelf = receiver; wallMockFlags = flags;
+    wallMockForce = force; wallMockExtra = extra;
+    if (wallDeliverMc) {
+        unsigned char* module = (unsigned char*)receiver - 24;
+        if (wallMcNewGeometry) {
+            put(module, 12, (unsigned)(uintptr_t)wallMcNewGeometry);
+            fl_wrap_wall_scene(wallMockScene, NULL, (void**)(module + 12));
+        }
+        memcpy(module + 400, flags, 60);
+        put(module, 64, (unsigned)(uintptr_t)wallMockState);
+        const bool unpacking = (*(const unsigned*)flags & kFlStructureUnpacking) != 0;
+        put(module, 284, unpacking ? (unsigned)(uintptr_t)wallMockState : 0);
+        put(module, 300, unpacking ? kFlMatchUnpacking : 0);
+        *(float*)(module + 288) = 0.0f;
+    }
+    return 0x63;
+}
+static uintptr_t wallResumeThis, wallResumeFlags;
+static unsigned wallResumeForce, wallResumeExtra;
+static uintptr_t wallAbiEspBefore, wallAbiEspAfter, wallAbiEbpBefore, wallAbiEbpAfter;
+static unsigned wallAbiEax, wallAbiEbx, wallAbiEsi, wallAbiEdi;
+static void* wallAbiReceiver;
+static void* wallAbiFlags;
+// Owned continuation of the verified five-byte native MC prologue. The game
+// is never called. Argument offsets include 124 locals and two saved registers.
+static __declspec(naked) void mock_wall_mc_resume() {
+    __asm {
+        mov wallResumeThis, ecx
+        mov eax, [esp + 88h]
+        mov wallResumeFlags, eax
+        mov eax, [esp + 8Ch]
+        mov wallResumeForce, eax
+        mov eax, [esp + 90h]
+        mov wallResumeExtra, eax
+        mov eax, 65h
+        pop ebp
+        pop ebx
+        add esp, 7Ch
+        ret 0Ch
+    }
+}
+// All observations use static addresses. In particular, changing EBX here
+// cannot corrupt MSVC's dynamically aligned frame pointer in the C++ fixture.
+static __declspec(naked) void run_wall_mc_trampoline_abi() {
+    __asm {
+        pushad
+        mov wallAbiEbpBefore, ebp
+        mov wallAbiEspBefore, esp
+        mov ebx, 12345678h
+        mov esi, 23456789h
+        mov edi, 3456789Ah
+        push 91h
+        push 27h
+        push dword ptr [wallAbiFlags]
+        mov ecx, wallAbiReceiver
+        call fl_wall_mc_trampoline
+        mov wallAbiEax, eax
+        mov wallAbiEbx, ebx
+        mov wallAbiEsi, esi
+        mov wallAbiEdi, edi
+        mov wallAbiEspAfter, esp
+        mov wallAbiEbpAfter, ebp
+        popad
+        ret
+    }
+}
+static void test_wall_first_display() {
+    unsigned char module[660], drawable[850], tpl[16], object[260], geometry[260];
+    unsigned char logic[100] = {}, engine[100] = {};
+    unsigned char* lp = logic; unsigned char* ep = engine;
+    unsigned stamp = 1000, model = 7, state = 9, scene = 11;
+    unsigned flags[15] = { kFlStructureUnpacking };
+    auto oldL = g_constructionLogicSlot; auto oldE = g_constructionEngineSlot;
+    auto oldStamp = g_constructionStamp;
+    g_constructionLogicSlot = &lp; g_constructionEngineSlot = &ep; g_constructionStamp = &stamp;
+    g_wallModelFn = (void*)&mock_wall_model; g_wallSceneFn = (void*)&mock_wall_scene;
+    g_wallAlphaFn = (void*)&mock_wall_alpha; g_wallMcFn = (void*)&mock_wall_mc;
+    wallMockGeometry = geometry; wallMockScene = &scene; wallMockState = &state;
+    auto reset = [&](unsigned instance, unsigned drawFlags = 0) {
+        memset(module, 0, sizeof module); memset(drawable, 0, sizeof drawable);
+        memset(tpl, 0, sizeof tpl); memset(object, 0xA5, sizeof object);
+        memset(geometry, 0, sizeof geometry); memset(g_wallFirstDisplay, 0, sizeof g_wallFirstDisplay);
+        g_wallBorn = g_wallSceneHidden = g_wallRenderHeld = g_wallReleased = 0;
+        g_wallOverflow = g_wallPreview = g_wallStale = 0; g_wallTraceCount = g_wallTraceLogged = 0;
+        g_wallHolding = 0;
+        put(module, 8, (unsigned)(uintptr_t)drawable);
+        put(drawable, 4, (unsigned)(uintptr_t)tpl); put(drawable, 608, 42);
+        put(drawable, 340, drawFlags);
+        put(tpl, 4, 0x942FFF2Du); put(tpl, 8, instance);
+        *(float*)(geometry + 96) = 0.875f;
+        g_targetFps = 90; g_constructionOn = true; wallDeliverMc = true;
+        wallMcNewGeometry = NULL;
+        wallModelCalls = wallSceneCalls = wallAlphaCalls = wallMcCalls = 0;
+        wallEarlyAlphaHidden = false;
+    };
+    for (unsigned id : {0x296799CFu,0x09435832u,0xF8C50039u,0xBF93CE00u,0xA82CF003u,0x0895CAE6u}) {
+        for (int fps : {60,90}) {
+            reset(id); g_targetFps = fps;
+            // This is intentionally before owner binding and before any
+            // unpacking flags exist: the preceding candidate missed that gap.
+            const char result = fl_wrap_wall_default(module, NULL, &model, 7, &state);
+            check(result == 0x61 && wallModelCalls == 1 && wallMockSelf == module &&
+                  wallMockModel == &model && wallMockState == &state && wallMockForce == 7,
+                  "wall default wrapper preserves native model arguments, one call and AL");
+            check(g_wallBorn == 1 && g_wallSceneHidden == 1 && wallSceneCalls == 1 && wallEarlyAlphaHidden,
+                  "wall default geometry is already transparent when its native scene-add runs");
+            put(drawable, 312, (unsigned)(uintptr_t)object);
+            unsigned char beforeObject[sizeof object], beforeDrawable[sizeof drawable];
+            unsigned char beforeModule[sizeof module], beforeGeometry[sizeof geometry];
+            memcpy(beforeObject, object, sizeof object); memcpy(beforeDrawable, drawable, sizeof drawable);
+            memcpy(beforeModule, module, sizeof module); memcpy(beforeGeometry, geometry, sizeof geometry);
+            for (unsigned phase = 1; phase <= 6; ++phase) {
+                put(engine, 88, phase);
+                check(fl_wrap_wall_alpha(module, NULL) == 0.0,
+                      "extra renders hold the default wall without a timer or early MC delivery");
+            }
+            check(!memcmp(beforeObject, object, sizeof object) && !memcmp(beforeDrawable, drawable, sizeof drawable) &&
+                  !memcmp(beforeModule, module, sizeof module) && !memcmp(beforeGeometry, geometry, sizeof geometry),
+                  "render guard never mutates object, drawable, native model/animation or geometry pose");
+            wallDeliverMc = false;
+            const char early = fl_wrap_wall_mc(module + 24, NULL, flags, 5, 9);
+            check(early == 0x63 && wallMcCalls == 1 && wallMockSelf == module + 24 &&
+                  wallMockFlags == flags && wallMockForce == 5 && wallMockExtra == 9 &&
+                  g_wallReleased == 0 && fl_wrap_wall_alpha(module, NULL) == 0.0,
+                  "native early return preserves receiver ABI and cannot release an uninitialized wall");
+            wallDeliverMc = true;
+            const char ready = fl_wrap_wall_mc(module + 24, NULL, flags, 3, 4);
+            check(ready == 0x63 && wallMcCalls == 2 && g_wallReleased == 1 &&
+                  fl_wrap_wall_alpha(module, NULL) == 0.375 && wallAlphaCalls == 8,
+                  "native model and animation initialization release the guard and restore native alpha result");
+            check(g_wallTraceCount >= 4 && g_wallDisplayTrace[g_wallTraceCount - 1].event == 4 &&
+                  g_wallDisplayTrace[g_wallTraceCount - 1].mode == kFlMatchUnpacking &&
+                  g_wallDisplayTrace[g_wallTraceCount - 1].displayedFlags == kFlStructureUnpacking,
+                  "bounded lifecycle trace identifies the wall template and the completed native construction state");
+            check(!memcmp(beforeObject, object, sizeof object) && !memcmp(beforeDrawable, drawable, sizeof drawable),
+                  "native MC callback is the only source of model changes; world fixtures stay byte-identical");
+        }
+    }
+    reset(0xA82CF003u, 8);
+    fl_wrap_wall_default(module, NULL, &model, 0, &state);
+    check(g_wallBorn == 0 && g_wallPreview == 1 && !wallEarlyAlphaHidden &&
+          fl_wrap_wall_alpha(module, NULL) == 0.375, "native wall placement preview remains visible");
+    reset(0xBD8CD4C6u);
+    fl_wrap_wall_default(module, NULL, &model, 0, &state);
+    check(g_wallBorn == 0 && !wallEarlyAlphaHidden && fl_wrap_wall_alpha(module, NULL) == 0.375,
+          "other templates including power-glow ID are ineligible for wall visibility changes");
+    reset(0xA82CF003u); put(tpl, 4, 0);
+    fl_wrap_wall_default(module, NULL, &model, 0, &state);
+    check(g_wallBorn == 0 && !wallEarlyAlphaHidden, "wall instance ID alone cannot match a different asset type");
+    for (int fps : {30,120}) {
+        reset(0xA82CF003u); g_targetFps = fps;
+        fl_wrap_wall_default(module, NULL, &model, 0, &state);
+        check(g_wallBorn == 0 && !wallEarlyAlphaHidden && fl_wrap_wall_alpha(module, NULL) == 0.375,
+              "wall guard is limited to the supported 60 and 90 render rates");
+    }
+    reset(0xA82CF003u); g_constructionOn = false;
+    fl_wrap_wall_default(module, NULL, &model, 0, &state);
+    check(g_wallBorn == 0 && wallSceneCalls == 1 && fl_wrap_wall_alpha(module, NULL) == 0.375,
+          "disabled wall wrappers forward native behavior");
+    reset(0xA82CF003u); put(module, 60, 1);
+    fl_wrap_wall_default(module, NULL, &model, 0, &state);
+    check(g_wallBorn == 0 && !wallEarlyAlphaHidden, "reinitializing an existing model does not acquire a first-display guard");
+    reset(0xA82CF003u);
+    fl_wrap_wall_default(module, NULL, &model, 0, &state);
+    unsigned idleFlags[15] = {};
+    wallDeliverMc = false;
+    fl_wrap_wall_mc(module + 24, NULL, idleFlags, 0, 0);
+    check(g_wallReleased == 0 && fl_wrap_wall_alpha(module, NULL) == 0.0,
+          "equal zero flags alone cannot release a wall without initialized native animation state");
+    wallDeliverMc = true;
+    fl_wrap_wall_mc(module + 24, NULL, idleFlags, 0, 0);
+    check(g_wallReleased == 1 && g_wallHolding == 0 && fl_wrap_wall_alpha(module, NULL) == 0.375,
+          "native idle-state initialization releases completed and map-initial wall models");
+    reset(0xA82CF003u);
+    fl_wrap_wall_default(module, NULL, &model, 0, &state);
+    unsigned char replacementGeometry[260] = {};
+    *(float*)(replacementGeometry + 96) = 1.0f;
+    wallMcNewGeometry = replacementGeometry;
+    fl_wrap_wall_mc(module + 24, NULL, flags, 0, 0);
+    check(wallSceneCalls == 2 && wallEarlyAlphaHidden && g_wallSceneHidden == 2 &&
+          g_wallReleased == 1 && g_wallHolding == 0 && fl_wrap_wall_alpha(module, NULL) == 0.375,
+          "native replacement geometry remains hidden until its entire model/animation callback returns");
+    reset(0xA82CF003u);
+    const unsigned start = fl_wall_hash((uintptr_t)module);
+    for (unsigned i = 0; i < 16; ++i)
+        g_wallFirstDisplay[(start + i) & 511u].module = (uintptr_t)module + i + 1;
+    fl_wrap_wall_default(module, NULL, &model, 0, &state);
+    check(g_wallOverflow == 1 && wallModelCalls == 1 && !wallEarlyAlphaHidden &&
+          fl_wrap_wall_alpha(module, NULL) == 0.375, "a full cache probe fails open with a diagnostic and preserves native calls");
+    reset(0xA82CF003u);
+    fl_wrap_wall_default(module, NULL, &model, 0, &state);
+    put(drawable, 608, 43);
+    check(fl_wrap_wall_alpha(module, NULL) == 0.375, "reused drawable pointer with a different native ID cannot match stale guard");
+    put(drawable, 608, 42); put(module, 12, (unsigned)(uintptr_t)object);
+    check(fl_wrap_wall_alpha(module, NULL) == 0.375 && g_wallStale == 1,
+          "unobserved geometry replacement fails open without dereferencing a retained pointer");
+    reset(0xA82CF003u);
+    fl_wrap_wall_default(module, NULL, &model, 0, &state);
+    // Check the actual compiler-generated floating-point ABI with a preexisting
+    // x87 value below the returned ST(0), both while held and after native MC.
+    double alphaResult = -1.0; float canaryResult = 0.0f, canary = 17.25f;
+    void* moduleArg = module;
+    __asm {
+        fld canary
+        mov ecx, moduleArg
+        xor edx, edx
+        call fl_wrap_wall_alpha
+        fstp qword ptr alphaResult
+        fstp dword ptr canaryResult
+    }
+    check(alphaResult == 0.0 && canaryResult == canary, "held wall alpha preserves the native x87 result ABI and lower stack value");
+    fl_wrap_wall_mc(module + 24, NULL, flags, 0, 0);
+    __asm {
+        fld canary
+        mov ecx, moduleArg
+        xor edx, edx
+        call fl_wrap_wall_alpha
+        fstp qword ptr alphaResult
+        fstp dword ptr canaryResult
+    }
+    check(alphaResult == 0.375 && canaryResult == canary, "released wall alpha preserves x87 stack and exact native multiplier");
+    wallAbiFlags = flags; wallAbiReceiver = module + 24;
+    g_wallMcResume = (void*)&mock_wall_mc_resume;
+    run_wall_mc_trampoline_abi();
+    check(wallAbiEspBefore == wallAbiEspAfter && wallAbiEbpBefore == wallAbiEbpAfter && wallAbiEax == 0x65 &&
+          wallAbiEbx == 0x12345678 && wallAbiEsi == 0x23456789 && wallAbiEdi == 0x3456789A &&
+          wallResumeThis == (uintptr_t)wallAbiReceiver && wallResumeFlags == (uintptr_t)wallAbiFlags &&
+          wallResumeForce == 0x27 && wallResumeExtra == 0x91,
+          "actual MC trampoline preserves arguments, AL, callee stack cleanup and nonvolatile registers");
+    g_constructionOn = false; g_constructionLogicSlot = oldL; g_constructionEngineSlot = oldE;
+    g_constructionStamp = oldStamp;
+    g_wallModelFn = g_wallSceneFn = g_wallAlphaFn = g_wallMcFn = g_wallMcResume = NULL;
+}
+
 int main() {
-    test_glow();test_vertices();test_glow_seam();test_construction();test_construction_prepare();
+    test_glow();test_vertices();test_glow_seam();test_construction();test_construction_prepare();test_wall_first_display();
     std::printf("visual timing: %d passed, %d failed\n",passed,failed);
     return failed?1:0;
 }

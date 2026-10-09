@@ -17,6 +17,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image", type=Path)
     parser.add_argument("--glow-asset", type=Path)
+    parser.add_argument("--wall-manifest", type=Path,
+                        help="optional retail static.manifest (local, read-only)")
     args = parser.parse_args()
     image = Image(args.image)
     source = Path(__file__).resolve().parents[2] / "src" / "visual_timing.h"
@@ -67,6 +69,29 @@ def main():
          "track initializer stores animation mode at module +300")
     code(0x6FD550, "B8 01 00 00 00 84 05 FC 5F CE 00 56 8B F1",
          "read-only visual progress query entry")
+    def call_target(va, expected, label):
+        opcode = image.read(va, 5)
+        check(opcode[0] == 0xe8 and va + 5 + struct.unpack_from("<i", opcode, 1)[0] == expected,
+              label)
+
+    call_target(0x90D5E8, 0x90C3A0, "default initializer invokes native geometry setup")
+    call_target(0x90CDD5, 0x9B2E50, "geometry setup invokes native shared-reference scene-add")
+    code(0x90CDD0, "57 FF D0 8B C8", "scene-add receives EDI shared geometry ref and scene in ECX")
+    code(0x90CE60, "83 EC 7C 53 55 8B E9 8B 5D EC",
+         "MC trampoline copies whole nonrelative prologue and resumes at +5")
+    code(0x90CF66, "8D BD 78 01 00 00 B9 0F 00 00 00 F3 A5",
+         "MC receiver copies 15 flags to receiver +376 (module +400)")
+    call_target(0x90CFB8, 0x90C3A0, "MC callback performs native geometry setup")
+    call_target(0x90CFDB, 0x90C1B0, "MC callback performs native animation setup before returning")
+    code(0x90CFE0, "5F 5E 5D 5B 83 C4 7C C2 0C 00",
+         "MC callback restores nonvolatile registers and removes three stack arguments")
+    call_target(0x90FA63, 0x8E9D10, "draw's opacity multiplier is supplied by native x87 getter")
+    code(0x90FA68, "D9 44 24 10 32 DB D8 4C 24 58 DE C9",
+         "native alpha caller consumes ST0 before opacity classification")
+    code(0x90FAAF, "F3 0F 11 41 60", "native final geometry alpha is at +96")
+    code(0x53E827, "66 89 96 54 01 00 00", "Drawable constructor stores creation flags at +340 before module setup")
+    code(0x7E2872, "89 48 04", "Drawable base constructor stores ThingTemplate at +4")
+    code(0x482B23, "83 7E 04 00", "template name lookup reads instance word +4 (ThingTemplate +8)")
     if args.glow_asset:
         asset = args.glow_asset.read_bytes()
         check(len(asset) == 552 and hashlib.sha256(asset).hexdigest() ==
@@ -77,6 +102,29 @@ def main():
               "retail glow GPUDrawModule uses native geometry type 2")
     else:
         print("Retail asset checks NOT RUN: optionally pass --glow-asset with your own extracted asset.")
+    if args.wall_manifest:
+        manifest = args.wall_manifest.read_bytes()
+        hdr = struct.unpack_from("<12I", manifest)
+        check(hdr[0] == 0x00060100, "optional wall manifest version/endianness")
+        names = 48 + hdr[3] * 48 + hdr[8] + hdr[9]
+        required = {
+            "AlliedWallPiece": 0x296799CF, "AlliedWallSegmentPiece": 0x09435832,
+            "JapanWallPiece": 0xF8C50039, "JapanWallSegmentPiece": 0xBF93CE00,
+            "SovietWallPiece": 0xA82CF003, "SovietWallSegmentPiece": 0x0895CAE6,
+        }
+        found = {}
+        for i in range(hdr[3]):
+            entry = struct.unpack_from("<12I", manifest, 48 + i * 48)
+            start = names + entry[6]
+            name = manifest[start:manifest.index(0, start)].decode("utf-8")
+            if name.startswith("GameObject:") and name[11:] in required:
+                found[name[11:]] = (entry[0], entry[1])
+        for name, instance in required.items():
+            check(found.get(name) == (0x942FFF2D, instance) and
+                  f"0x{instance:08X}u" in header,
+                  "compiled wall identity agrees with retail manifest: " + name)
+    else:
+        print("Retail wall IDs NOT RUN: optionally pass --wall-manifest with your own static.manifest.")
     print(f"native visual contract: {checks} passed, 0 failed")
 
 
