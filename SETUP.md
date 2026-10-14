@@ -12,4 +12,4 @@
 
 DLL 默认在其所在目录的 `logs` 写日志；`RA3FL_LOG` 可覆盖完整文件路径，父目录需要事先创建。GUI 的配置使用运行时发现的用户目录，日志与载荷默认位于系统临时目录下的 `Ra3FrameLab`；`FLAB_RUNTIME_DIR` 可覆盖为可写目录。路径由参数、目录、环境或系统 API 获取，仓库没有作者安装位置的默认值。
 
-请阅读 [README](README.md) 中的运行方式和风险，以及 [技术报告](docs/TECHNICAL.md) 中的版本指纹和验收边界。所有再分发须遵守 [非商业许可](LICENSE)。
+请阅读 [README](README.md) 中的运行方式和风险，以及 [技术报告](docs/TECHNICAL.md) 中的版本指纹和验收边界。当前源码及相应程序的再分发须遵守 [GNU GPL v3](LICENSE)。[非商业使用倡议](NON_COMMERCIAL_REQUEST.md)表达开发者意愿，不是附加许可限制。
