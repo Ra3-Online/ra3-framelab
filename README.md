@@ -141,4 +141,4 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 
 
 此次调整适用于当前源码及随后按此许可制作的包；历史标签和已发布包保留各自原有的许可文件与记录，不重写旧发行物。
 
-本次未复制 CnC-FPS-Unlocker 的 GPL 实现；技术报告仅引用其公开源码分析机制。来源和权利边界见 [NOTICE.md](NOTICE.md)。
+特别感谢 [TheeHorse](https://github.com/TheeHorse) 开发并开源 [CnC-FPS-Unlocker / SAGE-Unlocked](https://github.com/TheeHorse/SAGE-Unlocked)，其公开源码、技术研究与问题分析为本项目的高帧率调度、显示插值和特效修复提供了重要参考与启发。完整致谢与许可说明见 [NOTICE.md](NOTICE.md)。
