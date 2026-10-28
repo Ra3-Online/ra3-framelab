@@ -11,6 +11,7 @@
 //   ⑤ 原版公式在 r = 4 时确实会慢(反证:说明我们的改动必要,同时证明测试本身有分辨力)。
 #include "../src/schedule.h"
 #include "../src/sim_gate.h"   // 2026-09-28:相位边界门 / 迷雾可见性相位
+#include "../src/high_fps_schedule.h"
 
 #include <cstdio>
 #include <cstring>
@@ -47,7 +48,10 @@ std::vector<int> run_logic_frame(int r, int (*target)(int, int)) {
 }
 }  // namespace
 
+#include "test_high_fps.inl"
+
 int main() {
+    test_high_fps_schedule();
     for (int r = 2; r <= 6; ++r) {
         char name[128];
         const std::vector<int> frames = run_logic_frame(r, fl_target_phase);

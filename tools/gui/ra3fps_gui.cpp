@@ -30,10 +30,10 @@
 //    3. 开始游戏        -- launches the game, injects the DLL, applies the patch
 //    The box underneath is output only (a log you can screenshot), not a control.
 //
-//  WHY 30/60/90 AND NOT ANY NUMBER
-//    The current FrameLab scheduler uses six existing interpolation stages per 15 Hz
-//    logic frame. Its supported ratio r = render / logic is a whole number in 1..6.
-//    30/60/90 are r = 2/4/6; 120 would be r = 8 and the DLL rejects it with error 23.
+//  TARGETS
+//    30/60/90 retain the previous scheduler. 120/165/180/240 use an experimental
+//    clock-driven native-half-batch path. Actual Present and multiplayer CRCs
+//    require separate runtime validation; the counter below is engine updates.
 //
 //  WHAT THE TOOL DOES AFTER PATCHING
 //    It keeps measuring the running game every ~10 s and prints render fps, logic fps, the
@@ -55,6 +55,7 @@
 #define _WIN32_WINNT 0x0600
 
 #include <windows.h>
+#include "../../src/high_fps_schedule.h"
 #include <commctrl.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -132,10 +133,10 @@ static const unsigned kGroups = 0x28FFFu;
 //   An RA3FL_GROUPS override, when present, still wins over the checkbox (expert use).
 static const unsigned kChassisFixBits = 0x380000u;
 static volatile LONG g_chassisFix = 1;
-// 2026-09-21:卷屏归一 —— 用户点名「做成可自选的」。默认**不勾**(= 现状:卷屏随帧率变快),勾上 = 键盘 / 边缘卷屏
+// 2026-09-21:卷屏归一 —— 用户点名「做成可自选的」。highfps4 默认勾选，覆盖键盘 / 边缘 / 右键拖动卷屏
 //   每秒走的距离与原版相同。这是手感问题不是对错问题,而且实机还没验过,所以默认保持现状。
 static const unsigned kScrollFixBits = 0x800000u;
-static volatile LONG g_scrollFix = 0;
+static volatile LONG g_scrollFix = 1;
 // 2026-09-22:用户在 90 帧实机报的两个新现象 ——「矿场熔炉 / 电厂灯口的光闪得特别快」和
 //   「帝国武士开火像机关枪(但伤害没变)」。它们与车身颠簸是**同一类 bug**:某个视觉效果
 //   每显示帧推进一步、不含 dt,于是 60/90 帧下时间轴被压缩 2/3 倍。
@@ -208,7 +209,7 @@ static HWND      g_hLog       = NULL;
 static HWND      g_hBbDump    = NULL;   // 「立即保存现场」
 static HWND      g_hBbTest    = NULL;   // 「记录器自检」
 static HWND      g_hChassis   = NULL;   // 「修复载具颠簸」复选框(2026-09-21)
-static HWND      g_hScroll    = NULL;   // 「卷屏保持原版速度」复选框(2026-09-21,默认不勾)
+static HWND      g_hScroll    = NULL;   // 「卷屏保持原版速度」复选框(highfps4 默认勾选)
 static HWND      g_hFx        = NULL;   // 「额外特效修复」复选框(默认不勾)
 static HFONT     g_hFont      = NULL;
 
@@ -1056,10 +1057,10 @@ static bool JobPatch(DWORD& outPid, HANDLE& outProc, JobCtx& ctx) {
                 DWORD ss3 = 0;
                 if (simStatus && RemoteCall(proc, simStatus, NULL, &ss3, 60000)) {
                     const int v = (int)ss3;
-                    if ((ctx.fps == 60 || ctx.fps == 90) && (v <= 0 || !(v & 4))) {
+                    if ((ctx.fps == 60 || ctx.fps == 90 || fl_high_fps_target(ctx.fps)) && (v <= 0 || !(v & 4))) {
                         installed = false;
                         lastRc = 24;
-                        LogLine(L"[FAIL] 60/90 必需的三处相位边界门未确认安装，本次启用失败。请查看 DLL 日志。");
+                        LogLine(L"[FAIL] 高帧率必需的三处相位边界门未确认安装，本次启用失败。请查看 DLL 日志。");
                         break;
                     }
                     if (v == -2) {
@@ -1068,7 +1069,7 @@ static bool JobPatch(DWORD& outPid, HANDLE& outProc, JobCtx& ctx) {
                         if (v & 1) LogLine(L"[OK]   迷雾可见性相位补丁已安装；敌方可见性仍需按实际场景核对。");
                         else       LogLine(L"[!!]   迷雾可见性相位【没改成】—— 60/90 帧下敌方单位可能偶尔「隐身」。");
                         if (v & 2) LogLine(L"[OK]   三处运动器高度时间尺度保持原版（高帧率默认组合自动安装）。");
-                        if (v & 4) LogLine(L"[OK]   三处相位边界门已安装并核验（60/90 自动必需）；有限联机测试见技术报告。");
+                        if (v & 4) LogLine(L"[OK]   三处相位边界门已安装并核验（高帧率自动必需）；有限联机测试见技术报告。");
                     }
                 } else {
                     LogLine(L"[FAIL] 读不到模拟修正安装状态，本次启用停止。请检查 DLL 版本与日志。");
@@ -1146,7 +1147,7 @@ static bool JobPatch(DWORD& outPid, HANDLE& outProc, JobCtx& ctx) {
                 void* scStatus = RemoteExport(pid, localBase, "FrameLabScrollStatus");
                 DWORD ss = 0;
                 if (scStatus && RemoteCall(proc, scStatus, NULL, &ss, 60000)) {
-                    if ((int)ss == 1) LogLine(L"[OK]   卷屏归一已生效：键盘 / 边缘卷屏速度与原版相同。");
+                    if ((int)ss == 1) LogLine(L"[OK]   卷屏归一已生效：键盘 / 边缘 / 右键拖动按原版速度归一。");
                     else LogF(L"[!!]   卷屏归一【没开成】（状态 %d；特征未命中？）—— 卷屏保持随帧率变快。", (int)ss);
                 } else {
                     LogLine(L"[WARN] 读不到卷屏归一的状态（DLL 太旧？）。");
@@ -1158,7 +1159,7 @@ static bool JobPatch(DWORD& outPid, HANDLE& outProc, JobCtx& ctx) {
             //   当前候选的无限岛 30/60/90 三开仍实际不同步，随包报告记录条件和首差。
             //   历史与当前失败均保留，有限校验匹配不能作为完整联机验收。
             if (ctx.fps > 30) {
-                LogLine(L"[研究] 当前候选仍有实际跨帧率不同步，30 / 60 / 90 联机尚未通过验收，实测条件见随包报告。");
+                LogLine(L"[研究] 跨帧率联机仍属研究范围；高于 90 的新调度尚待实机 CRC 与画面验证。");
                 LogLine(L"       使用默认配置核对报告中的组合；其它帧率、专家分组或 MOD 组合需要独立验证。");
                 LogLine(L"       请退出游戏后再切换补丁配置；运行中的卸载不是可靠的恢复流程。");
                 LogLine(L"       单机、战役和回放也请结合实际场景与日志判断。");
@@ -1220,6 +1221,7 @@ static void JobMeasureLoop(DWORD pid, HANDLE gameProc, int targetFps, int maxCyc
     void* readDw   = RemoteExport(pid, localBase, "FrameLabReadDword");
     void* psStatus = RemoteExport(pid, localBase, "FrameLabPsysStatus");
     void* constructionStatus = RemoteExport(pid, localBase, "FrameLabConstructionStatus");
+    void* highStatus = RemoteExport(pid, localBase, "FrameLabHighStatus");
     if (!fpswin || !logicfps || !readDw) { LogLine(L"[WARN] 取不到测量用的导出地址。"); return; }
 
     HANDLE proc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
@@ -1289,6 +1291,14 @@ static void JobMeasureLoop(DWORD pid, HANDLE gameProc, int targetFps, int maxCyc
         const bool okL = RemoteCall(proc, logicfps, (void*)(uintptr_t)kMeasureWindowSec, &logic, 60000);
         RemoteCall(proc, readDw, (void*)(uintptr_t)0x00CE176C, &mspf, 30000);
         RemoteCall(proc, readDw, (void*)(uintptr_t)0x00CAF9D0, &lglob, 30000);
+        if (targetFps > 90) {
+            DWORD hs = 0;
+            if (!highStatus || !RemoteCall(proc, highStatus, NULL, &hs, 30000) || (int)hs != 1) {
+                LogLine(L"[FAIL] 高帧调度状态异常；请结束本次测试并保留日志。");
+                CloseHandle(proc);
+                return;
+            }
+        }
 
         wchar_t sR[32], sL[32];
         if (okR) _snwprintf_s(sR, _countof(sR), _TRUNCATE, L"%d.%02d", (int)render / 100, (int)render % 100);
@@ -1306,7 +1316,7 @@ static void JobMeasureLoop(DWORD pid, HANDLE gameProc, int targetFps, int maxCyc
         const bool fg = GameIsForeground(pid);
         const bool lowRender = okR && (int)render < 100;
 
-        LogF(L"#%02d  渲染 %s fps ｜ 逻辑 %s Hz ｜ 每帧毫秒 %lu ｜ 逻辑帧率全局 %lu%s",
+        LogF(L"#%02d  显示更新 %s /s ｜ 逻辑 %s Hz ｜ 每帧毫秒 %lu ｜ 逻辑帧率全局 %lu%s",
              cycle, sR, sL, (unsigned long)mspf, (unsigned long)lglob,
              (lowRender && !fg) ? L" ｜ 焦点不在游戏" : L"");
         // Collect after startup too; the old one-off reading was always 0/0.
@@ -1339,7 +1349,7 @@ static void JobMeasureLoop(DWORD pid, HANDLE gameProc, int targetFps, int maxCyc
             if (lf >= (kLogicFpsX100 - kLogicFpsTolX100) / 100.0 &&
                 lf <= (kLogicFpsX100 + kLogicFpsTolX100) / 100.0 &&
                 rf >= 0.95 * targetFps) {
-                LogLine(L"      => [PASS] 渲染达标，且模拟保持 15 Hz。这一档在本机成立。");
+                LogLine(L"      => [速率] 显示更新计数达标，逻辑速率正常；此读数不证明实际 Present 或联机同步。");
                 sawGood = true;
             } else if (rf < 1.0 && lf < 1.0) {
                 // Right after a launch the engine is still loading and renders almost nothing,
@@ -1358,25 +1368,21 @@ static void JobMeasureLoop(DWORD pid, HANDLE gameProc, int targetFps, int maxCyc
             } else if (lf < 1.0) {
                 LogLine(L"      => [WAIT] 逻辑帧率还没动，大概还在主菜单。进一局再看。");
             } else if (rf < 0.95 * targetFps && lf < 13.5) {
-                // Both the render rate AND the simulation rate are down: this is the real
-                // "the machine cannot keep up, so the whole game slows down" signature.
-                //
-                // The 13.5 threshold matters. A genuine case (60 Hz panel asked for 90, r=6)
-                // reads logic 9.40. A loading screen reads render ~2 while logic stays ~14.4 --
-                // the simulation is NOT slowed there, and calling that [ENV] would blame the
-                // monitor for a scene transition.
-                LogF(L"      => [ENV] 渲染只有 %.1f fps（目标 %d），模拟也掉到 %.2f Hz。",
+                // These sampled rates cannot identify the cause. HIGH no longer
+                // derives simulation rate from display/r; inspect its retry/fault log.
+                LogF(L"      => [检查] 显示更新 %.1f /s（目标 %d），模拟也掉到 %.2f Hz。",
                      rf, targetFps, lf);
-                LogLine(L"         引擎按「渲染 ÷ r」决定模拟速率，所以模拟跟着变慢、动画看起来是慢动作 ——");
-                LogLine(L"         这是屏幕刷新率不够，不是补丁的问题。");
-                LogLine(L"         90 帧需要 ≥90Hz 的显示器，并在游戏视频选项里关掉垂直同步。");
+                if (targetFps > 90)
+                    LogLine(L"         新调度按时钟推进；请核对负载、网络等待和 HIGH 状态日志，不能仅凭此读数判断原因。");
+                else
+                    LogLine(L"         旧调度可能随显示更新下降而变慢；请核对垂直同步、显示模式与负载。");
             } else if (rf < 0.95 * targetFps) {
                 // Render dipped but the simulation did NOT slow down. Measured: this is what a
                 // loading screen or a scene transition looks like (render 8.5 fps while logic
                 // stayed at 14.69). Reporting [ENV] here would blame the monitor for nothing.
                 LogF(L"      => [WAIT] 渲染暂时只有 %.1f fps，但模拟仍是 %.2f Hz（没被拖慢）。",
                      rf, lf);
-                LogLine(L"         多半是加载或切场景的瞬间，再等一轮。");
+                LogLine(L"         检查垂直同步、显卡负载与场景状态；低于目标不等于模拟一定变慢。");
             } else if (rf >= 0.95 * targetFps) {
                 LogLine(L"      => [!!] 渲染达标但模拟速率不对，请把这份日志发给开发者。");
             }
@@ -1403,7 +1409,7 @@ static void JobMeasureLoop(DWORD pid, HANDLE gameProc, int targetFps, int maxCyc
 // --auto usable from a script: an always-zero exit code would make a failing run look fine.
 static bool RunJob(JobCtx ctx) {
     LogF(L"===== 目标 %d 帧 ｜ 目录 %s =====", ctx.fps, ctx.dir.c_str());
-    LogF(L"补丁版本 %s ｜ 改动分组 0x%04X%s", L"0.2.3-dev1-visual6", EffectiveGroups(),
+    LogF(L"补丁版本 %s ｜ 改动分组 0x%04X%s", L"0.2.4-dev5-highfps5", EffectiveGroups(),
          g_groupsOverridden ? L"（★环境变量 RA3FL_GROUPS 覆盖；未采用界面选项组合）" : L"");
     if (!g_groupsOverridden)
         LogF(L"载具颠簸修复 = %s", g_chassisFix
@@ -1411,7 +1417,7 @@ static bool RunJob(JobCtx ctx) {
              : L"关（与旧版逐位相同的出厂分组 0x2CFFF —— 60/90 帧下载具会上下颠簸）");
     if (!g_groupsOverridden)
         LogF(L"卷屏速度 = %s", g_scrollFix
-             ? L"保持原版（键盘 / 边缘卷屏每秒距离不随帧率变；分组多出 0x800000；右键拖拽不在此列）"
+             ? L"保持原版（含键盘 / 边缘 / 右键拖动；分组多出 0x800000）"
              : L"随帧率变快（现状：60 帧约 2 倍、90 帧约 3 倍）");
     if (!g_groupsOverridden)
         LogF(L"额外特效修复 = %s", g_fxFix
@@ -1424,7 +1430,10 @@ static bool RunJob(JobCtx ctx) {
     const int   r  = ctx.fps / 15;
     if (hz) {
         LogF(L"显示器刷新率 : %lu Hz", (unsigned long)hz);
-        if ((DWORD)ctx.fps > hz && r > 0) {
+        if ((DWORD)ctx.fps > hz && ctx.fps > 90) {
+            LogF(L"[显示] 目标 %d 帧高于屏幕 %lu Hz；关闭垂直同步可测试更高提交率，屏幕无法显示所有独立帧。", ctx.fps, (unsigned long)hz);
+            LogLine(L"       新调度按时钟推进模拟；请分别检查显示更新、实际呈现与逻辑速率。");
+        } else if ((DWORD)ctx.fps > hz && r > 0) {
             LogF(L"[注意] 目标 %d 帧高于显示器刷新率 %lu Hz。引擎的模拟速率 = 实际渲染帧率 ÷ r，",
                  ctx.fps, (unsigned long)hz);
             LogF(L"       这一档预计会整体变慢（模拟约 %d.%02d Hz），看起来是慢动作，不是掉帧。",
@@ -1636,15 +1645,19 @@ static void CreateUi(HWND h) {
     SendMessageW(g_hFps, CB_ADDSTRING, 0, (LPARAM)L"30 帧（原版速度基线，r = 2）");
     SendMessageW(g_hFps, CB_ADDSTRING, 0, (LPARAM)L"60 帧（r = 4，互联未验收）");
     SendMessageW(g_hFps, CB_ADDSTRING, 0, (LPARAM)L"90 帧（研究候选，r = 6）");
-    SendMessageW(g_hFps, CB_SETCURSEL, 2, 0);   // research-r2 default; target and measured output remain distinct
+    SendMessageW(g_hFps, CB_ADDSTRING, 0, (LPARAM)L"120 帧（新调度实验）");
+    SendMessageW(g_hFps, CB_ADDSTRING, 0, (LPARAM)L"165 帧（新调度实验）");
+    SendMessageW(g_hFps, CB_ADDSTRING, 0, (LPARAM)L"180 帧（新调度实验）");
+    SendMessageW(g_hFps, CB_ADDSTRING, 0, (LPARAM)L"240 帧（新调度实验）");
+    SendMessageW(g_hFps, CB_SETCURSEL, 3, 0);   // highfps1 starts at 120; actual rate needs separate measurement
 
     // 2026-09-21:载具颠簸修复的开关,放在帧数下拉框右边,默认勾上。取消勾选 = 与旧版逐位相同的出厂掩码(做 A/B 用)。
-    g_hChassis = CreateWindowExW(0, L"BUTTON", L"修复载具上下颠簸（60/90 帧，实验）",
+    g_hChassis = CreateWindowExW(0, L"BUTTON", L"修复载具上下颠簸（高帧率，实验）",
                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                                  312, 8, 290, 20, h, (HMENU)IDC_CHASSIS_FIX, g_hInst, NULL);
     SendMessageW(g_hChassis, BM_SETCHECK, g_chassisFix ? BST_CHECKED : BST_UNCHECKED, 0);
-    // 卷屏:可自选,默认不勾。放在上一个复选框正下方。
-    g_hScroll = CreateWindowExW(0, L"BUTTON", L"卷屏保持原版速度（不勾 = 随帧率变快）",
+    // 用户要求右键速度回调；默认勾选，仍允许手动关闭。
+    g_hScroll = CreateWindowExW(0, L"BUTTON", L"卷屏保持原版速度（含右键拖动）",
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                                 312, 29, 290, 20, h, (HMENU)IDC_SCROLL_FIX, g_hInst, NULL);
     SendMessageW(g_hScroll, BM_SETCHECK, g_scrollFix ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -1680,7 +1693,10 @@ static void CreateUi(HWND h) {
                              WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
                              14, 192, 588, 290, h, (HMENU)IDC_LOG, g_hInst, NULL);
 
-    HWND all[] = { l1, l2, l3, g_hFps, g_hDir, g_hBrowse, g_hStart, g_hLog, g_hBbDump, g_hBbTest, g_hChassis, g_hScroll, g_hFx };
+    HWND credit = CreateWindowExW(0, L"STATIC", L"红警3online团队研发", st,
+                                  14, 492, 588, 20, h, NULL, g_hInst, NULL);
+
+    HWND all[] = { l1, l2, l3, g_hFps, g_hDir, g_hBrowse, g_hStart, g_hLog, g_hBbDump, g_hBbTest, g_hChassis, g_hScroll, g_hFx, credit };
     for (int i = 0; i < (int)(sizeof all / sizeof all[0]); ++i) SendMessageW(all[i], WM_SETFONT, (WPARAM)g_hFont, TRUE);
     UpdateBbButtons();
 }
@@ -1714,9 +1730,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             KillTimer(h, kSelfTestTimer);
             // Fill the controls exactly the way a user would, then click the real button.
             // Nothing here bypasses the button handler -- that is the whole point.
-            static const int kFpsSelfTest[3] = { 30, 60, 90 };
+            static const int kFpsSelfTest[7] = { 30, 60, 90, 120, 165, 180, 240 };
             int sel = 1;
-            for (int i = 0; i < 3; ++i) if (kFpsSelfTest[i] == g_selfTestFps) sel = i;
+            for (int i = 0; i < 7; ++i) if (kFpsSelfTest[i] == g_selfTestFps) sel = i;
             SendMessageW(g_hFps, CB_SETCURSEL, (WPARAM)sel, 0);
             SetWindowTextW(g_hDir, g_selfTestDir.c_str());
             AppendLog(L"[自测] 已填好控件，模拟点击「开始游戏」\r\n");
@@ -1749,8 +1765,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             const int sel = (int)SendMessageW(g_hFps, CB_GETCURSEL, 0, 0);
-            static const int kFps[3] = { 30, 60, 90 };
-            if (sel < 0 || sel > 2) { InterlockedExchange(&g_busy, 0); return 0; }
+            static const int kFps[7] = { 30, 60, 90, 120, 165, 180, 240 };
+            if (sel < 0 || sel > 6) { InterlockedExchange(&g_busy, 0); return 0; }
 
             // 复选框状态在 UI 线程上读一次,工作线程只读这个全局(EffectiveGroups 在工作线程里被调)。
             InterlockedExchange(&g_chassisFix,
@@ -1869,8 +1885,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR /*lpCmdLine*/, int) {
         c.maxCycles = (argc >= 5) ? _wtoi(argv[4]) : 3;
         c.killWhenDone = true;
         c.refocus = true;   // unattended run: nobody minds if we steal focus back
-        if (c.fps != 30 && c.fps != 60 && c.fps != 90) {
-            LogF(L"[FAIL] 帧数只支持 30 / 60 / 90，收到 %d", c.fps);
+        if (c.fps != 30 && c.fps != 60 && c.fps != 90 && !fl_high_fps_target(c.fps)) {
+            LogF(L"[FAIL] 帧数支持 30/60/90 及实验 120..240（15 的倍数），收到 %d", c.fps);
             if (g_hLogFile != INVALID_HANDLE_VALUE) CloseHandle(g_hLogFile);
             return 1;
         }
@@ -1898,9 +1914,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR /*lpCmdLine*/, int) {
     if (!RegisterClassExW(&wc)) return 1;
 
     // 2026-09-22:高度 472 → 496,给第三个复选框腾出那 24 px(实测截图发现它压在「游戏目录」行上)。
-    RECT rc = { 0, 0, 616, 496 };
+    RECT rc = { 0, 0, 616, 520 }; // includes the team credit below the log
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
-    g_hMain = CreateWindowExW(0, wc.lpszClassName, L"红警3 帧率测试工具 — 视觉候选 6",
+    g_hMain = CreateWindowExW(0, wc.lpszClassName, L"红警3 帧率测试工具 — 高帧候选 5 ｜ 红警3online团队研发",
                               WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
                               CW_USEDEFAULT, CW_USEDEFAULT,
                               rc.right - rc.left, rc.bottom - rc.top,

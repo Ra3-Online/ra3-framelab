@@ -87,6 +87,14 @@ inline const FlPowerGlowProfile* fl_power_glow_profile(std::uint32_t id) {
     return nullptr;
 }
 
+// Keep the accepted 60/90 visual candidate unchanged. Above 90 the last
+// pre-replacement sample approaches poolLifetime more closely; leave only
+// half a display step (in the native 30 Hz particle time domain) as margin.
+inline float fl_glow_visible_lifetime(const FlPowerGlowProfile& p, int fps) {
+    return fps > 90 ? static_cast<float>(p.poolLifetime) - 15.0f / fps
+                    : p.visibleLifetime;
+}
+
 inline std::uint32_t fl_visual_word(const void* object, unsigned offset) {
     std::uint32_t value;
     std::memcpy(&value, static_cast<const unsigned char*>(object) + offset, sizeof value);

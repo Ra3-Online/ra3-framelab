@@ -3,7 +3,7 @@
 [CmdletBinding()]
 param(
     [ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+(?:[-.][A-Za-z0-9.-]+)?$')]
-    [string]$Version = '0.2.3-dev1-visual6',
+    [string]$Version = '0.2.4-dev5-highfps5',
     [string]$BuildDir = $env:FLAB_BUILD_DIR,
     [string]$PackageDir,
     [switch]$Rebuild
@@ -33,7 +33,7 @@ New-Item -ItemType Directory -Force -Path $packages | Out-Null
 if ($Rebuild) { & (Join-Path $PSScriptRoot 'build.ps1') -Target all -BuildDir $build -RunTests }
 
 $binaryNames = @('Ra3FpsTest.exe', 'Ra3FrameLab.dll', 'flctl.exe', 'test_schedule.exe', 'test_visual_timing.exe', 'test_loader.exe', 'test_sim_contract.exe')
-$documents = @('README.md', 'LICENSE', 'NOTICE.md', 'NON_COMMERCIAL_REQUEST.md', 'CHANGELOG.md', 'SETUP.md', 'docs\TECHNICAL.md', 'docs\EFFECTS_INVESTIGATION.md')
+$documents = @('README.md', 'LICENSE', 'NOTICE.md', 'NON_COMMERCIAL_REQUEST.md', 'CHANGELOG.md', 'SETUP.md', 'docs\TECHNICAL.md', 'docs\EFFECTS_INVESTIGATION.md', 'docs\HIGH_FPS_RESEARCH.md', 'docs\HIGH_FPS_AUDIT.md')
 $researchDocument = 'docs\CROSSFPS_RESEARCH.md'
 if (Test-Path -LiteralPath (Join-Path $root $researchDocument) -PathType Leaf) { $documents += $researchDocument }
 foreach ($name in $binaryNames) {
@@ -110,7 +110,7 @@ foreach ($name in @('HANDOFF.md', 'HARDCODED-PATHS.md')) {
 }
 
 # Source whitelist: no archive, game/replay data, local reports, build logs or private sessions.
-$extensions = @('.cpp', '.c', '.h', '.hpp', '.def', '.rc', '.manifest', '.ps1', '.py', '.sh', '.md', '.txt', '.ico', '.yml', '.yaml')
+$extensions = @('.cpp', '.c', '.h', '.hpp', '.inl', '.def', '.rc', '.manifest', '.ps1', '.py', '.sh', '.md', '.txt', '.ico', '.yml', '.yaml')
 foreach ($folder in @('src', 'tests', 'tools', 'docs', '.github')) {
     $folderPath = Join-Path $root $folder
     if (-not (Test-Path -LiteralPath $folderPath -PathType Container)) { continue }
@@ -143,7 +143,9 @@ foreach ($zip in @($portableZip, $sourceZip)) {
 }
 [IO.Compression.ZipFile]::CreateFromDirectory($portable, $portableZip, [IO.Compression.CompressionLevel]::Optimal, $false)
 [IO.Compression.ZipFile]::CreateFromDirectory($source, $sourceZip, [IO.Compression.CompressionLevel]::Optimal, $false)
-$zipHashes = foreach ($zip in @($portableZip, $sourceZip)) {
+$standaloneGui = Join-Path $packages 'Ra3FpsTest.exe'
+Copy-Item -LiteralPath (Join-Path $build 'Ra3FpsTest.exe') -Destination $standaloneGui -Force
+$zipHashes = foreach ($zip in @($portableZip, $sourceZip, $standaloneGui)) {
     $hash = Get-FileHash -LiteralPath $zip -Algorithm SHA256
     '{0}  {1}' -f $hash.Hash.ToLowerInvariant(), [IO.Path]::GetFileName($zip)
 }
@@ -158,4 +160,5 @@ if ([IO.Path]::GetDirectoryName($resolvedStage) -ne $packages.TrimEnd('\', '/') 
 Remove-Item -LiteralPath $resolvedStage -Recurse -Force
 Write-Host "Portable release: $portableZip"
 Write-Host "Source release:   $sourceZip"
+Write-Host "Standalone GUI:   $standaloneGui"
 Write-Host "SHA256 manifest:  $checksums"

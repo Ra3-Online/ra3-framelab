@@ -62,12 +62,12 @@ static void test_glow() {
     g_glowOrigFn = (void*)&mock_gpu_ctor;
     g_glowOn = true; g_psOn = true;
     g_glowSeen = 0; g_glowAdjusted = 0; g_glowSkipped = 0;
-    for (int fps : {60,90}) {
+    for (int fps : {60,90,120,165,180,240}) {
         g_targetFps = fps;
         run_glow(self, &handle, &input, expected, true);
     }
-    check(g_glowSeen == 2 && g_glowAdjusted == 2 && g_glowSkipped == 0, "eligible glow diagnostics count actual corrections");
-    for (int fps : {30,120}) {
+    check(g_glowSeen == 6 && g_glowAdjusted == 6 && g_glowSkipped == 0, "eligible glow diagnostics count actual corrections");
+    for (int fps : {30,105}) {
         g_targetFps = fps;
         run_glow(self, &handle, &input, input, false);
     }
@@ -90,7 +90,7 @@ static void test_glow() {
         input.words[9] = life;
         run_glow(self, &handle, &input, input, false);
     }
-    check(g_glowAdjusted == 2 && g_glowSeen == 18 && g_glowSkipped == 16,
+    check(g_glowAdjusted == 6 && g_glowSeen == 22 && g_glowSkipped == 16,
           "different template not counted; changed fields/lifetimes explicitly counted as skipped");
     input.words[9] = 15;
     handle = NULL;
@@ -138,13 +138,13 @@ static void test_vertices() {
         check(vertexCalls==1 && vertexStorage==storage && vertexParticle==particle &&
               vertexBuffer==out && result==out+nativeWritten, "actual upload preserves native call, args and end pointer");
         float expected[60]; memcpy(expected,nativeVertices,sizeof expected);
-        if(adjust) for(int i=0;i<5;++i) expected[i*10+3]=kFlGlowVisibleLifetime;
+        if(adjust) for(int i=0;i<5;++i) expected[i*10+3]=fl_glow_visible_lifetime(kFlPowerGlows[0],g_targetFps);
         check(!memcmp(out,expected,sizeof out), "only five visible-life floats change; centre, birth, velocity, position and tail survive");
         check(!memcmp(particle,before,sizeof before), "upload never changes native particle object");
     };
-    for (int fps : {60,90}) { g_targetFps=fps; invoke(true); }
-    check(g_glowVertexAdjusted==2, "upload counts actual paired correction");
-    for (int fps : {30,120}) {g_targetFps=fps;invoke(false);}
+    for (int fps : {60,90,120,165,180,240}) { g_targetFps=fps; invoke(true); }
+    check(g_glowVertexAdjusted==6, "upload counts actual paired correction");
+    for (int fps : {30,105}) {g_targetFps=fps;invoke(false);}
     g_targetFps=90;g_glowOn=false;invoke(false);g_glowOn=true;
     g_psOn=false;invoke(false);g_psOn=true;
     for(unsigned count : {0u,1u,3u,4u,6u,0xffffffffu}) {put(storage,36,count);invoke(false);}
@@ -216,7 +216,7 @@ static void test_empire_glow() {
         put(particle, 40, profile->poolLifetime); nativeWritten = 50;
         auto upload = [&](bool corrected) {
             float out[60], expectedOut[60]; memcpy(expectedOut, nativeVertices, sizeof expectedOut);
-            if (corrected) for (unsigned i = 0; i < 5; ++i) expectedOut[i * 10 + 3] = profile->visibleLifetime;
+            if (corrected) for (unsigned i = 0; i < 5; ++i) expectedOut[i * 10 + 3] = fl_glow_visible_lifetime(*profile,g_targetFps);
             unsigned char before[88]; memcpy(before, particle, sizeof before); vertexCalls = 0;
             float* result = fl_wrap_gpu_vertices(storage, NULL, particle, out);
             check(vertexCalls == 1 && result == out + nativeWritten && vertexStorage == storage &&
@@ -226,14 +226,14 @@ static void test_empire_glow() {
                   "Empire correction changes only all five lifetime fields including centre; native birth and tail survive");
             check(!memcmp(particle, before, sizeof before), "Empire vertex correction preserves the whole native particle");
         };
-        for (int fps : {60,90}) {
+        for (int fps : {60,90,120,165,180,240}) {
             g_targetFps = fps;
             run_glow(self, &handle, &params, expected, true); upload(true);
         }
         const PowerGlowStats& stats = g_powerGlowStats[profile->index];
-        check(stats.born == 2 && stats.adjusted == 2 && stats.uploads == 2 && stats.corrected == 2,
+        check(stats.born == 6 && stats.adjusted == 6 && stats.uploads == 6 && stats.corrected == 6,
               "Empire light and refinery have independent successful runtime diagnostics");
-        for (int fps : {30,120}) {
+        for (int fps : {30,105}) {
             g_targetFps = fps; run_glow(self, &handle, &params, params, false); upload(false);
         }
         g_targetFps = 90;
@@ -248,7 +248,7 @@ static void test_empire_glow() {
         nativeVertices[43] = (float)profile->poolLifetime;
         put(storage, 36, 4); upload(false); put(storage, 36, 5);
         nativeWritten = 40; upload(false); nativeWritten = 50;
-        check(stats.corrected == 2 && stats.rejected[0] == 12 && stats.rejected[1] == 1 &&
+        check(stats.corrected == 6 && stats.rejected[0] == 12 && stats.rejected[1] == 1 &&
               stats.rejected[2] == 1 && stats.rejected[3] == 1 && stats.rejected[4] == 1,
               "modified Empire timing, layouts, spans and centre lifetime fail closed with per-template reasons");
         check(g_glowVertexTraceCount > 0 && stats.traces == 16,
@@ -596,7 +596,7 @@ static void test_wall_first_display() {
         wallEarlyAlphaHidden = false;
     };
     for (unsigned id : {0x296799CFu,0x09435832u,0xF8C50039u,0xBF93CE00u,0xA82CF003u,0x0895CAE6u}) {
-        for (int fps : {60,90}) {
+        for (int fps : {60,90,120,165,180,240}) {
             reset(id); g_targetFps = fps;
             // This is intentionally before owner binding and before any
             // unpacking flags exist: the preceding candidate missed that gap.
@@ -649,11 +649,11 @@ static void test_wall_first_display() {
     reset(0xA82CF003u); put(tpl, 4, 0);
     fl_wrap_wall_default(module, NULL, &model, 0, &state);
     check(g_wallBorn == 0 && !wallEarlyAlphaHidden, "wall instance ID alone cannot match a different asset type");
-    for (int fps : {30,120}) {
+    for (int fps : {30,105}) {
         reset(0xA82CF003u); g_targetFps = fps;
         fl_wrap_wall_default(module, NULL, &model, 0, &state);
         check(g_wallBorn == 0 && !wallEarlyAlphaHidden && fl_wrap_wall_alpha(module, NULL) == 0.375,
-              "wall guard is limited to the supported 60 and 90 render rates");
+              "wall guard remains off for native30 and unsupported target105");
     }
     reset(0xA82CF003u); g_constructionOn = false;
     fl_wrap_wall_default(module, NULL, &model, 0, &state);
@@ -734,8 +734,20 @@ static void test_wall_first_display() {
     g_wallModelFn = g_wallSceneFn = g_wallAlphaFn = g_wallMcFn = g_wallMcResume = NULL;
 }
 
+#include "test_high_runtime.inl"
+#include "test_high_turret.inl"
+#include "test_high_visual.inl"
+#include "test_scroll_runtime.inl"
+
 int main() {
     test_glow();test_vertices();test_glow_seam();test_empire_glow();test_construction();test_construction_prepare();test_wall_first_display();
+    test_high_runtime();
+    test_high_unit_alpha();
+    test_high_turret();
+    test_high_visual_readers();
+    test_high_visual_observations();
+    test_drag_scroll();
+    test_high_glow_clock_model();
     std::printf("visual timing: %d passed, %d failed\n",passed,failed);
     return failed?1:0;
 }

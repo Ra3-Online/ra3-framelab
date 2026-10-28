@@ -43,9 +43,11 @@
 #include "sim_gate.h"      // 2026-09-28:相位边界门 / 迷雾可见性相位的纯逻辑(与 test_schedule 共用)
 #include "chassis_gate.h"   // 2026-09-21:车身外观 30 Hz 节拍门的纯逻辑(与离线自检共用)
 #include "visual_timing.h"
+#include "high_fps_turret.h"
+#include "high_fps_schedule.h"
 
 // ───────────────────────────── 版本与状态码 ─────────────────────────────
-#define FL_VERSION "0.2.3-dev1-visual6"
+#define FL_VERSION "0.2.4-dev5-highfps5"
 
 enum FlStatus {
     FL_OK = 0,
@@ -767,9 +769,9 @@ static const short kSigMsPerFrameSetter[] = {
 //   另外两个读者 sub_ABC640 / sub_ABC690 是**事件驱动**的一次性位移(没有帧号差),不动。
 //   为什么不去缩放卷屏系数本身:flt_CB0338 / flt_CB033C 各有 3 个写入点(设置 / 选项菜单),运行中会变,
 //   我们的副本会过期;而 100.0 是常量。两处必须**一起**改(只改一处,加速段与稳态段速度会接不上)。
-//   ⚠ 不含右键拖拽卷屏(sub_ABFF40):它是「每调用一次走 系数 ×(鼠标 − 锚点)」,没有帧号差;
-//     它的调用节拍(每帧 / 每次鼠标消息)静态没定下来,先不碰,见 docs/TECHNICAL.md。
-//   状态:2026-09-21 静态定位 + 离线构建;**实机一次都没跑过**。
+//   2026-10-27 highfps4 扩展：右键拖动 sub_ABFF40 的最终两轴位移另乘 30/目标FPS。
+//   原鼠标锚点、用户速度选项、碰界处理、共享 ScrollBy 虚表保留；见 scroll_runtime.inl。
+//   GUI 默认勾选，CLI 仍由 FL_G_SCROLL 控制；新右键路径待手测。
 #define FL_G_SCROLL       0x800000
 
 // ── ★★★ 2026-09-22(用户 90 帧实机报告 #2):弹道流(TheTracerManager)30 Hz 节拍门,**默认关** ──────
@@ -1064,6 +1066,13 @@ static const short kSigScrollStep2[] = {                 // sub_ABC9C0 加速段
     0xF3,0x0F,0x59,0xC3,                  // mulss xmm0, xmm3
     0xF3,0x0F,0x59,0xCB                   // mulss xmm1, xmm3
 };
+// Only the right-drag velocity path, after current axis/user speed settings.
+// Keep the two local-vector stores and the original view callback outside patch.
+static const short kSigDragScroll[] = {
+    0xF3,0x0F,0x59,0xC3,0xF3,0x0F,0x59,0xCC,
+    0xF3,0x0F,0x11,0x44,0x24,0x08,0xF3,0x0F,0x11,0x4C,0x24,0x0C,
+    0x8B,0x0D,0xB4,0xB7,0xCD,0x00
+};
 static const short kSigSecPerFrameInit[] = {
     0xF3,0x0F,0x10,0x05,W,W,W,W,          // movss xmm0, [1.0]
     0xF3,0x0F,0x5E,0x05,W,W,W,W,          // divss xmm0, [客户端帧率浮点]   ← 操作数在 +12,必须是 0x00CDBC50
@@ -1089,6 +1098,65 @@ static const short kSigPerFrame[] = {
     0x89,0x46,0x58,                       // mov [esi+0x58], eax     存阶段
     0xF3,0x0F,0x11,0x46,0x60              // movss [esi+0x60], xmm0  存系数(后面还会再存一次钳位后的值)
 };
+
+// High-FPS sites are mandatory as a set, and require their canonical VA too.
+static const short kSigHighEntry[] = {
+    0x51,0x53,0x56,0x8B,0xF1,0x8B,0x0D,0x90,0xD1,0xCD,0x00
+};
+// Drawable::updateTransform runs inside GameClient::update, BEFORE the native
+// logic batch. Its cached position/rotation must read the independent draw
+// alpha; the engine field has already been restored for simulation work.
+static const short kSigHighDrawableAlpha[] = {
+    0x8B,0x15,0x8C,0x2F,0xCE,0x00, 0xD9,0x42,0x60,
+    0x51,0x8D,0x86,0xE8,0x00,0x00,0x00,0xD9,0x54,0x24,0x10,
+    0xD9,0x1C,0x24
+};
+static const short kSigHighDrawableCaller[] = {
+    0x8B,0xCE,0xE8,0x69,0x4D,0xFF,0xFF,0x8B,0xCE,0xE8,0x92,0x3E,0xFE,0xFF
+};
+// Additional visual-only alpha consumers found by the offline direct-load audit.
+// Include the engine load in the signature; replace only its scalar MOVSS.
+static const short kSigHighBoneAlpha[] = {
+    0xA1,0x8C,0x2F,0xCE,0x00,0xF3,0x0F,0x10,0x40,0x60,
+    0x53,0x55,0x57,0x8B,0xF9,0x8B,0x5F,0x0C
+};
+static const short kSigHighStructureAlpha[] = {
+    0x8B,0x0D,0x8C,0x2F,0xCE,0x00,0xF3,0x0F,0x10,0x41,0x60,
+    0x6A,0x00,0x8D,0x8F,0x10,0x01,0x00,0x00
+};
+// W3D turret bone cache: read visual alpha, decide yaw/pitch capture, save marker.
+static const short kSigHighTurretPrefix[] = {
+    0xA1,0x8C,0x2F,0xCE,0x00,0x8B,0xA9,0x38,0x01,0x00,0x00,0x85,0xED
+};
+static const short kSigHighTurretRead[] = {
+    0xF3,0x0F,0x10,0x40,0x60,0xF3,0x0F,0x11,0x44,0x24,0x30,
+    0x74,0x74,0x8B,0x8D,0x7C,0x03,0x00,0x00
+};
+static const short kSigHighTurretYaw[] = {
+    0x0F,0x2E,0xE3,0x9F,0xF6,0xC4,0x44,0x7B,0x60,
+    0x0F,0x2E,0x63,0x10,0x9F,0xF6,0xC4,0x44,0x7B,0x56,
+    0xF3,0x0F,0x10,0x43,0x08,0xF3,0x0F,0x5C,0xC2
+};
+static const short kSigHighTurretPitch[] = {
+    0x0F,0x2E,0x05,0x00,0x62,0xBE,0x00,0x9F,0xF6,0xC4,0x44,0x7B,0x0A,
+    0x0F,0x2E,0x43,0x10,0x9F,0xF6,0xC4,0x44,0x7A,0x11,
+    0xD9,0x43,0x0C,0xD9,0x5B,0x04
+};
+static const short kSigHighTurretSave[] = {
+    0xF3,0x0F,0x11,0x43,0x10,0x83,0xC6,0x1C,0x3B,0xF5,0x0F,0x85,0xD6,0xF9,0xFF,0xFF
+};
+static const short kSigHighAdvance[] = {
+    0x8B,0x4E,0x58,0x83,0xF9,0x06,0x75,0x1A,0x80,0x7E,0x64,0x00,0x74,0x14,
+    0xA1,0xD4,0xF9,0xCA,0x00,0x33,0xD2,0xF7,0x35,0xD0,0xF9,0xCA,0x00
+};
+static const short kSigHighExit[] = {
+    0x8B,0x0D,0x9C,0x6C,0xCD,0x00,0x8B,0x11,0x8B,0x82,0xA0,0x00,0x00,0x00,
+    0x5F,0x5E,0x5B,0x83,0xC4,0x04,0xFF,0xE0
+};
+static const short kSigHighLimiter[] = {
+    0xDF,0x7C,0x24,0x14,0x8B,0x74,0x24,0x14,0x3B,0xC6,0xD9,0x6C,0x24,0x10
+};
+static const short kSigHighWindow[] = {0x2B,0x86,0x30,0x01,0x00,0x00,0x83,0xF8,0x06};
 
 
 // P7:`sub_6027D0` 里那次「每客户端帧一回」的绘制/动画更新调用(0x602942,13 字节,唯一命中):
@@ -1117,8 +1185,8 @@ static const short kSigFrameUpdate[] = {
 // 前者静默改错,后者保持原样。所以采用后者。
 //
 // R1 算 r 的地方:mov eax,[渲染帧率]; xor edx,edx; div [逻辑帧率]。本构建共 5 处,
-//    五处算出的 r 都会被存进同一个对象字段(+92),所以**必须五处一起改**,否则 r 不一致。
-//    ★参考成品只改了其中 2 处,它那份里另外 3 处算出的 r 与已改的两处不等 —— 这是它的缺陷之一。
+//    旧调度统一读显示倍率。HIGH 必须区分三处 +0x5C 显示预算、原生批次
+//    调度器和新 tick 判据；不能把五处一律指回 30，否则限帧预算也会变小。
 static const short kSigRatio[] = { 0xA1,W,W,W,W, 0x33,0xD2, 0xF7,0x35,W,W,W,W };
 // R3 某量 ÷ 渲染帧率 → 存入一个全局
 static const short kSigDivFps[] = { 0xF7,0x35,W,W,W,W, 0xA3,W,W,W,W, 0xC3 };
@@ -1324,6 +1392,11 @@ static unsigned g_wallTraceLogged = 0;
 static int g_retailFps = 30;
 static int g_targetFps = 60;
 static int g_ratio = 4;            // r = 客户端帧率 ÷ 逻辑帧率
+static bool g_highOn = false;
+static bool fl_high_boundary(unsigned bit);
+static bool fl_high_new_tick(void* engine);
+static float fl_high_visual_alpha(const void* engine, float nativeValue);
+static void fl_high_visual_observe(const void* module);
 
 // 2026-09-16 初始实现:容量从 16 提到 48。改成「重定向读者」的设计后改动点有 18 处,
 // 原来满了之后 remember() 是**静默返回**,会留下一份残缺的撤销表 —— 回滚时还不回去,比不装还糟。
@@ -1703,7 +1776,7 @@ extern "C" int __stdcall fl_hook_batch(int phase, int ratio) {
 // 就只能拿「我记得原版是 30」当分母,那是我自己都不该接受的判据。
 extern "C" float __stdcall fl_hook_fraction(void* self) {
     const int phase = *(int*)((unsigned char*)self + 0x58);
-    float f = g_measureOnly ? (float)phase * (1.0f / 6.0f) : fl_fraction(phase, g_ratio);
+    float f = (g_measureOnly || g_highOn) ? (float)phase * (1.0f / 6.0f) : fl_fraction(phase, g_ratio);
     if (f < 0.0f) f = 0.0f;
     if (f > 1.0f) f = 1.0f;
     return f;
@@ -1800,7 +1873,7 @@ extern "C" void __stdcall fl_hook_perframe(void* self) {
                 g_frameCount, logicFrame, phase, frac);
     }   // 引擎自己算的 FPS 就在 self+0x70,留个指针做第二把尺子
     const int phase = *(int*)((unsigned char*)self + 0x58);
-    float f = g_measureOnly ? (float)phase * (1.0f / 6.0f) : fl_fraction(phase, g_ratio);
+    float f = (g_measureOnly || g_highOn) ? (float)phase * (1.0f / 6.0f) : fl_fraction(phase, g_ratio);
     if (f < 0.0f) f = 0.0f;
     if (f > 1.0f) f = 1.0f;
     *(float*)((unsigned char*)self + 0x60) = f;
@@ -1973,7 +2046,7 @@ extern "C" void* __fastcall fl_wrap_gpu_ctor(void* self, void* unused,
     (void)unused;
     FlGpuParticleParams adjusted;
     const FlGpuParticleParams* use = params;
-    if (g_glowOn && g_psOn && (g_targetFps == 60 || g_targetFps == 90) && handle && params) {
+    if (g_glowOn && g_psOn && (g_targetFps == 60 || g_targetFps == 90 || fl_high_fps_target(g_targetFps)) && handle && params) {
         const void* ref = *(const void**)handle;
         const void* system = ref ? *(const void**)ref : NULL;
         const void* tpl = system ? *(const void**)((const unsigned char*)system + 8) : NULL;
@@ -2005,7 +2078,7 @@ extern "C" float* __fastcall fl_wrap_gpu_vertices(void* storage, void* unused,
                                                   const void* particle, float* vertices) {
     (void)unused;
     float* result = ((FnGpuVertices)g_glowVerticesOrigFn)(storage, particle, vertices);
-    if (g_glowOn && g_psOn && (g_targetFps == 60 || g_targetFps == 90) &&
+    if (g_glowOn && g_psOn && (g_targetFps == 60 || g_targetFps == 90 || fl_high_fps_target(g_targetFps)) &&
         storage && particle && vertices) {
         const void* tpl = fl_gpu_storage_template(storage);
         const FlPowerGlowProfile* profile = tpl ? fl_power_glow_profile(fl_visual_word(tpl, 256)) : NULL;
@@ -2038,7 +2111,7 @@ extern "C" float* __fastcall fl_wrap_gpu_vertices(void* storage, void* unused,
                 InterlockedIncrement(&g_glowVertexTraceCount);
             }
             if (!rejected) {
-                for (unsigned i = 0; i < kFlGlowVertexCount; ++i) vertices[i * 10 + 3] = profile->visibleLifetime;
+                for (unsigned i = 0; i < kFlGlowVertexCount; ++i) vertices[i * 10 + 3] = fl_glow_visible_lifetime(*profile, g_targetFps);
                 ++g_glowVertexAdjusted;
                 ++stats.corrected;
             } else {
@@ -2069,7 +2142,9 @@ extern "C" char __fastcall fl_wrap_construction_progress(void* module, void* unu
     const unsigned now = fl_visual_word(logic, 80);
     const unsigned duration = fl_visual_word(module, 56), start = fl_visual_word(module, 60);
     const unsigned hold = fl_visual_word(module, 64);
-    const float fraction = *(const float*)(engine + 96);
+    // This mode-0 display callback runs during preparation too, when +60h
+    // has already been restored to the discrete simulation fraction.
+    const float fraction = fl_high_visual_alpha(engine, *(const float*)(engine + 96));
     if (!active) { *out = 0.0f; ++g_constructionInactive; }
     else {
         *out = fl_construction_progress(now, start, hold, duration, fraction, held != 0);
@@ -2102,7 +2177,7 @@ typedef double (__thiscall *FnWallAlpha)(void*);
 typedef char (__thiscall *FnWallMc)(void*, const void*, char, char);
 
 static bool fl_wall_enabled() {
-    return g_constructionOn && (g_targetFps == 60 || g_targetFps == 90);
+    return g_constructionOn && (g_targetFps == 60 || g_targetFps == 90 || fl_high_fps_target(g_targetFps));
 }
 static unsigned fl_wall_hash(uintptr_t module) {
     return (unsigned)((module >> 4) ^ (module >> 12) ^ (module >> 20)) & 511u;
@@ -2324,6 +2399,7 @@ extern "C" void __fastcall fl_wrap_construction_prepare(void* module, void* unus
     }
     if (prime || stamp != lastStamp)
         ((FnConstructionAnimate)g_constructionAnimateFn)(module);
+    if (g_highOn) fl_high_visual_observe(module);
     if (g_constructionOn) {
         ConstructionLastDraw& last = g_constructionLastDraw[((uintptr_t)module >> 4) & 255u];
         last.lastStamp = fl_visual_word(module, 200);
@@ -2387,23 +2463,24 @@ static int fl_engine_phase() {
 // 原 sub_5FFAD0 在 sub_542DF0 里的那一处调用:ecx = 引擎;调用方只用 AL。
 extern "C" bool __fastcall fl_wrap_visphase(void* engine, void* unused) {
     (void)unused;
+    if (g_highOn) return fl_high_new_tick(engine);
     return engine && *(int*)((char*)engine + FL_SIM_PHASE_OFFSET) == g_visPhase;
 }
 typedef void (__cdecl *FnSimVoid)(void);
 typedef void (__thiscall *FnSimThis)(void* self);
 extern "C" void __cdecl fl_wrap_mcsync(void) {
-    if (fl_sim_boundary_ok(fl_engine_phase())) ((FnSimVoid)kEngineMcSyncVa)();
+    if (g_highOn ? fl_high_boundary(1) : fl_sim_boundary_ok(fl_engine_phase())) ((FnSimVoid)kEngineMcSyncVa)();
     else ++g_simGateHeld;                          // 表继续累积,到原版边界再一次性排空
 }
 extern "C" void __fastcall fl_wrap_xfflush(void* gl, void* unused) {
     (void)unused;
-    if (fl_sim_boundary_ok(fl_engine_phase())) ((FnSimThis)kEngineXfFlushVa)(gl);
+    if (g_highOn ? fl_high_boundary(2) : fl_sim_boundary_ok(fl_engine_phase())) ((FnSimThis)kEngineXfFlushVa)(gl);
     else ++g_simGateHeld;                          // GL+0x31C 保持 0,双缓冲表继续累积,首次快照保留
 }
 extern "C" void __fastcall fl_wrap_destroy(void* engine, void* unused) {
     (void)unused;
     const int ph = engine ? *(int*)((char*)engine + FL_SIM_PHASE_OFFSET) : 0;
-    if (!engine || fl_sim_destroy_ok(ph)) { ((FnSimThis)kEngineDestroyVa)(engine); return; }
+    if (!engine || (g_highOn ? fl_high_boundary(4) : fl_sim_destroy_ok(ph))) { ((FnSimThis)kEngineDestroyVa)(engine); return; }
     // sub_619BD0 除了销毁表还做别的事,所以不能整个跳过:只在调用期间把「销毁请求」藏起来,调完再并回去。
     unsigned char* req = (unsigned char*)engine + 0x180;
     const unsigned char saved = *req;
@@ -2414,6 +2491,8 @@ extern "C" void __fastcall fl_wrap_destroy(void* engine, void* unused) {
 }
 
 // ───────────────────────────── 安装 / 卸载 ─────────────────────────────
+#include "high_fps_runtime.inl"
+#include "scroll_runtime.inl"
 static void log_environment() {
     char path[MAX_PATH] = {0};
     GetModuleFileNameA(NULL, path, MAX_PATH);
@@ -2464,6 +2543,8 @@ static void log_error_legend() {
 // 为什么单独拆出来:干扫(只查不改)和正式安装必须走**同一套判据**,否则用户日志里的
 // 「干扫通过」和「安装失败」会自相矛盾,排障就没法只看日志了。
 struct Sites {
+    HighSites high;
+    DragScrollSite dragScroll;
     unsigned char* fps;
     unsigned char* batch;
     unsigned char* fraction;
@@ -2563,9 +2644,10 @@ static int resolve_sim_gates(int targetFps, int logicFps, Sites& s) {
     memset(s.simGate, 0, sizeof s.simGate);
     memset(s.simGateOriginal, 0, sizeof s.simGateOriginal);
     const bool supported = g_retailFps == 30 && logicFps == 15 &&
-        ((targetFps == 60 && g_ratio == 4) || (targetFps == 90 && g_ratio == 6));
-    if ((targetFps == 60 || targetFps == 90) && !supported) {
-        FL_ERR("60/90要求原生客户端30/逻辑15和精确倍率,当前帧率基准已被修改;拒绝安装");
+        ((targetFps == 60 && g_ratio == 4) || (targetFps == 90 && g_ratio == 6) ||
+         (fl_high_fps_target(targetFps) && g_ratio == targetFps / 15));
+    if ((targetFps == 60 || targetFps == 90 || targetFps > 90) && !supported) {
+        FL_ERR("60/90及HIGH要求原生客户端30/逻辑15和精确倍率;拒绝已修改或不匹配的基线");
         return FL_ERR_FPS_GLOBALS;
     }
     s.simGateRequired = supported;
@@ -2573,11 +2655,11 @@ static int resolve_sim_gates(int targetFps, int logicFps, Sites& s) {
     s.simGateNeeded = s.simGateRequired || requested;
     if (!s.simGateNeeded) return FL_OK;
     if (!supported) {
-        FL_ERR("相位边界门仅支持零售30/逻辑15的60或90目标；当前 %d/%d → %d(r=%d)，拒绝该请求",
+        FL_ERR("相位边界门仅支持零售30/逻辑15的60/90或HIGH目标；当前 %d/%d → %d(r=%d)，拒绝该请求",
                g_retailFps, logicFps, targetFps, g_ratio);
         return FL_ERR_RATIO;
     }
-    FL_INFO("相位边界门:请求 mask=0x%08X，显式位=%s，60/90自动必需=%s；核验三处 call",
+    FL_INFO("相位边界门:请求 mask=0x%08X，显式位=%s，自动必需=%s；核验三处 call",
             (unsigned)g_groups, requested ? "开" : "关", s.simGateRequired ? "是" : "否");
     for (int i = 0; i < 3; ++i) {
         const Pattern& p = kSimGatePatterns[i];
@@ -2666,6 +2748,37 @@ static bool add_redirect(Sites& s, void** operand, const char* name, int group, 
     return true;
 }
 
+static int resolve_ratio_redirects(int targetFps, Sites& s) {
+    Pattern p = {"算 r 的 mov+div", kSigRatio, sizeof kSigRatio / sizeof(short), 0};
+    unsigned char* hits[16] = {};
+    const int count = scan_all(p, 1, g_fpsClient, hits, 16);
+    const uintptr_t highReaders[] = {0x5FFAD0, 0x60283D, 0x616256, 0x61B59B, 0x62935D};
+    unsigned seen = 0;
+    int taken = 0;
+    for (int i = 0; i < count; ++i) {
+        if (*(int**)(hits[i] + 9) != g_fpsLogic) continue;
+        void* target = NULL; // ordinary display ratio
+        if (targetFps > 90) {
+            int index = 0;
+            while (index < 5 && (uintptr_t)hits[i] != highReaders[index]) ++index;
+            if (index == 5 || (seen & (1u << index))) return FL_ERR_SIG_MISMATCH;
+            seen |= 1u << index;
+            ++taken;
+            if (index == 0) continue; // phase-test entry belongs to HIGH's tick pulse
+            if (index == 2) target = &g_constRetailFps; // dispatcher alone retains r=2
+        } else {
+            ++taken;
+        }
+        // The other three HIGH readers store +0x5C, consumed by the native
+        // limiter at 0x629745. Keep their display budget at targetFps/15.
+        if (!add_redirect(s, (void**)(hits[i] + 1), "R1 算 r", FL_G_RATIO, target))
+            return FL_ERR_SIG_AMBIGUOUS;
+    }
+    if (!taken || (targetFps > 90 && seen != 0x1Fu)) return FL_ERR_SIG_MISS;
+    FL_INFO("  R1 算 r:核验 %d 处%s", taken, targetFps > 90 ? "；HIGH 原生批次/显示预算分离" : "");
+    return FL_OK;
+}
+
 // 只读:定位六处补丁点 + 核对它们现在的数值。返回 FL_OK 表示「可以安装」。全程不写游戏内存。
 static int resolve_and_verify(int targetFps, Sites& s) {
     if (!resolve_module()) { FL_ERR("拿不到主模块或不是 32 位 PE"); return FL_ERR_BAD_PE; }
@@ -2712,13 +2825,23 @@ static int resolve_and_verify(int targetFps, Sites& s) {
     }
     g_targetFps = targetFps;
     g_ratio = targetFps / logicFps;
-    if (g_ratio < 1 || g_ratio > 6) {
-        FL_ERR("倍数 r = %d 超出支持范围(1..6);引擎每逻辑帧只有 6 个插值阶段", g_ratio);
+    if (g_ratio < 1 || (g_ratio > 6 && !fl_high_fps_target(targetFps))) {
+        FL_ERR("倍数 r = %d 不受支持;旧调度1..6,高帧实验为120..240且15的倍数", g_ratio);
         return FL_ERR_RATIO;
     }
-    FL_INFO("目标:客户端 %d 帧,逻辑 %d 帧,r = %d(每 %d 个客户端帧跑满 6 个阶段)",
-            targetFps, logicFps, g_ratio, g_ratio);
+    FL_INFO("目标:客户端 %d 帧,逻辑 %d 帧,显示倍率 r = %d；调度=%s",
+            targetFps, logicFps, g_ratio, targetFps > 90 ? "HIGH 原生两批 + 独立显示时钟" : "旧六阶段分配");
 
+    if (targetFps > 90) {
+        const int required = FL_G_RATIO | FL_G_PERFRAME | FL_G_CLOCK | FL_G_PARTICLE |
+                             FL_G_VISUAL | FL_G_DERIVED2 | FL_G_ANIMSTEP;
+        if ((g_groups & required) != required || (g_groups & (FL_G_FPSGLOBAL | FL_G_ANIMGATE))) {
+            FL_ERR("HIGH requires complete visual clock/core groups; FPSGLOBAL/P7 forbidden");
+            return FL_ERR_RATIO;
+        }
+        const int highRc = resolve_high_sites(s.high);
+        if (highRc != FL_OK) return highRc;
+    }
     const int rcSimPin = resolve_sim_pins(targetFps, s);
     if (rcSimPin != FL_OK) return rcSimPin;
     const int rcSimGate = resolve_sim_gates(targetFps, logicFps, s);
@@ -2762,21 +2885,8 @@ static int resolve_and_verify(int targetFps, Sites& s) {
     {
         unsigned char* hits[16];
 
-        // R1 算 r 的地方(本构建 5 处)。两道判据:被除数必须是客户端帧率全局、除数必须是逻辑帧率全局。
-        // 五处算出的 r 会被存进同一个对象字段,所以必须**全部**改,少改一处 r 就不一致。
-        Pattern pRatio = {"算 r 的 mov+div", kSigRatio, (int)(sizeof kSigRatio / sizeof(short)), 0};
-        const int nRatio = scan_all(pRatio, 1, g_fpsClient, hits, 16);
-        int taken = 0;
-        for (int i = 0; i < nRatio; ++i) {
-            if (*(int**)(hits[i] + 9) != g_fpsLogic) {
-                FL_WARN("  跳过 %08X:它的除数不是逻辑帧率全局,不是算 r 的那种", (unsigned)(uintptr_t)hits[i]);
-                continue;
-            }
-            if (!add_redirect(s, (void**)(hits[i] + 1), "R1 算 r", FL_G_RATIO)) return FL_ERR_SIG_AMBIGUOUS;
-            ++taken;
-        }
-        if (taken == 0) { FL_ERR("一处「算 r」的代码都没找到 —— 放弃安装"); return FL_ERR_SIG_MISS; }
-        FL_INFO("  R1 算 r:采用 %d 处(这份构建已知为 5 处)", taken);
+        const int rcRatio = resolve_ratio_redirects(targetFps, s);
+        if (rcRatio != FL_OK) return rcRatio;
 
         // R3 某量 ÷ 渲染帧率 → 存全局
         // ★ 2026-09-17:这里的小函数(0x00BB3C50)算的是 **1000 ÷ 客户端帧率,存进 dword_CE176C**,
@@ -3057,6 +3167,12 @@ static int resolve_and_verify(int targetFps, Sites& s) {
 
     s.fps = fpsSite; s.batch = batch; s.fraction = fraction;
     s.pfmul = pfmul; s.pimul = pimul; s.visual = visual;
+    const int scrollResult=resolve_drag_scroll(targetFps,g_retailFps,g_groups,false,s.dragScroll);
+    if(scrollResult!=FL_OK) return scrollResult;
+    if(s.dragScroll.address && g_scrollSites!=2) {
+        FL_ERR("卷屏归一要求键盘 / 边缘和右键三处一起就位，拒绝部分安装");
+        return FL_ERR_SIG_MISMATCH;
+    }
     return FL_OK;
 }
 
@@ -3144,6 +3260,9 @@ static int install(int targetFps, bool measureOnly) {
     // 2026-09-21:卷屏步长常量(见 FL_G_SCROLL)。同样必须在重定向循环之前就位。
     g_scroll100 = 100.0f * (float)g_retailFps / (float)(targetFps > 0 ? targetFps : g_retailFps);
     g_scrollOn  = false;
+    g_dragScrollOn = false;
+    g_dragScrollCalls = 0;
+    g_dragScrollScale = (float)g_retailFps/(float)targetFps;
 
     log::PatchLogLock logLock;
     mem::ThreadFreezer freeze;   // 改代码期间别让别的线程跑到这些字节上
@@ -3156,12 +3275,20 @@ static int install(int targetFps, bool measureOnly) {
         FL_ERR("相位边界门安装前复核失败；尚未写任何游戏补丁");
         return FL_ERR_SIG_MISMATCH;
     }
+    if (!measureOnly && targetFps > 90 && !verify_high_sites(s.high, false)) {
+        FL_ERR("HIGH full preimage changed before install; no writes performed");
+        return FL_ERR_SIG_MISMATCH;
+    }
+    if(!verify_drag_scroll(s.dragScroll,false)) {
+        FL_ERR("右键卷屏安装前上下文漂移，尚未写任何补丁");
+        return FL_ERR_SIG_MISMATCH;
+    }
     FL_INFO("已挂起其它线程 %d 个,开始写补丁", freeze.count);
 
     bool ok = true;
 
     // ── P2 批次块:push edi; push esi; call 我们的调度; mov edi,eax; mov ebx,1; add esi,ebx; 其余 NOP
-    if (!measureOnly && (g_groups & FL_G_BATCH)) {
+    if (!measureOnly && targetFps <= 90 && (g_groups & FL_G_BATCH)) {
         unsigned char code[41];
         memset(code, 0x90, sizeof code);
         int i = 0;
@@ -3177,7 +3304,7 @@ static int install(int targetFps, bool measureOnly) {
     }
 
     // ── P3 插值系数:push eax; push ebp; call 我们的系数; 结果从 ST(0) 搬到 xmm0; pop eax; 其余 NOP
-    if (ok && !measureOnly && (g_groups & FL_G_FRACTION)) {
+    if (ok && !measureOnly && targetFps <= 90 && (g_groups & FL_G_FRACTION)) {
         unsigned char code[42];
         memset(code, 0x90, sizeof code);
         int i = 0;
@@ -3199,7 +3326,7 @@ static int install(int targetFps, bool measureOnly) {
     //    两组用同一把尺子才能比。
     //    ★为什么从 xorps 起接管:调用我们的钩子会破坏 xmm1/xmm2(32 位 MSVC 里 xmm 全易失),
     //      而后面两步钳位要用它们,所以调用后必须把这两个常量重新装载回去。
-    if (ok && (g_groups & FL_G_PERFRAME)) {
+    if (ok && (measureOnly || targetFps <= 90) && (g_groups & FL_G_PERFRAME)) {
         unsigned char* site = s.perFrame;
         float* clampTop = *(float**)(site + 7);
         unsigned char code[37];
@@ -3496,7 +3623,7 @@ static int install(int targetFps, bool measureOnly) {
         }
     }
 
-    // Paired pool/vertex candidate only with PSYS and the 60/90 targets.
+    // Paired pool/vertex candidate only with PSYS and supported high targets.
     // Verify BOTH native calls before patching either. Never install visual2's
     // standalone lifetime change when the upload half cannot be confirmed.
     g_glowOn = false; g_glowSeen = 0; g_glowAdjusted = 0; g_glowSkipped = 0;
@@ -3505,7 +3632,7 @@ static int install(int targetFps, bool measureOnly) {
     memset((void*)g_powerGlowStats, 0, sizeof g_powerGlowStats);
     g_glowVertexTraceCount = g_glowVertexTraceLogged = 0;
     if (ok && !measureOnly && (g_groups & FL_G_PSYS) &&
-        (targetFps == 60 || targetFps == 90)) {
+        (targetFps == 60 || targetFps == 90 || fl_high_fps_target(targetFps))) {
         Pattern pGlow = {"建筑光团 GPU 构造调用", kSigGpuGlowCtor,
                          (int)(sizeof kSigGpuGlowCtor / sizeof kSigGpuGlowCtor[0]), 0x006D2635};
         Pattern pVertices = {"GPU 粒子顶点上传调用", kSigGpuGlowVertices,
@@ -3531,8 +3658,10 @@ static int install(int targetFps, bool measureOnly) {
                 const int vertexRel = (int)((unsigned char*)&fl_wrap_gpu_vertices - (vertexCall + 5));
                 memcpy(code + 1, &vertexRel, sizeof vertexRel);
                 if (ok) ok = patch(vertexCall, code, sizeof code, "建筑光团 GPU 可见寿命(池末步前裁剪)");
-                if (ok) FL_INFO("建筑光团交接已装 @%08X / %08X；苏联/帝国矿场 pool=16 visible=15.75，帝国电厂 pool=2 visible=1.75；仅三个零售五顶点模板；出生与发射/RNG 不改；需画面验收",
-                                (unsigned)(uintptr_t)call, (unsigned)(uintptr_t)vertexCall);
+                if (ok) FL_INFO("建筑光团交接已装 @%08X / %08X；苏联/帝国矿场 pool=16 visible=%.6f，帝国电厂 pool=2 visible=%.6f；仅三个零售五顶点模板；出生与发射/RNG 不改；需画面验收",
+                                (unsigned)(uintptr_t)call, (unsigned)(uintptr_t)vertexCall,
+                                fl_glow_visible_lifetime(kFlPowerGlows[0],targetFps),
+                                fl_glow_visible_lifetime(kFlPowerGlows[2],targetFps));
             }
         }
         if (!ok) FL_ERR("建筑光团交接:PSYS 门或 GPU 构造/上传调用未确认，拒绝安装并回滚");
@@ -3865,10 +3994,11 @@ static int install(int targetFps, bool measureOnly) {
     if (ok && !measureOnly) FL_INFO("已改指向 %d 处;客户端帧率全局 %08X 仍为 %d(未改动)",
                                     s.redirectCount, (unsigned)(uintptr_t)g_fpsClient, *g_fpsClient);
     if (ok && !measureOnly && (g_groups & FL_G_SCROLL)) {
-        g_scrollOn = (g_scrollSites == 2);
+        if(s.dragScroll.address) ok=install_drag_scroll(s.dragScroll);
+        g_scrollOn = ok && g_scrollSites == 2 && (!s.dragScroll.address || g_dragScrollOn);
         if (g_scrollOn)
             FL_INFO("★卷屏归一已开:键盘 / 边缘卷屏每帧步长 100 → %.3f(= 100 × %d ÷ %d)⇒ 每秒走的距离与原版相同。"
-                    "右键拖拽卷屏不在此列。", g_scroll100, g_retailFps, targetFps);
+                    "右键拖动位移倍率 %.6f。", g_scroll100, g_retailFps, targetFps,g_dragScrollScale);
         else
             FL_WARN("FL_G_SCROLL 开着,但两处卷屏步长没就位(见上面的 S WARN)—— 卷屏保持现状。");
     }
@@ -3938,10 +4068,16 @@ static int install(int targetFps, bool measureOnly) {
     if (ok && !measureOnly && s.simGateNeeded)
         ok = g_simGateOn && g_simGateSites == 3 && verify_sim_gates(s, true);
 
+    if (ok && !measureOnly && targetFps > 90) {
+        ok = g_visPhaseOn && g_simGateOn && install_high_sites(s.high);
+        if (ok) FL_INFO("HIGH installed: native 33ms half-batches, independent drawable/turret interpolation, 12/12 sites; multiplayer UNVERIFIED");
+    }
     if (!ok) {
         FL_ERR("安装失败，尝试按撤销表还原；还原结果单独核验");
         const int bad = rollback();
         if (bad == 0) {
+            g_highOn = false;
+            g_scrollOn = g_dragScrollOn = false;
             g_constructionSites = 0;
             g_constructionOn = false;
             g_glowOn = false;
@@ -4053,6 +4189,7 @@ static int uninstall() {
     // 万一有线程此刻正停在包装函数里,它醒来后还要用它转发一次。
     g_chsSite = NULL; g_chsMode = FL_CHS_MODE_PROBE;
     g_scrollOn = false;
+    g_dragScrollOn = false;
     g_trcSite = NULL; g_trcOn = false;
     g_psSite = NULL; g_psOn = false;
     g_glowOn = false; g_constructionSites = 0; g_constructionOn = false;
@@ -4061,12 +4198,38 @@ static int uninstall() {
     g_visPhaseOn = false; g_simPinSites = 0; g_simGateSites = 0; g_simGateOn = false;
     memset(&g_simInstalled, 0, sizeof g_simInstalled);
     g_installed = false;
+    g_highOn = false;
     FL_INFO("已卸载,全部字节还原");
     return FL_OK;
 }
 }  // namespace fl
 
 // ───────────────────────────── 导出接口 ─────────────────────────────
+extern "C" __declspec(dllexport) int __stdcall FrameLabHighStatus() {
+    api::PatchGuard transaction;
+    if (!fl::g_installed || !fl::g_highOn) return 0;
+    const FlHighFpsSchedule& h = fl::g_highSchedule;
+    FL_INFO("HIGH target=%d accepted=%u attempts=%u renderOnly=%u netRetries=%u rebases=%u fault=%u newTick=%u drawableReads=%ld nativeAlphaReads=%ld drawAlpha=%.6f; update-counter is NOT D3D Present",
+        fl::g_targetFps, h.accepted, h.attempts, h.held, h.retries, h.rebases,
+        h.fault ? 1u : 0u, h.newTick ? 1u : 0u, fl::g_highDrawableReads, fl::g_highNativeAlphaReads, fl::g_highDrawAlpha);
+    FL_INFO("TURRET reads=%ld yawCaptures=%ld pitchCaptures=%ld completedTicks=%u epoch=%u alpha=%.6f; visual-cache-only, multiplayer UNVERIFIED",
+        fl::g_highTurretReads, fl::g_highTurretYawCaptures, fl::g_highTurretPitchCaptures,
+        fl::g_highTurretClock.completions, fl::g_highTurretClock.serial, fl::g_highTurretClock.alpha);
+    FL_INFO("VISUALREAD bone=%ld structure=%ld construction=%ld auditOverflow=%u; counters are display callbacks, NOT Present",
+        fl::g_highBoneReads, fl::g_highStructureReads, fl::g_highConstructionReads, fl::g_highVisualOverflow);
+    for (unsigned i=0;i<128;++i) {
+        const fl::HighVisualObservation& r=fl::g_highVisual[i];
+        if (!r.module || (!r.moving && !r.clipSteps)) continue;
+        FL_INFO("VISUALOBJ template=%08X drawable=%u module=%08X type=%08X samples=%u rawSteps=%u visualSteps=%u moving=%u held=%u maxHeld=%u bypass=%u modes=%u/%u/%u mask=%02X clipSteps=%u stampSteps=%u; bounded sample, not a smoothness verdict",
+            r.templateId,r.drawableId,(unsigned)r.module,r.vtable,r.samples,r.rawSteps,r.visualSteps,
+            r.moving,r.held,r.maxHeld,r.bypass,r.mode[0],r.mode[1],r.mode[2],r.modeMask,r.clipSteps,r.stampSteps);
+    }
+    if(fl::g_dragScrollOn)
+        FL_INFO("DRAGSCROLL calls=%ld scale=%.6f target=%d; local right-drag vector only",
+            fl::g_dragScrollCalls,fl::g_dragScrollScale,fl::g_targetFps);
+    return h.fault ? -2 : 1;
+}
+
 extern "C" __declspec(dllexport) int __stdcall FrameLabEnable(int targetFps) {
     api::PatchGuard transaction;
     FL_INFO("收到启用请求,目标帧率 %d", targetFps);
@@ -4319,7 +4482,7 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabSetGroups(int mask) {
     FL_INFO("  卷屏速度按帧率归一=%s%s",
             (fl::g_groups & FL_G_SCROLL) ? "开" : "关",
             (fl::g_groups & FL_G_SCROLL)
-                ? "(键盘 / 边缘卷屏每秒走的距离与原版相同;右键拖拽不在此列;未经实机验证)"
+                ? "(键盘 / 边缘与右键拖动按原版速度归一；新右键候选待手测)"
                 : "(默认:卷屏随渲染帧率变快 —— 60/90 帧下快 2/3 倍)");
     // 2026-09-21(显示帧递推普查):第四个派生量。默认关,单独一行。
     FL_INFO("  第四个派生量 每显示帧秒数(0x00CDBD34)=%s%s",
@@ -4660,7 +4823,7 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabPsysStatus() {
         const FlPowerGlowProfile& p = kFlPowerGlows[i];
         const fl::PowerGlowStats& s = fl::g_powerGlowStats[i];
         FL_INFO("GLOW tpl=%08X %s:原寿命=%u pool=%u visible=%.2f 构造=%ld 修正=%ld 跳过=%ld 上传=%ld 修正=%ld 跳过=%ld 拒绝=%ld/%ld/%ld/%ld/%ld",
-                p.id, names[i], p.nativeLifetime, p.poolLifetime, p.visibleLifetime,
+                p.id, names[i], p.nativeLifetime, p.poolLifetime, fl_glow_visible_lifetime(p, fl::g_targetFps),
                 s.born, s.adjusted, s.skipped, s.uploads, s.corrected, s.uploadSkipped,
                 s.rejected[0], s.rejected[1], s.rejected[2], s.rejected[3], s.rejected[4]);
     }
@@ -4717,12 +4880,15 @@ extern "C" __declspec(dllexport) int __stdcall FrameLabConstructionStatus() {
     return fl::g_constructionSites == 6 && fl::g_constructionOn ? 7 : 0;
 }
 
-// FrameLabScrollStatus():卷屏归一的状态。-2 = 两处补丁点没就位(特征没命中 / 常量不对);0 = 关;1 = 已生效。
+// FrameLabScrollStatus(): -2 = 请求的键盘/边缘/右键组未完整安装；0 = 关；1 = 就位。
 //   与 FrameLabChassisStatus 同一个理由:可自选的东西必须让上层读得到「到底开没开成」。
 extern "C" __declspec(dllexport) int __stdcall FrameLabScrollStatus() {
-    if (fl::g_scrollOn) return 1;
-    if (fl::g_installed && (fl::g_groups & FL_G_SCROLL) && fl::g_scrollSites != 2) return -2;
-    return 0;
+    if(!fl::g_installed || fl::g_measureOnly || !(fl::g_groups&FL_G_SCROLL)) return 0;
+    if(fl::g_targetFps<=fl::g_retailFps) return 1; // native speed already satisfies option
+    if(fl::g_dragScrollOn)
+        FL_INFO("DRAGSCROLL calls=%ld scale=%.6f target=%d; local right-drag vector only",
+            fl::g_dragScrollCalls,fl::g_dragScrollScale,fl::g_targetFps);
+    return fl::g_scrollOn && fl::g_dragScrollOn && fl::g_scrollSites==2 ? 1 : -2;
 }
 
 // ② FrameLabChassisRate(逻辑帧数)   ★车身路径的**主判据**:同一辆车每逻辑帧递推了几步(×1000)。

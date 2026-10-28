@@ -9,7 +9,7 @@ import re
 import sys
 
 ROOT = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(__file__).resolve().parents[2]
-TEXT = {'.cpp', '.c', '.h', '.hpp', '.def', '.rc', '.manifest', '.ps1', '.py', '.sh', '.md', '.txt', '.yml', '.yaml', '.json'}
+TEXT = {'.cpp', '.c', '.h', '.hpp', '.inl', '.def', '.rc', '.manifest', '.ps1', '.py', '.sh', '.md', '.txt', '.yml', '.yaml', '.json'}
 SKIP = {'__pycache__', 'build', 'dist', 'out', 'logs', 'tmp', '.git', 'archive'}
 # Require a token boundary so https:// links are not mistaken for drive letters.
 DRIVE = re.compile(r'''(?:^|[\s"'=(])([A-Za-z]:[\\/][^\r\n"']*)''')

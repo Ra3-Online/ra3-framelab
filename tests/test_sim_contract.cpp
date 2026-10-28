@@ -7,7 +7,7 @@ static int passed = 0, failed = 0;
 // This test-only PE data section owns the fake page before process initialization.
 // Only a fully bounded interior page is touched; no game code is executed.
 #pragma section(".flfix", read, write)
-__declspec(allocate(".flfix")) __declspec(align(4096)) unsigned char canonicalOwned[0x400000] = {};
+__declspec(allocate(".flfix")) __declspec(align(4096)) unsigned char canonicalOwned[0x800000] = {};
 static const DWORD testBaselineProtection = PAGE_READWRITE;
 static unsigned char* text = NULL;
 static const size_t textSize = 0x1000;
@@ -74,11 +74,11 @@ static bool patch_call(const fl::Sites& s, int i) {
 
 static void eligibility() {
     const int masks[] = {0, 0x28FFF, 0x3ACFFF, 0x403ACFFF};
-    const int fps[] = {60, 90};
-    for (int i = 0; i < 2; ++i) for (int k = 0; k < 4; ++k) {
+    const int fps[] = {60, 90, 120, 165, 180, 240};
+    for (int i = 0; i < 6; ++i) for (int k = 0; k < 4; ++k) {
         reset(fps[i], masks[k]);
         fl::Sites s = resolve(fps[i]);
-        check(s.simGateNeeded && s.simGateRequired, "canonical 60/90 require all gates despite legacy or zero mask");
+        check(s.simGateNeeded && s.simGateRequired, "canonical 60..240 require all gates despite legacy or zero mask");
         check(s.simGate[0] == sites[0] && s.simGate[1] == sites[1] && s.simGate[2] == sites[2], "all three exact fake sites resolved");
         check(same_text() && fl::g_undoCount == 0, "resolution is read only");
     }
@@ -88,8 +88,8 @@ static void eligibility() {
         fl::Sites s = resolve(other[i]);
         check(!s.simGateRequired && !s.simGateNeeded && same_text(), "30/45/75 without explicit gate have no mandatory gate claim");
     }
-    const int rejected[] = {45, 75, 120, 240};
-    for (int i = 0; i < 4; ++i) {
+    const int rejected[] = {45, 75};
+    for (int i = 0; i < 2; ++i) {
         reset(rejected[i], FL_G_SIMGATE);
         fl::Sites s = {};
         check(fl::resolve_sim_gates(rejected[i], 15, s) == FL_ERR_RATIO, "unsupported explicit gate ratio rejected");
@@ -290,6 +290,8 @@ static void api_interleave() {
         check(fl::rollback() == 0 && same_text(), "interleave fixture pending owned undo cleaned honestly");
     }
 }
+#include "test_high_contract.inl"
+#include "test_scroll_contract.inl"
 } // namespace fixture
 
 int main() {
@@ -323,6 +325,8 @@ int main() {
     fixture::transaction();
     fixture::durable_guard();
     fixture::api_interleave();
+    fixture::high_contract();
+    fixture::drag_contract();
     fixture::check(fixture::protect(fixture::testBaselineProtection) &&
                    fixture::protection(fixture::text) == fixture::testBaselineProtection,
                    "owned IMAGE data page test baseline protection restored; storage remains process lifetime");

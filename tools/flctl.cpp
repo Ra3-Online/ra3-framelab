@@ -184,6 +184,7 @@ int main(int argc, char** argv) {
     void* arg = NULL;
     if (_stricmp(cmd, "enable") == 0) { exportName = "FrameLabEnable"; arg = (void*)(uintptr_t)fps; }
     else if (_stricmp(cmd, "simstatus") == 0) exportName = "FrameLabSimStatus";
+    else if (_stricmp(cmd, "highstatus") == 0) exportName = "FrameLabHighStatus";
     else if (_stricmp(cmd, "dryrun") == 0) { exportName = "FrameLabDryRun"; arg = (void*)(uintptr_t)fps; }
     else if (_stricmp(cmd, "measure") == 0) exportName = "FrameLabMeasureOnly";
     // * measureex <groups>: "measure only" WITH an explicit groups mask. Needed because
@@ -335,7 +336,7 @@ int main(int argc, char** argv) {
     std::printf("RESULT=%ld\n", (long)(int)result);
     if (_stricmp(cmd, "enable") == 0) {
         if (result == 0) {
-            if (fps == 60 || fps == 90) {
+            if (fps == 60 || fps == 90 || (fps >= 120 && fps <= 240 && fps % 15 == 0)) {
                 void* localStatus = (void*)GetProcAddress(localBase, "FrameLabSimStatus");
                 void* remoteStatus = localStatus ? (void*)((unsigned char*)remoteBase +
                     ((unsigned char*)localStatus - (unsigned char*)localBase)) : NULL;
@@ -346,7 +347,7 @@ int main(int argc, char** argv) {
                     return 24;
                 }
                 std::printf("SIMSTATUS=%ld\n", (long)(int)sim);
-                std::printf("60/90 必需相位边界门已安装3/3；联机验证范围见技术报告。\n");
+                std::printf("高帧率必需相位边界门已安装3/3；联机验证范围见技术报告。\n");
             }
             std::printf("已启用。日志在 DLL 旁边的 logs\\ 目录里。\n");
         }
